@@ -1,7 +1,8 @@
-"""Tested source payload for the Lite Actions Blue A3 HCCL smoke.
+"""Restored real HCCL payload for the validation-only Blue acceptance PR.
 
-The immutable Worker runner owns topology, timeout, expected sums and evidence.
-This function is loaded only inside the leased NPU container, never in Prepare.
+The trusted runner still owns topology, expected sums, timeouts and evidence.
+This function is loaded only in leased vllm_hccl_smoke containers from the
+verified Head/Base merge source. Keep this acceptance PR unmerged.
 """
 
 PAYLOAD_API_VERSION = 1
