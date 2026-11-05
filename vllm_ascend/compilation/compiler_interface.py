@@ -115,7 +115,6 @@ def _initialize_static_kernel_runtime(vllm_config: VllmConfig) -> None:
         "FusedInferAttentionScore",  # Kimi K3: static tiling is not supported.
         "TopKV2",  # minimax-m3 910C
         "GenericBlockSparseAttn",  # minimax-m3 910C
-        "QuantBatchMatmulV3",  # glm5.2 910C
         "TransposeQuantBatchMatMul",  # dsv4 950
         "QuantLightningIndexer",  # glm5.2 950
     ]
