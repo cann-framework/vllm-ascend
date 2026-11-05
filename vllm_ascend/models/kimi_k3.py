@@ -16,6 +16,7 @@ from typing import Any, TypeVar, cast
 import torch
 import vllm.envs as envs
 from torch import nn
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
 from vllm.distributed import (
     get_pp_group,
@@ -90,13 +91,13 @@ from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.utils import mark_fused_preprocess_weights
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.ops.fused_moe.shared_experts import AscendSharedSparseSituAndMul
 from vllm_ascend.ops.kimi_attn_res import (
     AttnResBackend,
     AttnResQueryPlan,
     load_attn_res_fused_ops,
     resolve_attn_res_mode,
 )
-from vllm_ascend.ops.fused_moe.shared_experts import AscendSharedSparseSituAndMul
 from vllm_ascend.ops.kimi_kda import (
     AscendKimiK3DeltaAttention as AscendKimiK3DeltaAttentionBase,
 )
@@ -865,6 +866,7 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
         return hidden_states, block_residual
 
 
+@support_torch_compile
 class AscendKimiLinearModel(UpstreamKimiLinearModel):
     """Kimi text model assembled from the Ascend decoder layer."""
 
