@@ -39,7 +39,9 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.compilation.kimi_moe_superkernel import moe_superkernel_scope
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.dataclass.shared_experts import PreparedSharedExpertInput, RoutedMoEMilestones
@@ -78,17 +80,25 @@ def _ascend_kimi_moe(
     # Resolve once, like the upstream MoE op. Keep runtime phase selection and
     # all stream orchestration opaque to Dynamo, but capturable by ACLGraph.
     runner = get_layer_from_name(_resolve_layer_name(layer_name))
+    enabled = (
+        get_ascend_config().ascend_compilation_config.enable_super_kernel
+        and not _EXTRA_CTX.is_draft_model
+        and runner._can_run_kimi_decode(hidden_states if shared_experts_input is None else shared_experts_input)
+    )
+    runner._kimi_superkernel_active = enabled
     try:
-        return runner._forward_standard(
-            hidden_states,
-            hidden_states if router_logits is None else router_logits,
-            input_ids,
-            shared_experts_input,
-        )
+        with moe_superkernel_scope(f"{layer_name}_1.moe" if enabled else None, enabled):
+            return runner._forward_standard(
+                hidden_states,
+                hidden_states if router_logits is None else router_logits,
+                input_ids,
+                shared_experts_input,
+            )
     finally:
         # Do not retain a prefill-sized FP32 router tensor on every layer.
         runner._kimi_router_logits = None
         runner._kimi_router_done = None
+        runner._kimi_superkernel_active = False
 
 
 direct_register_custom_op(
@@ -322,17 +332,19 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # Apply output transform (e.g. latent -> full dim)
         fused_output = self.apply_routed_output_transform(fused_output)
 
-        if shared_output is not None:
-            if getattr(self, "_release_shared_schedule", False):
-                result = shared_output + fused_output
+        # Shared join and final residual Add are outside named MoE fusion.
+        with moe_superkernel_scope(None, getattr(self, "_kimi_superkernel_active", False)):
+            if shared_output is not None:
+                if getattr(self, "_release_shared_schedule", False):
+                    result = shared_output + fused_output
+                else:
+                    result = torch._foreach_add([shared_output], [fused_output])[0]
             else:
-                result = torch._foreach_add([shared_output], [fused_output])[0]
-        else:
-            result = fused_output
+                result = fused_output
 
-        result = self._maybe_reduce_final_output(result, og_hidden_dim_post_xform, fused_output_is_reduced)
+            result = self._maybe_reduce_final_output(result, og_hidden_dim_post_xform, fused_output_is_reduced)
 
-        return self._maybe_add_zero_expert_output(result)
+            return self._maybe_add_zero_expert_output(result)
 
     @property
     def is_internal_router(self) -> bool:
@@ -462,7 +474,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         shared_experts = self.ascend_shared_experts
         if self._can_overlap_sp_shared_with(self.routed_input_transform):
             assert shared_experts is not None
-            prepared_input = shared_experts.prepare_input_async(hidden_states)
+            with moe_superkernel_scope(None, getattr(self, "_kimi_superkernel_active", False)):
+                prepared_input = shared_experts.prepare_input_async(hidden_states)
         kimi_gate = getattr(self, "_kimi_gate", None)
         if kimi_gate is not None and router_logits is not None:
             self._kimi_decode_active = self._can_run_kimi_decode(hidden_states)
@@ -505,7 +518,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         shared_experts = self.ascend_shared_experts
         if self._can_overlap_sp_shared_with(self.routed_output_transform):
             assert shared_experts is not None
-            shared_experts.wait_for_output()
+            with moe_superkernel_scope(None, getattr(self, "_kimi_superkernel_active", False)):
+                shared_experts.wait_for_output()
         return fused_output
 
     def _prepare_router_input(
@@ -668,6 +682,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             and self.moe_config.is_sequence_parallel
             and hidden_states.dtype == torch.bfloat16
             and not self.routed_experts.dynamic_eplb
+            and not _EXTRA_CTX.is_draft_model
+            and not self.routed_experts._use_v2_model_runner
             and getattr(self.routed_experts, "_ascend_moe_lora_context", None) is None
             and shared.situ_activation is not None
             and getattr(shared.layer, "expert_gate", None) is None
@@ -713,7 +729,12 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                     else None
                 )
                 if self._kimi_decode_active:
-                    schedule = KimiDecodeSchedule(self.ascend_shared_experts, prepared_shared_input, ready)
+                    schedule = KimiDecodeSchedule(
+                        self.ascend_shared_experts,
+                        prepared_shared_input,
+                        ready,
+                        enable_superkernel=getattr(self, "_kimi_superkernel_active", False),
+                    )
                     routed_out, _ = self.routed_experts.forward_impl(
                         hidden_states=hidden_states,
                         router_logits=router_logits,
