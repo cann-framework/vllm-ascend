@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 def load(path, names, ns, class_name=None):
+    ns.setdefault("moe_superkernel_scope", lambda *args: nullcontext())
+    ns.setdefault("get_ascend_config", lambda: NS(ascend_compilation_config=NS(enable_super_kernel=False)))
     tree = ast.parse((ROOT / path).read_text())
     if class_name:
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name)
@@ -284,11 +286,13 @@ class TestDecodeDependencies(unittest.TestCase):
             ("dispatch", "shared_situ"),
             ("shared_situ", "gmm1"),
             ("gmm1", "shared_down"),
-            ("combine", "shared_rs"),
+            ("shared_down", "shared_rs"),
             ("shared_rs", "add"),
         ]:
             self.assertIn(ids[before], ancestors(ids[after]))
         self.assertNotIn(ids["shared_down"], ancestors(ids["routed_situ"]))
+        self.assertNotIn(ids["combine"], ancestors(ids["shared_rs"]))
+        self.assertLess(ids["shared_rs"], ids["routed_situ"])
         shared._prepare_linear_input_for_overlap.assert_not_called()
         if quantized:
             self.assertIn(ids["gmm1"], ancestors(ids["shared_down_quant"]))

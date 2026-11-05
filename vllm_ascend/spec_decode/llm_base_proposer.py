@@ -133,21 +133,21 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
 
     def _create_draft_vllm_config(self) -> VllmConfig:
-        """Expose the draft runner type during model construction.
+        """Mark draft configs before upstream replacement triggers validation.
 
-        ``_get_model`` calls this hook before ``get_model`` installs the
-        returned config as the current vLLM config. Attention constructors can
-        then identify the draft model from ``runner_type="draft"``.
-
-        Keep the target-derived model config otherwise unchanged. Replacing it
-        with ``draft_model_config`` changes how generic proposers construct
-        their layers and can invalidate target parallel settings.
+        Keep target model/parallel settings and shared layer registries. Only
+        the runner type is isolated so target-only optimizations, including MoE
+        SuperKernel, are ignored when validating and constructing the draft.
         """
-        draft_vllm_config = super()._create_draft_vllm_config()
-        draft_vllm_config = copy.copy(draft_vllm_config)
-        draft_vllm_config.model_config = copy.copy(draft_vllm_config.model_config)
+        target_vllm_config = self.vllm_config
+        draft_vllm_config = copy.copy(target_vllm_config)
+        draft_vllm_config.model_config = copy.copy(target_vllm_config.model_config)
         draft_vllm_config.model_config.runner_type = self.speculative_config.draft_model_config.runner_type
-        return draft_vllm_config
+        self.vllm_config = draft_vllm_config
+        try:
+            return super()._create_draft_vllm_config()
+        finally:
+            self.vllm_config = target_vllm_config
 
     @staticmethod
     def _get_multimodal_image_token_index(model_name: str, config: Any) -> int | None:

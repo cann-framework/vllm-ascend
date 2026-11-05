@@ -382,11 +382,17 @@ def test_draft_vllm_config_only_propagates_draft_runner_type():
     proposer.speculative_config = SimpleNamespace(
         draft_model_config=draft_model_config,
     )
+    proposer.vllm_config = base_vllm_config
+
+    def create_draft_config(self):
+        assert self.vllm_config.model_config.runner_type == "draft"
+        return self.vllm_config
 
     with (
         patch(
             "vllm.v1.spec_decode.llm_base_proposer.SpecDecodeBaseProposer._create_draft_vllm_config",
-            return_value=base_vllm_config,
+            autospec=True,
+            side_effect=create_draft_config,
         ),
     ):
         draft_vllm_config = proposer._create_draft_vllm_config()
@@ -398,6 +404,7 @@ def test_draft_vllm_config_only_propagates_draft_runner_type():
     assert draft_vllm_config.model_config.architecture == "target-architecture"
     assert draft_vllm_config.model_config.num_experts == 256
     assert base_model_config.runner_type == "generate"
+    assert proposer.vllm_config is base_vllm_config
 
 
 class TestDisablePaddedDrafterBatchWithFullGraph:

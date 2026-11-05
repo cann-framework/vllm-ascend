@@ -4,6 +4,7 @@
 import torch
 import torch_npu
 
+from vllm_ascend.compilation.kimi_moe_superkernel import moe_superkernel_scope
 from vllm_ascend.utils import npu_stream_switch, shared_experts_calculation_stream
 
 ROUTER_CORE_LIMIT = (32, 1)
@@ -15,12 +16,13 @@ class KimiDecodeSchedule:
     """One invocation's shared tensors/events; never retained by a communicator.
 
     Dispatch -> shared SiTU -> routed GMM1 -> shared Down. Keep the 0.30
-    HCCL ordering: shared ReduceScatter follows routed finalize, even though
-    shared Down's Cube work overlaps routed activation/quantization/GMM2.
+    MC2 Decode submits shared ReduceScatter after shared Down, overlapping
+    routed activation/quantization/GMM2. Other paths keep the 0.30 schedule.
     """
 
-    def __init__(self, shared, prepared_input, router_ready):
+    def __init__(self, shared, prepared_input, router_ready, *, enable_superkernel=False):
         self.shared = shared
+        self.enable_superkernel = enable_superkernel
         prepared = shared.prepare_for_router_overlap(prepared_input, router_ready)
         assert prepared is not None
         limit = MXFP_SHARED_CORE_LIMIT if hasattr(shared.layer.gate_up_proj, "weight_scale") else BF16_SHARED_CORE_LIMIT
@@ -52,14 +54,13 @@ class KimiDecodeSchedule:
         with npu_stream_switch(shared_experts_calculation_stream()):
             torch.npu.current_stream().wait_event(gmm1_done)
             self.output = self.shared.part2(self.submitted.hidden_states, self.down_input)
+            # The shared stream already orders Down before RS. Do not wait for
+            # routed Combine: the two branches join at the final output transform.
+            with moe_superkernel_scope(None, self.enable_superkernel):
+                self.output = self.shared._pad_and_reduce_scatter(self.output)
 
     def finalize(self):
         if self.output is None:
             raise RuntimeError("Routed MLP did not publish its GMM1 completion")
-        # Preserve 0.30's cross-process-group collective ordering.
-        routed_done = torch.npu.current_stream().record_event()
-        with npu_stream_switch(shared_experts_calculation_stream()):
-            torch.npu.current_stream().wait_event(routed_done)
-            self.output = self.shared._pad_and_reduce_scatter(self.output)
         self.output.record_stream(torch.npu.current_stream())
         return self.output

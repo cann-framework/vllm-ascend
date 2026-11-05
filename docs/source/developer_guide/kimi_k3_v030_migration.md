@@ -9,7 +9,7 @@ It transfers their behavior through the 0.30 interfaces rather than restoring
 
 | GitCode PR | Source merge | Treatment on 0.30 |
 | --- | --- | --- |
-| 5 | `6cbcbbf71` | Keep MXFP4 shared SiTU output in BF16 for the registered Down linear to quantize; apply `(16, 32)` Gate/Up limits on the Kimi multistream path, including outside the specialized Decode ladder. |
+| 5 | `6cbcbbf71` | Keep MXFP4 shared SiTU output in BF16 for the registered Down linear to quantize. PR64 supersedes the earlier Prefill core limit: limits now belong only to the Decode ladder. |
 | 35 | `af5fbc0db` | Port sparse unquantized SiTU into `_unified_apply_activation`; port grouped SiTU/MX quant into the W4A8 MXFP quant method; request expert counts from MC2 dispatch. Keep the new GMM hook architecture and its LoRA/EPLB paths. |
 | 42 | `b41a64714` | Select sparse SiTU for A5 Kimi shared experts, preserving the registered Dense MLP and checkpoint parameter names. CPU, other devices and unavailable custom operators retain the native fallback. |
 | 45 | `9f87b17b1` (source commit) | Included in PR48 ancestry. Keep Router GEMM and MC2/SP TopK on the per-layer Router stream, join prepared inputs before TopK and join TopK before Dispatch. Retain 0.30 common padding and collective ordering. |
@@ -19,6 +19,8 @@ It transfers their behavior through the 0.30 interfaces rather than restoring
 | 54 | `9172ba684` | Keep KDA metadata dispatch opaque using the existing `no_compile_layers` registry, BFG/QKV tracing protection and FIA static blacklist entry. The added text-model `support_torch_compile` decorator has been removed pending AttnRes AOT alias compatibility. |
 | 62 | `723ee0633` | No code needed: 0.30 no longer contains `_plan_mega_kda` or its metadata fallback logs. Do not restore that obsolete path. |
 | 20 | `e689fdd0a` | Keep the 0.30 CANN MegaMoE backend, per-model communication lookup, activation binding, weight layouts and HCCL restore lifecycle. Port Kimi prefill/decode/idle agreement into the existing CPU DP collective and selector. |
+| 64 | `d8d72e6e4` (source head) | Port named Decode MoE SuperKernel scopes, owning-graph optimization, draft isolation and early shared ReduceScatter. Reuse 0.30 `enable_super_kernel`; do not add the source branch's separate switch. Keep 0.30 projection and weight layouts. |
+| 65 | `3a3e40fb3` | Call the native A5 TopK dispatcher directly so recipes imports cannot redirect softmax/sigmoid routing into the custom Hash alias. Included in PR64; ported once. |
 
 The 0.30 router kernel and dtype behavior, KDA AscendC implementation, KV pool
 hooks, Attention Residual implementation, fine-grained TP padding, hardware
@@ -42,6 +44,31 @@ package must be installed in every worker environment. This PR does not bundle
 those external kernels. Registration alone does not override dtype, activation,
 quantization, LoRA or hardware eligibility checks. MegaMoE uses its fused
 pipeline and need not show these standalone operators in profiling.
+Recipes registration also overwrites some `torch_npu` Python aliases. A5
+softmax/sigmoid routing now uses `torch.ops.npu.npu_moe_gating_top_k` directly,
+preserving native arguments, softmax renormalization and int32 expert IDs.
+
+## Decode SuperKernel
+
+Use the existing 0.30 `ascend_compilation_config.enable_super_kernel` flag.
+Its existing default inheritance from `enable_static_kernel` is unchanged;
+there is no additional Kimi SuperKernel switch. On A5 Kimi with shared
+multistream and the v1 runner, capture optimizes only graphs that emitted
+eligible Decode MoE scopes. Draft, Prefill and unsupported batches do not emit
+these scopes. Other models and the v2 runner retain their generic 0.30 policy.
+
+Named scopes cover Router/latent down through routed Combine and latent
+norm/up. Nested exclusions keep shared AllGather, shared ReduceScatter, the
+final join and Add outside fusion. The owning ACL graph is optimized once
+after successful capture with `dcci_disable_on_kernel=[".*"]` and
+`auto_op_parallel=1`; replay never repeats optimization. Capture tracking is
+local to the forward context and restores nested/failed captures. Compiler
+options/cache keys distinguish this policy from generic whole-model fusion.
+Draft configs are marked before upstream validation and restored on failure.
+
+Actual kernel fusion and speedups require NPU profiling. A named scope does
+not guarantee a single fused hardware kernel. The existing Decode eligibility,
+weight layout, scale packing and native routing contracts are retained.
 
 The 0.30 `attn_res_fwd` aliasing implementation is unchanged. The model's added
 compile decorator is removed, so full text-backbone compilation is not claimed
@@ -73,13 +100,14 @@ The sequence is:
 5. Shared activation completion releases routed GMM1.
 6. GMM1 completion releases shared Down input quantization and projection, which may overlap routed activation,
    output quantization and GMM2.
-7. After routed finalize, submit shared ReduceScatter. The final Add waits for
-   shared completion through the existing output-transform join.
+7. Submit shared ReduceScatter immediately after shared Down on its producer
+   stream; it can overlap routed activation, GMM2 and Combine. The final Add
+   waits for shared completion through the output-transform join.
 
-**Deliberate difference from the 0.27 schedule:** shared ReduceScatter is not
-moved ahead of routed finalize. The 0.30 code explicitly orders these
-collectives to avoid HCCL deadlocks when ranks progress differently. Compute
-can overlap; the newer communication ordering takes precedence.
+Early shared ReduceScatter applies only to the validated MC2 Decode ladder;
+all other paths retain 0.30's collective ordering. Shared input AllGather still
+joins before routed EP communication. Multi-rank capture/replay must validate
+the new overlap; CPU dependency tests do not establish HCCL deadlock freedom.
 
 The per-forward schedule is passed through typed fused-expert/MLP inputs.
 Its temporary layer reference is cleared in the existing `finally` block.
@@ -133,6 +161,7 @@ python tests/ut/ops/test_kimi_kda_compile.py -v
 python tests/ut/ops/test_kimi_v30_moe.py -v
 python tests/ut/ops/test_kimi_v30_review.py -v
 python tests/ut/ops/test_kimi_situ_loading.py -v
+python tests/ut/compilation/test_kimi_moe_superkernel.py -v
 python tests/ut/worker/test_kimi_megamoe_phase_policy.py -v
 ```
 
