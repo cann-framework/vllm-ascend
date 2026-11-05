@@ -86,6 +86,8 @@ def _ascend_kimi_moe(
         and runner._can_run_kimi_decode(hidden_states if shared_experts_input is None else shared_experts_input)
     )
     runner._kimi_superkernel_active = enabled
+    runner._kimi_topk = None
+    runner._kimi_shared_output_done = None
     try:
         with moe_superkernel_scope(f"{layer_name}_1.moe" if enabled else None, enabled):
             return runner._forward_standard(
@@ -99,6 +101,8 @@ def _ascend_kimi_moe(
         runner._kimi_router_logits = None
         runner._kimi_router_done = None
         runner._kimi_superkernel_active = False
+        runner._kimi_topk = None
+        runner._kimi_shared_output_done = None
 
 
 direct_register_custom_op(
@@ -475,7 +479,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         if self._can_overlap_sp_shared_with(self.routed_input_transform):
             assert shared_experts is not None
             with moe_superkernel_scope(None, getattr(self, "_kimi_superkernel_active", False)):
-                prepared_input = shared_experts.prepare_input_async(hidden_states)
+                prepared_input = shared_experts.prepare_input_async(
+                    hidden_states, comm_stream=getattr(self, "_kimi_shared_comm_stream", None)
+                )
         kimi_gate = getattr(self, "_kimi_gate", None)
         if kimi_gate is not None and router_logits is not None:
             self._kimi_decode_active = self._can_run_kimi_decode(hidden_states)
@@ -498,10 +504,17 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 with scope:
                     self._kimi_router_logits = self._compute_router_logits(hidden_states, hidden_states)
                 self._kimi_router_done = torch.npu.current_stream().record_event() if stream is not None else None
-            # Retain 0.30's Router-before-latent-GEMM order. Shared input
-            # AllGather overlaps both; do not launch two full Cube GEMMs
-            # concurrently just because routing now has its own stream.
-            if self._kimi_router_done is not None:
+                if self._kimi_decode_active:
+                    self._kimi_topk = self._prepare_kimi_decode_topk(hidden_states, self._kimi_router_logits)
+            # Quantization overlaps Router GEMM; the projection waits only for
+            # GEMM, not TopK. Preserve the registered linear's padding/scales.
+            if self._kimi_decode_active and routed_input is None:
+                scheme = self.routed_input_transform.quant_method.quant_method
+                prepared = scheme.prepare_input_for_overlap(self.routed_input_transform, hidden_states)
+                if self._kimi_router_done is not None:
+                    torch.npu.current_stream().wait_event(self._kimi_router_done)
+                routed_input = self.routed_input_transform(prepared if prepared is not None else hidden_states)[0]
+            elif self._kimi_router_done is not None:
                 torch.npu.current_stream().wait_event(self._kimi_router_done)
         if routed_input is None:
             routed_input, shared_input = super().apply_routed_input_transform(hidden_states)
@@ -512,6 +525,21 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             shared_input = prepared_input.hidden_states
         return routed_input, shared_input
 
+    def _prepare_kimi_decode_topk(self, hidden_states, logits):
+        """Select on the Router stream without reading the latent activations.
+
+        Only the exact non-custom router admitted by _can_run_kimi_decode is
+        allowed here. Match MC2's SP padding, retaining its actual prepare for
+        hidden states, masks, scales and finalize bookkeeping.
+        """
+        comm = get_moe_comm_method(MoECommType.MC2, self.moe_config)
+        pad = max(0, _EXTRA_CTX.padded_num_tokens // comm.prepare_finalize.tp_size - hidden_states.shape[0])
+        if pad:
+            logits = F.pad(logits, (0, 0, 0, pad))
+        metadata = hidden_states.new_empty((hidden_states.shape[0] + pad, self.moe_config.hidden_dim))
+        weights, ids = self.routed_experts._select_experts(metadata, logits, _EXTRA_CTX.in_profile_run, None)
+        return weights, ids, torch.npu.current_stream().record_event()
+
     def apply_routed_output_transform(self, fused_output: torch.Tensor) -> torch.Tensor:
         """Run the latent up projection before joining the SP shared output."""
         fused_output = super().apply_routed_output_transform(fused_output)
@@ -519,7 +547,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         if self._can_overlap_sp_shared_with(self.routed_output_transform):
             assert shared_experts is not None
             with moe_superkernel_scope(None, getattr(self, "_kimi_superkernel_active", False)):
-                shared_experts.wait_for_output()
+                output_done = getattr(self, "_kimi_shared_output_done", None)
+                if output_done is not None:
+                    torch.npu.current_stream().wait_event(output_done)
+                else:
+                    shared_experts.wait_for_output()
         return fused_output
 
     def _prepare_router_input(
@@ -677,6 +709,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             and type(router) is AscendFusedTopKRouter
             and router.custom_routing_function is None
             and router.tid2eid is None
+            and router.bias_vl is None
             and self._can_overlap_sp_shared_with(self.routed_input_transform)
             and self._can_overlap_sp_shared_with(self.routed_output_transform)
             and self.moe_config.is_sequence_parallel
@@ -734,6 +767,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                         prepared_shared_input,
                         ready,
                         enable_superkernel=getattr(self, "_kimi_superkernel_active", False),
+                        comm_stream=getattr(self, "_kimi_shared_comm_stream", None),
                     )
                     routed_out, _ = self.routed_experts.forward_impl(
                         hidden_states=hidden_states,
@@ -741,8 +775,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                         input_ids=input_ids,
                         shared_expert_schedule=schedule,
                         router_stream=getattr(self, "_kimi_router_stream", None),
+                        precomputed_topk=getattr(self, "_kimi_topk", None),
                     )
-                    return schedule.finalize(), routed_out
+                    shared_out = schedule.finalize()
+                    self._kimi_shared_output_done = schedule.output_done
+                    return shared_out, routed_out
                 shared_input_ready = router_output_ready = ready
                 prepared_execution = self._prepare_shared_for_router_overlap(prepared_shared_input, ready)
                 submitted_gate_up = (

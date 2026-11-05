@@ -12,7 +12,7 @@ It transfers their behavior through the 0.30 interfaces rather than restoring
 | 5 | `6cbcbbf71` | Keep MXFP4 shared SiTU output in BF16 for the registered Down linear to quantize. PR64 supersedes the earlier Prefill core limit: limits now belong only to the Decode ladder. |
 | 35 | `af5fbc0db` | Port sparse unquantized SiTU into `_unified_apply_activation`; port grouped SiTU/MX quant into the W4A8 MXFP quant method; request expert counts from MC2 dispatch. Keep the new GMM hook architecture and its LoRA/EPLB paths. |
 | 42 | `b41a64714` | Select sparse SiTU for A5 Kimi shared experts, preserving the registered Dense MLP and checkpoint parameter names. CPU, other devices and unavailable custom operators retain the native fallback. |
-| 45 | `9f87b17b1` (source commit) | Included in PR48 ancestry. Keep Router GEMM and MC2/SP TopK on the per-layer Router stream, join prepared inputs before TopK and join TopK before Dispatch. Retain 0.30 common padding and collective ordering. |
+| 45 | `9f87b17b1` (source commit) | Included in PR48 ancestry. Keep Router GEMM and eligible MC2/SP TopK on the Router stream, with a dedicated model-owned shared communication stream. Retain 0.30 common prepare for activation padding/masks; join precomputed TopK before Dispatch. |
 | 48 | `0275e9c89` | Keep 0.30's latent-input/output transforms, eager single-group GMM selection, output normalization and runtime reductions. Move the original registered router gate into an opaque MoE operation and overlap shared input gather with Router/latent down. Never project latent input twice. |
 | 50 | `eb8dda36e` | Already covered: 0.30 router selection and quant-method application retain FP32 TopK weights. Add a regression; do not restore old per-method dtype policy code. |
 | 51 | `1288cd435` | Add a per-forward Decode schedule on top of 0.30's shared executor and quant hooks. Both BF16 and MXFP4 shared SiTU wait for Dispatch; routed GMM1 waits for that activation; shared Down starts after GMM1. |
@@ -108,19 +108,24 @@ core usage. Vector-resource waits are present for both weight types.
 
 The sequence is:
 
-1. Start shared AllGather, overlapping the Router and subsequent latent down.
-   Preserve 0.30's Router-before-latent-GEMM order. MC2/SP TopK uses the Router
-   stream after joining 0.30's common prepare; other paths keep their original stream.
+1. Start shared AllGather on a dedicated communication stream. Router GEMM
+   and TopK run consecutively on the Router stream. The main stream quantizes
+   latent input before waiting for Router GEMM, then runs latent down while
+   TopK may execute. Both branches can overlap AllGather.
 2. Join shared AllGather before submitting routed EP communication, preserving
    0.30's cross-process-group ordering.
-3. Submit shared Gate/Up before routed TopK and Dispatch.
+3. Join TopK after latent down and the original MC2 prepare. Submit shared
+   Gate/Up against the event immediately before Dispatch, so Gate/Up and
+   Dispatch share a release point. Gate/Up preparation/quantization remains
+   outside the projection core limit.
 4. Dispatch completion releases shared SiTU.
 5. Shared activation completion releases routed GMM1.
 6. GMM1 completion releases shared Down input quantization and projection, which may overlap routed activation,
    output quantization and GMM2.
-7. Submit shared ReduceScatter immediately after shared Down on its producer
-   stream; it can overlap routed activation, GMM2 and Combine. The final Add
-   waits for shared completion through the output-transform join.
+7. Submit shared ReduceScatter on the communication stream, waiting only for
+   shared Down's completion event. It can overlap routed activation, GMM2 and
+   Combine. After latent up, the main stream waits for that invocation's RS
+   completion event before Add.
 
 Early shared ReduceScatter applies only to the validated MC2 Decode ladder;
 all other paths retain 0.30's collective ordering. Shared input AllGather still
@@ -177,6 +182,7 @@ collectives; they are not hardware or full-package import validation.
 ```bash
 python tests/ut/ops/test_kimi_kda_compile.py -v
 python tests/ut/ops/test_kimi_v30_moe.py -v
+python tests/ut/ops/test_kimi_moe_front_overlap.py -v
 python tests/ut/ops/test_kimi_v30_review.py -v
 python tests/ut/ops/test_kimi_situ_loading.py -v
 python tests/ut/compilation/test_kimi_moe_superkernel.py -v

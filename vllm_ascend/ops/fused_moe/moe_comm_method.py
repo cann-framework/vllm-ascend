@@ -176,13 +176,14 @@ class MoECommMethod(ABC):
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         assert moe_comm_method is not None, "Missing communication context"
 
-        before_dispatch_evt = torch.npu.current_stream().record_event()
-
         token_dispatch_input = build_token_dispatch_input(
             fused_experts_input=fused_experts_input,
             prefer_expert_token_counts=isinstance(self.token_dispatcher, TokenDispatcherWithMC2)
             and _prefer_expert_token_counts_for_situ(self.moe_config, fused_experts_input),
         )
+        before_dispatch_evt = torch.npu.current_stream().record_event()
+        if fused_experts_input.shared_expert_schedule is not None:
+            fused_experts_input.shared_expert_schedule.before_dispatch(before_dispatch_evt)
         token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
         if fused_experts_input.shared_expert_schedule is not None:
             fused_experts_input.shared_expert_schedule.after_dispatch()

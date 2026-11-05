@@ -176,12 +176,14 @@ class TestSituHooks(unittest.TestCase):
 
 class TestDecodeDependencies(unittest.TestCase):
     def test_bf16_and_mxfp_share_vector_barriers(self):
-        self.check_dependency_graph(False)
-        self.check_dependency_graph(True)
+        for quantized in (False, True):
+            for superkernel in (False, True):
+                with self.subTest(quantized=quantized, superkernel=superkernel):
+                    self.check_dependency_graph(quantized, superkernel)
 
-    def check_dependency_graph(self, quantized):
+    def check_dependency_graph(self, quantized, superkernel):
         nodes = []
-        last = {"main": None, "shared": None}
+        last = {"main": None, "shared": None, "comm": None}
         current = ["main"]
 
         def op(name, deps=()):
@@ -263,18 +265,25 @@ class TestDecodeDependencies(unittest.TestCase):
             _pad_and_reduce_scatter=scatter,
         )
         op("ready")
-        schedule = ns["KimiDecodeSchedule"](shared, x, last["main"])
+        schedule = ns["KimiDecodeSchedule"](
+            shared, x, last["main"], comm_stream=streams["comm"], enable_superkernel=superkernel
+        )
+        self.assertFalse(any(name == "gate_up" for _, name, _ in nodes))
+        op("before_dispatch")
+        schedule.before_dispatch(last["main"])
         op("dispatch")
         schedule.after_dispatch()
         op("gmm1")
-        schedule.after_gmm1()
+        with patch.object(torch.Tensor, "record_stream") as comm_record:
+            schedule.after_gmm1()
+        comm_record.assert_called_once_with(streams["comm"])
         op("routed_situ")
         op("gmm2")
         op("combine")
         with patch.object(torch.Tensor, "record_stream") as record_stream:
             actual = schedule.finalize()
         record_stream.assert_called_once_with(streams["main"])
-        npu.current_stream().wait_event(last["shared"])
+        npu.current_stream().wait_event(schedule.output_done)
         op("add")
         torch.testing.assert_close(actual, x * 2 + 3)
 
@@ -283,6 +292,7 @@ class TestDecodeDependencies(unittest.TestCase):
 
         ids = {name: i for i, (_, name, _) in enumerate(nodes) if name != "wait"}
         for before, after in [
+            ("before_dispatch", "gate_up"),
             ("dispatch", "shared_situ"),
             ("shared_situ", "gmm1"),
             ("gmm1", "shared_down"),
@@ -291,6 +301,9 @@ class TestDecodeDependencies(unittest.TestCase):
         ]:
             self.assertIn(ids[before], ancestors(ids[after]))
         self.assertNotIn(ids["shared_down"], ancestors(ids["routed_situ"]))
+        self.assertNotIn(ids["gate_up"], ancestors(ids["dispatch"]))
+        self.assertNotIn(ids["dispatch"], ancestors(ids["gate_up"]))
+        self.assertEqual(nodes[ids["shared_rs"]][0], "comm")
         self.assertNotIn(ids["combine"], ancestors(ids["shared_rs"]))
         self.assertLess(ids["shared_rs"], ids["routed_situ"])
         shared._prepare_linear_input_for_overlap.assert_not_called()

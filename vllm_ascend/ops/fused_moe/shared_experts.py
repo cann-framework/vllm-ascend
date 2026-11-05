@@ -335,6 +335,7 @@ class AscendSharedExperts:
     def prepare_input_async(
         self,
         hidden_states: torch.Tensor,
+        comm_stream: torch.npu.Stream | None = None,
     ) -> PreparedSharedExpertInput:
         """Start the SP-only input all-gather on the shared-expert stream.
 
@@ -346,12 +347,16 @@ class AscendSharedExperts:
             return PreparedSharedExpertInput(hidden_states=hidden_states)
 
         input_ready = torch.npu.current_stream().record_event()
-        with npu_stream_switch(shared_experts_calculation_stream(), enabled=True):
+        stream = comm_stream if comm_stream is not None else shared_experts_calculation_stream()
+        hidden_states.record_stream(stream)
+        with npu_stream_switch(stream, enabled=True):
             torch.npu.current_stream().wait_event(input_ready)
             # Keep TP padding across the custom-op boundary; the shared MLP
             # trims it before computation.
             hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
             all_gather_done = torch.npu.current_stream().record_event()
+        hidden_states.record_stream(shared_experts_calculation_stream())
+        hidden_states.record_stream(torch.npu.current_stream())
         return PreparedSharedExpertInput(
             hidden_states=hidden_states,
             is_gathered=True,
