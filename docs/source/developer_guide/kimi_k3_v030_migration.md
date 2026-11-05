@@ -16,14 +16,37 @@ It transfers their behavior through the 0.30 interfaces rather than restoring
 | 48 | `0275e9c89` | Keep 0.30's latent-input/output transforms, eager single-group GMM selection, output normalization and runtime reductions. Move the original registered router gate into an opaque MoE operation and overlap shared input gather with Router/latent down. Never project latent input twice. |
 | 50 | `eb8dda36e` | Already covered: 0.30 router selection and quant-method application retain FP32 TopK weights. Add a regression; do not restore old per-method dtype policy code. |
 | 51 | `1288cd435` | Add a per-forward Decode schedule on top of 0.30's shared executor and quant hooks. Both BF16 and MXFP4 shared SiTU wait for Dispatch; routed GMM1 waits for that activation; shared Down starts after GMM1. |
-| 54 | `9172ba684` | Keep KDA metadata dispatch opaque using the existing `no_compile_layers` registry, BFG/QKV tracing protection and FIA static blacklist entry. The added text-model `support_torch_compile` decorator has been removed pending AttnRes AOT alias compatibility. |
+| 54 | `9172ba684` | Enable the text-model `support_torch_compile` boundary; keep KDA metadata dispatch opaque using `no_compile_layers`, BFG/QKV tracing protection and the FIA static blacklist entry. |
 | 62 | `723ee0633` | No code needed: 0.30 no longer contains `_plan_mega_kda` or its metadata fallback logs. Do not restore that obsolete path. |
 | 20 | `e689fdd0a` | Keep the 0.30 CANN MegaMoE backend, per-model communication lookup, activation binding, weight layouts and HCCL restore lifecycle. Port Kimi prefill/decode/idle agreement into the existing CPU DP collective and selector. |
 
 The 0.30 router kernel and dtype behavior, KDA AscendC implementation, KV pool
-hooks, Attention Residual implementation, fine-grained TP padding, hardware
+hooks, fine-grained TP padding, hardware
 capability registry, and non-Kimi communication policies remain authoritative.
-No new environment variable or mutable module-level registry is introduced.
+No mutable module-level registry is introduced.
+
+## Combined AttnRes and compilation support
+
+This branch combines GitHub `cann-framework/vllm-ascend` PR5 at `81e5e8f31`
+with PR6 at `cea1c3d38`. These GitHub PR numbers are separate from the GitCode
+source PR numbers in the table above.
+
+PR5 adds `attn_res_mode` values `fused`, `two_phase`, `original` and `native`.
+The default is `fused`, using optional transformer/DSL operators; unavailable
+operators fall back to the Torch `two_phase` implementation. The centralized
+`VLLM_ASCEND_KIMI_K3_ATTNRES_FUSED_ENABLED` switch defaults to `1`; setting it
+to `0` makes a requested `fused` mode use `two_phase`. The non-persistent query
+buffers refresh in place after weight loading, preserving captured references.
+PP/SP transport and DSpark auxiliary-state contracts are retained.
+
+The Kimi text model again uses `@support_torch_compile`. CPU fullgraph tests
+cover Dynamo and AOT functionalization for `original`, `two_phase`, and the
+fused adapter with simulated kernels. Actual fused NPU kernels still require
+hardware validation. Explicit `native` mode keeps the 0.30 `attn_res_fwd`
+implementation: its aliased outputs remain incompatible with the AOT
+functionalization path described in the reported error. Use `two_phase` or
+`original` for that path; restoring the decorator does not fix the native
+operator schema.
 
 ## Recipes SiTU availability
 
@@ -42,11 +65,6 @@ package must be installed in every worker environment. This PR does not bundle
 those external kernels. Registration alone does not override dtype, activation,
 quantization, LoRA or hardware eligibility checks. MegaMoE uses its fused
 pipeline and need not show these standalone operators in profiling.
-
-The 0.30 `attn_res_fwd` aliasing implementation is unchanged. The model's added
-compile decorator is removed, so full text-backbone compilation is not claimed
-as a delivered feature. Removing that decorator is not equivalent to setting
-`enforce_eager` or disabling every graph mechanism in the runtime.
 
 ## Decode execution
 
