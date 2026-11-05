@@ -731,6 +731,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         input_ids: torch.Tensor | None = None,
         shared_expert_schedule=None,
         router_stream: torch.npu.Stream | None = None,
+        precomputed_topk: tuple[torch.Tensor, torch.Tensor, torch.npu.Event] | None = None,
     ):
         forward_context = get_forward_context()
         # When static kernels are enabled, the forward pass runs twice
@@ -763,13 +764,22 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         pertoken_scale = prepare_output.pertoken_scale
         if self.router is None:
             raise RuntimeError("AscendRoutedExperts requires a router for expert selection.")
-        topk_weights, topk_ids = self._select_experts_with_stream(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            enable_force_load_balance=enable_force_load_balance,
-            input_ids=input_ids,
-            router_stream=router_stream,
-        )
+        if precomputed_topk is not None:
+            topk_weights, topk_ids, topk_done = precomputed_topk
+            if topk_weights.shape[0] != hidden_states.shape[0] or topk_ids.shape != topk_weights.shape:
+                raise RuntimeError("Precomputed Kimi TopK does not match MC2 prepared token padding")
+            main_stream = torch.npu.current_stream()
+            main_stream.wait_event(topk_done)
+            topk_weights.record_stream(main_stream)
+            topk_ids.record_stream(main_stream)
+        else:
+            topk_weights, topk_ids = self._select_experts_with_stream(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                enable_force_load_balance=enable_force_load_balance,
+                input_ids=input_ids,
+                router_stream=router_stream,
+            )
         self.ascend_pertoken_scale = pertoken_scale
         self.ascend_mc2_mask = mc2_mask
         self._ascend_shared_schedule = shared_expert_schedule

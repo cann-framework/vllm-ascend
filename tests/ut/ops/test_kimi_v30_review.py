@@ -351,6 +351,7 @@ class TestKimiMigrationReview(unittest.TestCase):
         router = Router()
         router.custom_routing_function = None
         router.tid2eid = None
+        router.bias_vl = None
         scheme = Routed()
         scheme.use_expert_weight_list = False
         runner.routed_experts = NS(
@@ -365,6 +366,7 @@ class TestKimiMigrationReview(unittest.TestCase):
         with patch.dict("sys.modules", modules):
             self.assertTrue(runner._can_run_kimi_decode(x))
             for obj, attribute, value in [
+                (router, "bias_vl", object()),
                 (ns["_EXTRA_CTX"], "is_draft_model", True),
                 (runner.routed_experts, "_use_v2_model_runner", True),
                 (scheme, "use_expert_weight_list", True),
