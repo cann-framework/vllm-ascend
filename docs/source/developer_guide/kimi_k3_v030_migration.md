@@ -87,7 +87,8 @@ after successful capture with `dcci_disable_on_kernel=[".*"]` and
 `auto_op_parallel=1`; replay never repeats optimization. Capture tracking is
 local to the forward context and restores nested/failed captures. Compiler
 options/cache keys distinguish this policy from generic whole-model fusion.
-Draft configs are marked before upstream validation and restored on failure.
+Draft configuration keeps the v0.30 construction order: mark the returned copy
+with `runner_type="draft"` without replacing the proposer's target configuration.
 
 Actual kernel fusion and speedups require NPU profiling. A named scope does
 not guarantee a single fused hardware kernel. The existing Decode eligibility,
