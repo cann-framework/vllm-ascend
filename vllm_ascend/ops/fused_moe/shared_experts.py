@@ -37,7 +37,6 @@ from vllm_ascend.ops.fused_moe.dataclass.shared_experts import (
     PreparedSharedExpertInput,
     RoutedMoEMilestones,
 )
-from vllm_ascend.ops.fused_moe.kimi_decode_schedule import MXFP_SHARED_CORE_LIMIT
 from vllm_ascend.ops.fused_moe.moe_utils import _pad_tokens_with_cat
 from vllm_ascend.quantization.prepared_linear_input import PreparedLinearInput
 from vllm_ascend.quantization.quant_type import QuantType
@@ -510,17 +509,6 @@ class AscendSharedExperts:
             return nullcontext()
         return npu_stream_switch(shared_experts_calculation_stream(), enabled=True)
 
-    def _gate_up_core_context(self):
-        # PR5 also limits MXFP4 Gate/Up outside the specialized Decode ladder.
-        # Enter this context only after selecting the producer stream.
-        if (
-            self.multistream_overlap
-            and isinstance(self.situ_activation, AscendSharedSparseSituAndMul)
-            and self._select_mlp_path() is SharedExpertMLPPath.A8_MXFP_FUSED
-        ):
-            return torch_npu.npu.npugraph_ex.scope.limit_core_num(*MXFP_SHARED_CORE_LIMIT)
-        return nullcontext()
-
     def enqueue_gate_up_after_router(
         self,
         prepared_execution: PreparedSharedExpertExecution,
@@ -535,7 +523,7 @@ class AscendSharedExperts:
         """
         path = self._select_mlp_path()
         gate_up_input_scale = None
-        with self._compute_stream_context(), self._gate_up_core_context():
+        with self._compute_stream_context():
             self._wait_for_milestone(router_output_ready, "router_output_ready")
             if path is SharedExpertMLPPath.A8_INT_FUSED:
                 # W8A8/W4A8: INT8 activations with INT8 or INT4 weights.

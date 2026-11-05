@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 def load_class(path, name, methods, ns, base=None):
+    ns.setdefault("moe_superkernel_scope", lambda *args: nullcontext())
     tree = ast.parse((ROOT / path).read_text())
     node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name)
     node.bases = [] if base is None else [ast.Name(id=base, ctx=ast.Load())]
@@ -157,7 +158,6 @@ class TestKimiMigrationReview(unittest.TestCase):
                 "enqueue_gate_up_after_router",
                 "_wait_for_milestone",
                 "_compute_stream_context",
-                "_gate_up_core_context",
                 "wait_for_output",
             },
             ns,
@@ -246,7 +246,12 @@ class TestKimiMigrationReview(unittest.TestCase):
         runner = NS(_forward_standard=run)
         resolve = Mock(return_value=runner)
         namespace = dict(
-            torch=torch, _layer_name_type=str, get_layer_from_name=resolve, _resolve_layer_name=lambda name: name
+            torch=torch,
+            _layer_name_type=str,
+            get_layer_from_name=resolve,
+            _resolve_layer_name=lambda name: name,
+            get_ascend_config=lambda: NS(ascend_compilation_config=NS(enable_super_kernel=False)),
+            moe_superkernel_scope=lambda *args: nullcontext(),
         )
         exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(path), "exec"), namespace)
         library = torch.library.Library("kimi_moe_review", "FRAGMENT")
@@ -332,7 +337,7 @@ class TestKimiMigrationReview(unittest.TestCase):
             get_forward_context=lambda: NS(attn_metadata={"layer": NS(num_prefills=0)}),
             get_current_hardware_profile=lambda: NS(supports=lambda cap: True),
             HardwareCapability=NS(CANN_MEGAMOE_MXFP=1),
-            _EXTRA_CTX=NS(moe_comm_type="mc2"),
+            _EXTRA_CTX=NS(moe_comm_type="mc2", is_draft_model=False),
             MoECommType=NS(MC2="mc2"),
             QuantType=NS(W4A8MXFP="fp4"),
         )
@@ -348,7 +353,9 @@ class TestKimiMigrationReview(unittest.TestCase):
         router.tid2eid = None
         scheme = Routed()
         scheme.use_expert_weight_list = False
-        runner.routed_experts = NS(quant_method=NS(quant_method=scheme), router=router, dynamic_eplb=False)
+        runner.routed_experts = NS(
+            quant_method=NS(quant_method=scheme), router=router, dynamic_eplb=False, _use_v2_model_runner=False
+        )
         layer = NS(
             gate_up_proj=NS(weight=torch.ones(2, 2, dtype=torch.bfloat16)),
             down_proj=NS(weight=torch.ones(2, 2, dtype=torch.bfloat16)),
@@ -358,6 +365,8 @@ class TestKimiMigrationReview(unittest.TestCase):
         with patch.dict("sys.modules", modules):
             self.assertTrue(runner._can_run_kimi_decode(x))
             for obj, attribute, value in [
+                (ns["_EXTRA_CTX"], "is_draft_model", True),
+                (runner.routed_experts, "_use_v2_model_runner", True),
                 (scheme, "use_expert_weight_list", True),
                 (router, "custom_routing_function", lambda: None),
                 (router, "tid2eid", object()),

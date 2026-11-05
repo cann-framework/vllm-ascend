@@ -39,35 +39,27 @@ class TestSituLoading(unittest.TestCase):
                 self.assertIn("native fallbacks", warning[0])
                 self.assertIn("grouped_situ_mx_quant", warning[1])
 
-    def test_pr5_gate_up_limit_is_scoped_to_kimi_mxfp_multistream(self):
-        class Sparse:
-            pass
-
-        limit = Mock(return_value=nullcontext())
+    def test_prefill_gate_up_has_no_decode_core_limit(self):
+        limit = Mock(side_effect=AssertionError("Decode limit leaked into Prefill"))
         ns = dict(
             nullcontext=nullcontext,
-            AscendSharedSparseSituAndMul=Sparse,
-            SharedExpertMLPPath=NS(A8_MXFP_FUSED=1),
-            MXFP_SHARED_CORE_LIMIT=(16, 32),
+            SharedExpertMLPPath=NS(A8_INT_FUSED=0, A8_MXFP_FUSED=1),
+            SubmittedSharedExpertGateUp=NS,
             torch_npu=NS(npu=NS(npugraph_ex=NS(scope=NS(limit_core_num=limit)))),
         )
-        load("vllm_ascend/ops/fused_moe/shared_experts.py", {"_gate_up_core_context"}, ns, "AscendSharedExperts")
+        load("vllm_ascend/ops/fused_moe/shared_experts.py", {"enqueue_gate_up_after_router"}, ns, "AscendSharedExperts")
         shared = ns["AscendSharedExperts"]()
-        for enabled, activation, path, expected in (
-            (True, Sparse(), 1, True),
-            (False, Sparse(), 1, False),
-            (True, object(), 1, False),
-            (True, Sparse(), 2, False),
-        ):
-            limit.reset_mock()
-            shared.multistream_overlap = enabled
-            shared.situ_activation = activation
-            shared._select_mlp_path = lambda path=path: path
-            with shared._gate_up_core_context():
-                pass
-            self.assertEqual(limit.called, expected)
-            if expected:
-                limit.assert_called_once_with(16, 32)
+        shared._compute_stream_context = nullcontext
+        shared._wait_for_milestone = Mock()
+        shared._select_mlp_path = lambda: 1
+        output = object()
+        projection = Mock(return_value=(output,))
+        shared.layer = NS(gate_up_proj=projection)
+        prepared = NS(hidden_states=object(), gate_up_input=(object(), object()), local_dp_metadata=None)
+        result = shared.enqueue_gate_up_after_router(prepared, None)
+        self.assertIs(result.gate_up, output)
+        projection.assert_called_once_with(prepared.gate_up_input)
+        limit.assert_not_called()
 
     def test_pr45_topk_waits_for_prepare_and_dispatch_waits_for_topk(self):
         events = []
