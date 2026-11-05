@@ -1,6 +1,6 @@
 # Kimi K3 changes ported to v0.30.0
 
-This migration uses upstream `releases/v0.30.0` at `8a913c9f9` as its base (initial comparison: `56848620f`).
+This migration uses `cann-framework/vllm-ascend` branch `releases/v0.30.0` at `56848620f` as its base.
 The source is the following merged PRs in `wangtao43/vllm-ascend` on GitCode.
 It transfers their behavior through the 0.30 interfaces rather than restoring
 0.27 files or merging the entire 0.27 release branch.
@@ -43,9 +43,9 @@ The sequence is:
 2. Join shared AllGather before submitting routed EP communication, preserving
    0.30's cross-process-group ordering.
 3. Submit shared Gate/Up before routed TopK and Dispatch.
-4. Dispatch completion releases shared SiTU/Down input preparation.
+4. Dispatch completion releases shared SiTU.
 5. Shared activation completion releases routed GMM1.
-6. GMM1 completion releases shared Down, which may overlap routed activation,
+6. GMM1 completion releases shared Down input quantization and projection, which may overlap routed activation,
    output quantization and GMM2.
 7. After routed finalize, submit shared ReduceScatter. The final Add waits for
    shared completion through the existing output-transform join.
@@ -129,7 +129,7 @@ latency. The local environment has no NPU or complete vLLM runtime, so these
 hardware results must be supplied separately. A first-token match alone does
 not establish multi-token correctness.
 
-Local results after review: 27 CPU tests passed; changed Python files passed Ruff and AST
+Local results after review: 29 CPU tests passed; changed Python files passed Ruff and AST
 parsing; the migration document passed markdownlint; `git diff --check` passed.
 `bash format.sh ci` was attempted twice outside the sandbox, but actionlint's
 Go environment download failed first with a TLS EOF and then a timeout at
@@ -170,3 +170,17 @@ simulations do not prove HCCL stability or real-weight precision.
 The follow-up reran the full-format command with a 60-second limit; it again
 stalled installing actionlint and timed out. Targeted Ruff, syntax and Markdown
 checks passed. The existing adapter forward test also passed in isolation.
+
+## Execution-path alignment
+
+Shared MXFP4 uses the sparse SiTU module in Prefill, serial and staged Decode
+paths; it no longer bypasses the module through fused SiTU/quantization.
+A5 routed SiTU always uses separate GMM1 plus activation/quantization, including
+the optional-operator fallback, so enabling multistream does not change that
+operator choice. Down input quantization remains after GMM1, matching PR51.
+Gate/Up core limits are applied on the shared producer stream. Staged Decode
+retains PR51's validated quant schemes and excludes custom/lookup routing,
+expert weight lists and output gates.
+
+The correct upstream is `cann-framework/vllm-ascend`. The mistaken vllm-project
+PR #21051 is closed; its unrelated README-only base update is excluded.

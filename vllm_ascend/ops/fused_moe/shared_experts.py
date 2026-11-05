@@ -638,6 +638,12 @@ class AscendSharedExperts:
             milestones.shared_activation_overlap_start,
             "shared_activation_overlap_start",
         )
+        if isinstance(self.situ_activation, AscendSharedSparseSituAndMul):
+            # Keep the same activation/rounding in integrated, serial and
+            # staged Kimi paths. The Down wrapper owns subsequent MX quant.
+            activated = self.apply_activation(submitted_gate_up.gate_up)
+            self._wait_for_routed_stage(milestones, milestones.routed_combine_start, "routed_combine_start")
+            return self.part2(submitted_gate_up.hidden_states, activated)
         if self.situ_activation is not None:
             quantized_x, swiglu_out_scale = torch.ops._C_ascend.situ_mx_quant(
                 x=submitted_gate_up.gate_up,
