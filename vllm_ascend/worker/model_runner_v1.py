@@ -6403,7 +6403,6 @@ class NPUModelRunner(GPUModelRunner):
                         store_on_host=self.sparse_kv_offload_enabled,
                         model_version=model_version,
                         indexes_kv_by_block_stride=indexes_kv_by_block_stride,
-                        flash_mla_layout=getattr(getattr(attn_module, "impl", None), "flash_mla_layout", "pa_bbnd"),
                     )
                 elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     if getattr(attn_module.impl, "fa_quant_layer", False):
@@ -6442,7 +6441,6 @@ class NPUModelRunner(GPUModelRunner):
                         non_causal_multi_token_decode=spec.non_causal_multi_token_decode,
                         model_version=model_version,
                         indexes_kv_by_block_stride=indexes_kv_by_block_stride,
-                        flash_mla_layout=getattr(getattr(attn_module, "impl", None), "flash_mla_layout", "pa_bbnd"),
                         **ratio_kwargs,
                     )
                     attn_layer_names.add(layer_name)

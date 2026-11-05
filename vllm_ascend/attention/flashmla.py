@@ -440,12 +440,23 @@ class FlashMLAMetadataBuilder:
         used = torch.zeros(rows, **ints)
         lengths = torch.zeros(rows, **ints)
         if adapter.config.layout_kv == "PA_NZ":
-            # The 0.27 metadata operator has no meta implementation.  Build
-            # one dummy device schedule here; refresh() overwrites it in place.
-            cu.copy_(torch.arange(rows + 1, dtype=torch.int32, device=self.device))
-            used.fill_(1)
-            lengths.fill_(1)
-            schedule = adapter.build_metadata(lengths, cu, used, q_len=1)
+            # Prefer the package Meta implementation so full-graph capture
+            # never records a device metadata op. Older packages may not
+            # implement Meta for this operator; fall back to one device call
+            # before capture (the schedule is retained at a stable address).
+            try:
+                schedule_meta = adapter.build_metadata(
+                    torch.empty_like(lengths, device="meta"),
+                    torch.empty_like(cu, device="meta"),
+                    torch.empty_like(used, device="meta"),
+                    q_len=1,
+                )
+                schedule = torch.empty_like(schedule_meta, device=self.device)
+            except (AttributeError, NotImplementedError, RuntimeError):
+                cu.copy_(torch.arange(rows + 1, dtype=torch.int32, device=self.device))
+                used.fill_(1)
+                lengths.fill_(1)
+                schedule = adapter.build_metadata(lengths, cu, used, q_len=1)
         else:
             schedule_meta = adapter.build_metadata(
                 torch.empty_like(lengths, device="meta"),

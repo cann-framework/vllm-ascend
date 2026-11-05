@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch_npu
-from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -1116,16 +1116,6 @@ class AscendMLAImpl(MLAAttentionImpl):
             inner = getattr(quant_method, "quant_method", quant_method)
             if inner is not None and not isinstance(inner, UnquantizedLinearMethod):
                 raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 requires native BF16 MLA projections.")
-        mode = getattr(config.compilation_config, "cudagraph_mode", None)
-        if not config.model_config.enforce_eager and mode not in (
-            None,
-            CUDAGraphMode.NONE,
-            CUDAGraphMode.PIECEWISE,
-        ):
-            raise RuntimeError(
-                "VLLM_ASCEND_ENABLE_FLASH_MLA=1 supports eager or piecewise execution only; "
-                "full aclgraph is not supported."
-            )
         from vllm_ascend.ops.flash_mla_pa_nz import (  # noqa: PLC0415
             _get_bf16_mla_prolog_op,
             _get_pa_nz_flash_mla_ops,
