@@ -9,7 +9,7 @@ from unittest.mock import Mock
 
 
 class TestKimiStaticBlacklist(unittest.TestCase):
-    def test_fia_blacklist_preserves_existing_entries(self):
+    def test_quant_matmul_is_allowed_while_other_blacklist_entries_are_preserved(self):
         path = Path(__file__).resolve().parents[3] / "vllm_ascend/compilation/compiler_interface.py"
         tree = ast.parse(path.read_text())
         function = next(n for n in tree.body if getattr(n, "name", None) == "_initialize_static_kernel_runtime")
@@ -27,6 +27,9 @@ class TestKimiStaticBlacklist(unittest.TestCase):
         self.assertIn("FusedInferAttentionScore", entries)
         self.assertIn("QuantLightningIndexer", entries)
         self.assertIn("TopKV2", entries)
+        self.assertIn("GenericBlockSparseAttn", entries)
+        self.assertIn("TransposeQuantBatchMatMul", entries)
+        self.assertNotIn("QuantBatchMatmulV3", entries)
         self.assertEqual(env, {"LOCAL_WORLD_SIZE": "8"})
 
 
