@@ -259,7 +259,7 @@ class TestKimiMoESuperkernel(unittest.TestCase):
                 self.assertEqual(order, expected + ["replay"])
                 self.assertEqual(self.context.additional_kwargs, {})
 
-    def test_draft_mark_precedes_upstream_validation_and_restores_target(self):
+    def test_draft_config_marks_returned_copy_without_changing_upstream_context(self):
         ns = {"copy": copy}
         tree = ast.parse((ROOT / "vllm_ascend/spec_decode/llm_base_proposer.py").read_text())
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AscendSpecDecodeBaseProposer")
@@ -269,7 +269,8 @@ class TestKimiMoESuperkernel(unittest.TestCase):
 
         class Base:
             def _create_draft_vllm_config(self):
-                assert self.vllm_config.model_config.runner_type == "draft"
+                assert self.vllm_config is target
+                assert self.vllm_config.model_config.runner_type == "generate"
                 if fails[0]:
                     raise RuntimeError("upstream")
                 return self.vllm_config
@@ -285,6 +286,9 @@ class TestKimiMoESuperkernel(unittest.TestCase):
         proposer.vllm_config = target
         proposer.speculative_config = NS(draft_model_config=NS(runner_type="draft"))
         draft = proposer._create_draft_vllm_config()
+        self.assertIsNot(draft, target)
+        self.assertIsNot(draft.model_config, target.model_config)
+        self.assertEqual(draft.model_config.runner_type, "draft")
         self.assertIs(draft.additional_config, target.additional_config)
         self.assertIs(proposer.vllm_config, target)
         fails[0] = True
