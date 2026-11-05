@@ -104,6 +104,7 @@ class TestKimiMoESuperkernel(unittest.TestCase):
 
         x = torch.ones(2, 4)
         runner = NS(
+            layer_name="layer",
             _kimi_gate=object(),
             _can_run_kimi_decode=lambda _: True,
             _maybe_pad_hidden_states=lambda shared, hidden: (hidden, None, None),
@@ -140,6 +141,48 @@ class TestKimiMoESuperkernel(unittest.TestCase):
             ns["_ascend_kimi_moe"](x, None, "layer")
         self.assertFalse(runner._kimi_superkernel_active)
         self.assertEqual(active, [])
+
+    def test_runtime_scope_uses_resolved_runner_name_with_one_lookup_per_layer(self):
+        x = torch.ones(2, 4)
+        layer_names = [f"model.layers.{index}.mlp.experts" for index in range(2)]
+        for encoding in ("context", "opaque", "string"):
+            with self.subTest(encoding=encoding):
+                self.npu.super_kernel_scope_begin.reset_mock()
+                runners = [
+                    NS(layer_name=name, _can_run_kimi_decode=lambda _: True, _forward_standard=Mock(return_value=x))
+                    for name in layer_names
+                ]
+                lookup = Mock(side_effect=runners)
+                ns = load(
+                    "vllm_ascend/ops/fused_moe/fused_moe.py",
+                    {"_ascend_kimi_moe"},
+                    dict(
+                        get_layer_from_name=lookup,
+                        _resolve_layer_name=lambda value: value.value if isinstance(value, NS) else value,
+                        moe_superkernel_scope=self.ns["moe_superkernel_scope"],
+                        get_ascend_config=lambda: NS(ascend_compilation_config=NS(enable_super_kernel=True)),
+                        _EXTRA_CTX=NS(is_draft_model=False),
+                    ),
+                )
+                with self.ns["collect_moe_superkernel_scopes"](self.context, True) as scopes:
+                    for name in layer_names:
+                        encoded = "from_forward_context" if encoding == "context" else NS(value=name)
+                        if encoding == "string":
+                            encoded = name
+                        self.assertIs(ns["_ascend_kimi_moe"](x, None, encoded), x)
+                expected_names = [f"{name}_1.moe" for name in layer_names]
+                self.assertEqual(scopes, set(expected_names))
+                self.assertEqual(
+                    [call.args[0] for call in self.npu.super_kernel_scope_begin.call_args_list], expected_names
+                )
+                self.assertEqual(lookup.call_count, len(layer_names))
+                self.assertEqual(
+                    [call.args[0] for call in lookup.call_args_list],
+                    ["from_forward_context"] * len(layer_names) if encoding == "context" else layer_names,
+                )
+                for runner in runners:
+                    runner._forward_standard.assert_called_once_with(x, x, None, None)
+                self.assertEqual(self.context.additional_kwargs, {})
 
     def test_backend_options_and_hash_keep_generic_and_draft_separate(self):
         cfg = NS(enable_static_kernel=True, enable_npugraph_ex=True, enable_super_kernel=True)

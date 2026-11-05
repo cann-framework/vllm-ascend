@@ -89,7 +89,7 @@ def _ascend_kimi_moe(
     runner._kimi_topk = None
     runner._kimi_shared_output_done = None
     try:
-        with moe_superkernel_scope(f"{layer_name}_1.moe" if enabled else None, enabled):
+        with moe_superkernel_scope(f"{runner.layer_name}_1.moe" if enabled else None, enabled):
             return runner._forward_standard(
                 hidden_states,
                 hidden_states if router_logits is None else router_logits,
