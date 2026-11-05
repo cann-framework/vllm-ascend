@@ -9,12 +9,14 @@ It transfers their behavior through the 0.30 interfaces rather than restoring
 
 | GitCode PR | Source merge | Treatment on 0.30 |
 | --- | --- | --- |
+| 5 | `6cbcbbf71` | Keep MXFP4 shared SiTU output in BF16 for the registered Down linear to quantize; apply `(16, 32)` Gate/Up limits on the Kimi multistream path, including outside the specialized Decode ladder. |
 | 35 | `af5fbc0db` | Port sparse unquantized SiTU into `_unified_apply_activation`; port grouped SiTU/MX quant into the W4A8 MXFP quant method; request expert counts from MC2 dispatch. Keep the new GMM hook architecture and its LoRA/EPLB paths. |
 | 42 | `b41a64714` | Select sparse SiTU for A5 Kimi shared experts, preserving the registered Dense MLP and checkpoint parameter names. CPU, other devices and unavailable custom operators retain the native fallback. |
+| 45 | `9f87b17b1` (source commit) | Included in PR48 ancestry. Keep Router GEMM and MC2/SP TopK on the per-layer Router stream, join prepared inputs before TopK and join TopK before Dispatch. Retain 0.30 common padding and collective ordering. |
 | 48 | `0275e9c89` | Keep 0.30's latent-input/output transforms, eager single-group GMM selection, output normalization and runtime reductions. Move the original registered router gate into an opaque MoE operation and overlap shared input gather with Router/latent down. Never project latent input twice. |
 | 50 | `eb8dda36e` | Already covered: 0.30 router selection and quant-method application retain FP32 TopK weights. Add a regression; do not restore old per-method dtype policy code. |
 | 51 | `1288cd435` | Add a per-forward Decode schedule on top of 0.30's shared executor and quant hooks. Both BF16 and MXFP4 shared SiTU wait for Dispatch; routed GMM1 waits for that activation; shared Down starts after GMM1. |
-| 54 | `9172ba684` | Enable the Ascend text-model compile boundary; make KDA metadata dispatch opaque using the existing `no_compile_layers` registry; serialize BFG/QKV tracing for the AOT backend; append FIA to 0.30's existing static blacklist initialization. |
+| 54 | `9172ba684` | Keep KDA metadata dispatch opaque using the existing `no_compile_layers` registry, BFG/QKV tracing protection and FIA static blacklist entry. The added text-model `support_torch_compile` decorator has been removed pending AttnRes AOT alias compatibility. |
 | 62 | `723ee0633` | No code needed: 0.30 no longer contains `_plan_mega_kda` or its metadata fallback logs. Do not restore that obsolete path. |
 | 20 | `e689fdd0a` | Keep the 0.30 CANN MegaMoE backend, per-model communication lookup, activation binding, weight layouts and HCCL restore lifecycle. Port Kimi prefill/decode/idle agreement into the existing CPU DP collective and selector. |
 
@@ -22,6 +24,29 @@ The 0.30 router kernel and dtype behavior, KDA AscendC implementation, KV pool
 hooks, Attention Residual implementation, fine-grained TP padding, hardware
 capability registry, and non-Kimi communication policies remain authoritative.
 No new environment variable or mutable module-level registry is introduced.
+
+## Recipes SiTU availability
+
+Kimi A5 SiTU model construction loads the installed recipes `custom_ops`
+extension before tracing. Previously, the migrated call sites only checked
+`torch.ops.custom`; a worker that never imported the extension silently used
+the native fallback even when the package was installed. Missing or incompatible
+packages now produce a warning naming the unavailable operators.
+
+The two calls are `torch.ops.custom.npu_situ_and_mul_sparse` (shared experts
+and eligible unquantized routed experts) and
+`torch.ops.custom.grouped_situ_mx_quant` (eligible W4A8 MXFP routed experts).
+Their profiling names are `SituAndMulSparse` and `GroupedSituMxQuant`.
+The recipes `ops/ascendc/torch_ops_extension` package and matching CANN operator
+package must be installed in every worker environment. This PR does not bundle
+those external kernels. Registration alone does not override dtype, activation,
+quantization, LoRA or hardware eligibility checks. MegaMoE uses its fused
+pipeline and need not show these standalone operators in profiling.
+
+The 0.30 `attn_res_fwd` aliasing implementation is unchanged. The model's added
+compile decorator is removed, so full text-backbone compilation is not claimed
+as a delivered feature. Removing that decorator is not equivalent to setting
+`enforce_eager` or disabling every graph mechanism in the runtime.
 
 ## Decode execution
 
@@ -39,7 +64,8 @@ core usage. Vector-resource waits are present for both weight types.
 The sequence is:
 
 1. Start shared AllGather, overlapping the Router and subsequent latent down.
-   Preserve 0.30's Router-before-latent-GEMM order and its TopK entry.
+   Preserve 0.30's Router-before-latent-GEMM order. MC2/SP TopK uses the Router
+   stream after joining 0.30's common prepare; other paths keep their original stream.
 2. Join shared AllGather before submitting routed EP communication, preserving
    0.30's cross-process-group ordering.
 3. Submit shared Gate/Up before routed TopK and Dispatch.
@@ -106,6 +132,7 @@ collectives; they are not hardware or full-package import validation.
 python tests/ut/ops/test_kimi_kda_compile.py -v
 python tests/ut/ops/test_kimi_v30_moe.py -v
 python tests/ut/ops/test_kimi_v30_review.py -v
+python tests/ut/ops/test_kimi_situ_loading.py -v
 python tests/ut/worker/test_kimi_megamoe_phase_policy.py -v
 ```
 

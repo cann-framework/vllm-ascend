@@ -697,6 +697,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                     input_ids=input_ids,
+                    router_stream=getattr(self, "_kimi_router_stream", None),
                 )
             shared_input_is_gathered = self._can_overlap_sp_shared_with(self.routed_input_transform)
             defer_shared_output_wait = self._can_overlap_sp_shared_with(self.routed_output_transform)
@@ -718,6 +719,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                         router_logits=router_logits,
                         input_ids=input_ids,
                         shared_expert_schedule=schedule,
+                        router_stream=getattr(self, "_kimi_router_stream", None),
                     )
                     return schedule.finalize(), routed_out
                 shared_input_ready = router_output_ready = ready
@@ -739,6 +741,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 input_ids=input_ids,
+                router_stream=getattr(self, "_kimi_router_stream", None),
             )
             assert isinstance(milestones, RoutedMoEMilestones)
             milestones.shared_input_ready = shared_input_ready

@@ -16,7 +16,6 @@ from typing import Any, TypeVar, cast
 import torch
 import vllm.envs as envs
 from torch import nn
-from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
 from vllm.distributed import (
     get_pp_group,
@@ -93,6 +92,7 @@ from vllm_ascend.ops.fused_moe.shared_experts import AscendSharedSparseSituAndMu
 from vllm_ascend.ops.kimi_kda import (
     AscendKimiK3DeltaAttention as AscendKimiK3DeltaAttentionBase,
 )
+from vllm_ascend.ops.kimi_situ import initialize_kimi_situ_ops
 from vllm_ascend.ops.linear_op import KimiOProjMMReduceScatterOp
 from vllm_ascend.quantization.methods.base import PreparedLinearInput
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
@@ -362,6 +362,11 @@ class AscendKimiMoE(nn.Module):
         self.num_shared_experts = config.num_shared_experts
         activation_situ_beta = config.activation_situ_beta if config.hidden_act == "situ" else None
         activation_situ_linear_beta = config.activation_situ_linear_beta if config.hidden_act == "situ" else None
+
+        if config.hidden_act == "situ" and get_current_hardware_profile().supports(
+            HardwareCapability.CANN_MEGAMOE_MXFP
+        ):
+            initialize_kimi_situ_ops()
 
         self.gate = GateLinear(
             input_size=hidden_size,
@@ -847,7 +852,6 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
         return hidden_states, block_residual
 
 
-@support_torch_compile
 class AscendKimiLinearModel(UpstreamKimiLinearModel):
     """Kimi text model assembled from the Ascend decoder layer."""
 

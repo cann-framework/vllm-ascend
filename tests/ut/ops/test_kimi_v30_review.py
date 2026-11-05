@@ -157,6 +157,7 @@ class TestKimiMigrationReview(unittest.TestCase):
                 "enqueue_gate_up_after_router",
                 "_wait_for_milestone",
                 "_compute_stream_context",
+                "_gate_up_core_context",
                 "wait_for_output",
             },
             ns,
@@ -207,6 +208,7 @@ class TestKimiMigrationReview(unittest.TestCase):
             KimiMLP=lambda **kw: shared,
             FusedMoEFactory=lambda **kw: runner,
             AscendSharedSparseSituAndMul=sparse,
+            initialize_kimi_situ_ops=Mock(),
             get_current_hardware_profile=lambda: NS(supports=lambda cap: True),
             HardwareCapability=NS(CANN_MEGAMOE_MXFP=1),
             get_ascend_config=lambda: NS(multistream_overlap_shared_expert=False),
@@ -214,6 +216,7 @@ class TestKimiMigrationReview(unittest.TestCase):
         cls = load_class("vllm_ascend/models/kimi_k3.py", "AscendKimiMoE", {"__init__"}, ns, "Module")
         cls(config=cfg, vllm_config=NS(parallel_config=NS(enable_eplb=False)))
         sparse.assert_called_once_with(1.0, 25.0)
+        ns["initialize_kimi_situ_ops"].assert_called_once_with()
 
     def test_public_moe_op_keeps_preprojected_input(self):
         op = Mock(return_value=torch.zeros(2, 4))
