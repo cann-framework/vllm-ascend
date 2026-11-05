@@ -390,10 +390,30 @@ class FlashMLADecode:
     q_len: int = 1
     tail_metadata: tuple[torch.Tensor, torch.Tensor] | None = None
     block_table_prepared: bool = False
+    tail_last_block_ids: torch.Tensor | None = None
+    tail_invalid: torch.Tensor | None = None
+    tail_offsets: torch.Tensor | None = None
+    prolog_slots: torch.Tensor | None = None
+    block_columns: torch.Tensor | None = None
+    metadata_builder: Any = None
+    metadata_started: bool = False
+    metadata_generated: bool = False
+    metadata_async: bool = False
 
 
 class FlashMLAMetadataBuilder:
-    def __init__(self, impl, device: torch.device, max_num_reqs: int, attn_mask: torch.Tensor):
+    def __init__(
+        self,
+        impl,
+        device: torch.device,
+        max_num_reqs: int,
+        attn_mask: torch.Tensor,
+        enable_async: bool = False,
+    ):
+        self.enable_async = bool(enable_async)
+        self.metadata_stream = torch.npu.Stream() if self.enable_async else None
+        self.metadata_start = torch.npu.Event() if self.enable_async else None
+        self.metadata_ready = torch.npu.Event() if self.enable_async else None
         self.dcp_size = getattr(impl, "dcp_size", 1)
         self.dcp_rank = getattr(impl, "dcp_rank", 0)
         # Materialize once: an integer rank would trigger a blocking H2D copy
@@ -433,7 +453,7 @@ class FlashMLAMetadataBuilder:
         self.buffers: dict[tuple, FlashMLADecode] = {}
         self.attn_mask = attn_mask
 
-    def _allocate(self, tokens: int, rows: int, columns: int, causal: bool) -> FlashMLADecode:
+    def _allocate(self, tokens: int, rows: int, columns: int, causal: bool, q_len: int = 1) -> FlashMLADecode:
         ints = {"dtype": torch.int32, "device": self.device}
         adapter = self.adapters[causal]
         cu = torch.zeros(rows + 1, **ints)
@@ -449,14 +469,14 @@ class FlashMLAMetadataBuilder:
                     torch.empty_like(lengths, device="meta"),
                     torch.empty_like(cu, device="meta"),
                     torch.empty_like(used, device="meta"),
-                    q_len=1,
+                    q_len=q_len,
                 )
                 schedule = torch.empty_like(schedule_meta, device=self.device)
             except (AttributeError, NotImplementedError, RuntimeError):
                 cu.copy_(torch.arange(rows + 1, dtype=torch.int32, device=self.device))
                 used.fill_(1)
                 lengths.fill_(1)
-                schedule = adapter.build_metadata(lengths, cu, used, q_len=1)
+                schedule = adapter.build_metadata(lengths, cu, used, q_len=q_len)
         else:
             schedule_meta = adapter.build_metadata(
                 torch.empty_like(lengths, device="meta"),
@@ -465,6 +485,11 @@ class FlashMLAMetadataBuilder:
             )
             schedule = torch.empty_like(schedule_meta, device=self.device)
         rope_shape = (tokens, 1, 1, FLASHMLA_QK_DIM - FLASHMLA_V_DIM)
+        tail_offsets = torch.arange(FLASHMLA_BLOCK_SIZE, dtype=torch.int64, device=self.device)
+        tail_last_block_ids = torch.zeros(rows, dtype=torch.int64, device=self.device)
+        tail_invalid = torch.zeros(
+            (rows, FLASHMLA_BLOCK_SIZE), dtype=torch.bool, device=self.device
+        )
         flash = FlashMLADecode(
             adapter=adapter,
             query=torch.empty(
@@ -479,10 +504,21 @@ class FlashMLAMetadataBuilder:
             positions=torch.zeros(tokens, dtype=torch.int64, device=self.device),
             token_live=torch.zeros(tokens, dtype=torch.bool, device=self.device),
             live_boundaries=torch.zeros(tokens + 1, **ints),
-            attn_mask=self.attn_mask if adapter.config.mask_mode == 3 else None,
+            attn_mask=(
+                self.attn_mask
+                if adapter.config.layout_kv == "PA_BBND" or q_len > 1
+                else None
+            ),
             cos=torch.empty(rope_shape, dtype=self.dtype, device=self.device) if self.use_rope else None,
             sin=torch.empty(rope_shape, dtype=self.dtype, device=self.device) if self.use_rope else None,
             layout=adapter.config.layout_kv,
+            q_len=q_len,
+            tail_metadata=(tail_last_block_ids, tail_invalid),
+            tail_last_block_ids=tail_last_block_ids,
+            tail_invalid=tail_invalid,
+            tail_offsets=tail_offsets,
+            prolog_slots=torch.full((tokens,), -1, dtype=torch.int64, device=self.device),
+            block_columns=torch.arange(columns, dtype=torch.int64, device=self.device),
         )
         if self.dcp_size > 1 and causal and self.use_spec_decode:
             # As in split DCP attention, each rank retains every current row.
@@ -522,23 +558,26 @@ class FlashMLAMetadataBuilder:
         tokens = num_decode_tokens if has_prefill else max(common.num_actual_tokens, common.num_input_tokens)
         rows = num_decodes + 1 if has_prefill else max(num_decodes, min(tokens, self.max_num_reqs)) + 1
         columns = common.block_table_tensor.shape[1]
-        key = tokens, rows, columns, common.causal
+        q_len = max(1, int(getattr(common, "max_query_len", 1) or 1))
+        key = tokens, rows, columns, common.causal, q_len
         if has_prefill:
             if retain_for_graph:
                 raise ValueError("FlashMLA graph buffers require a decode-only batch")
-            flash = self._allocate(tokens, rows, columns, common.causal)
+            flash = self._allocate(tokens, rows, columns, common.causal, q_len=q_len)
         else:
             cached_flash = self.buffers.get(key)
             if cached_flash is None:
-                flash = self._allocate(tokens, rows, columns, common.causal)
+                flash = self._allocate(tokens, rows, columns, common.causal, q_len=q_len)
                 if retain_for_graph:
                     self.buffers[key] = flash
             else:
                 flash = cached_flash
 
-        flash.q_len = max(1, int(getattr(common, "max_query_len", 1) or 1))
-        if flash.layout == "PA_NZ" and flash.q_len != 1:
-            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA supports q_len=1 only in Phase 1.")
+        flash.q_len = q_len
+        flash.metadata_builder = self
+        flash.metadata_async = (
+            self.enable_async and not retain_for_graph and flash.layout == "PA_NZ"
+        )
 
         def refresh():
             # The extra zero-used request owns physical graph/SP padding.
@@ -581,9 +620,37 @@ class FlashMLAMetadataBuilder:
                 cos, sin = get_cos_and_sin_mla(flash.positions)
                 flash.cos.copy_(cos)
                 flash.sin.copy_(sin)
-            flash.schedule.copy_(
-                flash.adapter.build_metadata(flash.cache_lens, flash.cu, flash.used_q, q_len=flash.q_len)
-            )
+            if flash.prolog_slots is not None:
+                flash.prolog_slots.copy_(flash.slots)
+            if (
+                num_decodes > 0
+                and flash.tail_last_block_ids is not None
+                and flash.tail_invalid is not None
+                and flash.tail_offsets is not None
+            ):
+                tail_lengths = flash.cache_lens[:num_decodes].to(torch.long)
+                last_columns = torch.div(
+                    torch.clamp_min(tail_lengths, 1) - 1,
+                    FLASHMLA_BLOCK_SIZE,
+                    rounding_mode="floor",
+                ).clamp_max(flash.block_table.shape[1] - 1)
+                last_block_ids = torch.gather(
+                    flash.block_table[:num_decodes].to(torch.long),
+                    1,
+                    last_columns[:, None],
+                ).squeeze(1)
+                flash.tail_last_block_ids[:num_decodes].copy_(last_block_ids)
+                valid_tail = torch.remainder(tail_lengths, FLASHMLA_BLOCK_SIZE)
+                valid_tail = torch.where(
+                    valid_tail == 0,
+                    torch.full_like(valid_tail, FLASHMLA_BLOCK_SIZE),
+                    valid_tail,
+                )
+                flash.tail_invalid[:num_decodes].copy_(
+                    flash.tail_offsets[None, :] >= valid_tail[:, None]
+                )
+            flash.metadata_started = False
+            flash.metadata_generated = False
             if flash.current is not None:
                 current = flash.current
                 page_counts = (flash.used_q + FLASHMLA_BLOCK_SIZE - 1) // FLASHMLA_BLOCK_SIZE
@@ -600,4 +667,48 @@ class FlashMLAMetadataBuilder:
         # Refresh on the caller's stream before return; captured buffer caching
         # preserves the addresses used by graph replay.
         refresh()
+        if not flash.metadata_async:
+            self.start_metadata(flash, force_sync=True)
         return flash
+
+    def start_metadata(self, flash: FlashMLADecode, *, force_sync: bool = False) -> None:
+        """Build the schedule on the side stream, or synchronously when forced."""
+        if flash.metadata_generated:
+            return
+        if not self.enable_async or force_sync or not flash.metadata_async:
+            flash.schedule.copy_(
+                flash.adapter.build_metadata(
+                    flash.cache_lens,
+                    flash.cu,
+                    flash.used_q,
+                    q_len=flash.q_len,
+                )
+            )
+            flash.metadata_started = False
+            flash.metadata_generated = True
+            return
+        if self.metadata_stream is None or self.metadata_start is None or self.metadata_ready is None:
+            raise RuntimeError("FlashMLA async metadata was enabled without stream/event resources.")
+        main_stream = torch.npu.current_stream()
+        self.metadata_start.record(main_stream)
+        self.metadata_stream.wait_event(self.metadata_start)
+        with torch.npu.stream(self.metadata_stream):
+            flash.schedule.copy_(
+                flash.adapter.build_metadata(
+                    flash.cache_lens,
+                    flash.cu,
+                    flash.used_q,
+                    q_len=flash.q_len,
+                )
+            )
+            self.metadata_ready.record()
+        flash.metadata_started = True
+        flash.metadata_generated = True
+
+    def wait_metadata(self, flash: FlashMLADecode) -> None:
+        """Make the main stream wait for an in-flight async schedule build."""
+        if not flash.metadata_started:
+            return
+        assert self.metadata_ready is not None
+        torch.npu.current_stream().wait_event(self.metadata_ready)
+        flash.metadata_started = False

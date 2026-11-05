@@ -380,8 +380,17 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         if True in flashmla_choices:
             impl = static_forward_context[layer_names[0]].impl
             self.flashmla_state = FlashMLAMetadataBuilder(
-                impl, device, scheduler_config.max_num_seqs, self.attn_mask_builder.get_splitfuse_attn_mask()
+                impl,
+                device,
+                scheduler_config.max_num_seqs,
+                self.attn_mask_builder.get_splitfuse_attn_mask(),
+                enable_async=(
+                    get_ascend_config().enable_multi_streams
+                    and next(iter(flashmla_layouts), "pa_bbnd") == "pa_nz"
+                ),
             )
+            for name in layer_names:
+                static_forward_context[name].impl.flash_mla_state = self.flashmla_state
 
     def _build_external_flashmla(self, common_prefix_len, common, *, retain_for_graph: bool = False):
         """Keep FIA prefill metadata, but build decode inputs from device state."""
@@ -3300,7 +3309,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_metadata: M,
     ) -> torch.Tensor:
         """Decode through the BF16 PA_NZ prolog + 0.27 FlashMLA operator."""
-        from vllm_ascend.ops.flash_mla_pa_nz import mla_prolog_no_rope  # noqa: PLC0415
+        from vllm_ascend.ops.flash_mla_pa_nz import (  # noqa: PLC0415
+            clear_partial_block_tail,
+            mla_prolog_no_rope,
+        )
 
         flash = attn_metadata.external_flashmla
         assert flash is not None
@@ -3311,8 +3323,43 @@ class AscendMLAImpl(MLAAttentionImpl):
         assert self.flash_gamma_qa is not None
         assert self.flash_gamma_kva is not None
         num_decode_tokens = attn_metadata.num_decode_tokens
+        num_decodes = attn_metadata.num_decodes
         merged_cache = kv_cache if isinstance(kv_cache, torch.Tensor) else kv_cache[0]
-        cache_indices = flash.slots[:num_decode_tokens].to(torch.int64).clamp_min(0)
+        block_size = merged_cache.shape[1]
+        if flash.block_columns is not None:
+            valid_cols = (flash.cache_lens + block_size - 1) // block_size
+            last_columns = (valid_cols - 1).clamp_min(0).to(torch.long)
+            last_blocks = torch.gather(
+                flash.block_table,
+                1,
+                last_columns[:, None],
+            ).squeeze(1)
+            stale = flash.block_columns[None, :] >= valid_cols[:, None]
+            flash.block_table.copy_(
+                torch.where(stale, last_blocks[:, None], flash.block_table)
+            )
+        if num_decodes > 0 and flash.tail_last_block_ids is not None and flash.tail_invalid is not None:
+            clear_partial_block_tail(
+                merged_cache,
+                flash.block_table,
+                flash.cache_lens,
+                num_requests=num_decodes,
+                tail_metadata=(
+                    flash.tail_last_block_ids[:num_decodes],
+                    flash.tail_invalid[:num_decodes],
+                ),
+            )
+        if num_decode_tokens > attn_metadata.num_actual_tokens:
+            raise RuntimeError(
+                "PA_NZ decode with graph/batch padding requires a reserved scratch page; "
+                "padded prolog writes are not allowed until that allocator support lands."
+            )
+        if flash.metadata_async and flash.metadata_builder is not None and not flash.metadata_started:
+            flash.metadata_builder.start_metadata(flash)
+        if flash.prolog_slots is not None:
+            cache_indices = flash.prolog_slots[:num_decode_tokens].to(torch.int64).clamp_min(0)
+        else:
+            cache_indices = flash.slots[:num_decode_tokens].to(torch.int64).clamp_min(0)
         q, *_ = mla_prolog_no_rope(
             hidden_states[:num_decode_tokens],
             self.weight_dq,
@@ -3328,6 +3375,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         q = q.view(num_decode_tokens, self.flash_total_heads, -1)
         head_start = self.flash_local_head_start
         q = q[:, head_start : head_start + self.num_heads, :]
+        if flash.metadata_builder is not None:
+            flash.metadata_builder.wait_metadata(flash)
         record_attention_compute_start()
         attn_output, _ = flash.adapter.attention(
             q,
@@ -3540,7 +3589,15 @@ class AscendMLAImpl(MLAAttentionImpl):
             return local_num_input_tokens - attn_metadata.num_decode_tokens
         return attn_metadata.num_actual_tokens - attn_metadata.num_decode_tokens
 
-    def mla_preprocess_prefill(self, q_c, kv_no_split, kv_cache, attn_metadata, written_kv=None):
+    def mla_preprocess_prefill(
+        self,
+        q_c,
+        kv_no_split,
+        kv_cache,
+        attn_metadata,
+        written_kv=None,
+        skip_kv_b_proj: bool = False,
+    ):
         """``written_kv`` holds normalized (k_pe, k_nope) of every local token
         when the caller has already written this step's KV cache."""
         num_decode_tokens = attn_metadata.num_decode_tokens
@@ -3571,6 +3628,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
         else:
             prefill_k_pe, prefill_k_c_normed = (kv[num_decode_tokens:num_actual_tokens] for kv in written_kv)
+        if skip_kv_b_proj:
+            return PrefillMLAPreprocessResult(prefill_q_nope, prefill_q_pe)
         prefill_k_nope, prefill_value = (
             self.kv_b_proj(prefill_k_c_normed)[0]
             .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
@@ -3791,10 +3850,11 @@ class AscendMLAImpl(MLAAttentionImpl):
             and not self.enable_kv_nz
             and attn_metadata.num_decode_tokens > 0
         )
-        if self.use_flashmla_pa_nz and num_decode_tokens > 0:
-            o_proj_input[:num_decode_tokens] = self._forward_decode_flash_bf16(
-                hidden_states, kv_cache, attn_metadata
-            )
+        if self.use_flashmla_pa_nz:
+            if num_decode_tokens > 0:
+                o_proj_input[:num_decode_tokens] = self._forward_decode_flash_bf16(
+                    hidden_states, kv_cache, attn_metadata
+                )
             if attn_metadata.num_prefills > 0:
                 assert self.fused_qkv_a_proj is not None
                 assert self.q_a_layernorm is not None
@@ -3805,7 +3865,13 @@ class AscendMLAImpl(MLAAttentionImpl):
                 )
                 q_c = self.q_a_layernorm(q_c)
                 kv_no_split = kv_no_split.contiguous()
-                prefill_res = self.mla_preprocess_prefill(q_c, kv_no_split, kv_cache, attn_metadata)
+                prefill_res = self.mla_preprocess_prefill(
+                    q_c,
+                    kv_no_split,
+                    kv_cache,
+                    attn_metadata,
+                    skip_kv_b_proj=True,
+                )
                 o_proj_input[num_decode_tokens:num_actual_tokens] = self._forward_prefill(
                     prefill_res.q_nope,
                     prefill_res.q_pe,

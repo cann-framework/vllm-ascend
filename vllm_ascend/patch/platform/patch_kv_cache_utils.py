@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
@@ -140,6 +141,124 @@ def _ascend_resolve_kv_cache_block_sizes(
     return _orig_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
 
 
+def _kimi_k3_physical_layout_key(layer_name: str, spec: KVCacheSpec) -> str:
+    """Return the physical cache layout family used by a Kimi K3 layer."""
+    if isinstance(spec, MambaSpec):
+        return "mamba"
+    if layer_name.startswith(_KIMI_K3_TARGET_LAYER_PREFIX):
+        return "target_attention"
+    if layer_name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX):
+        return "draft_attention"
+    return "default"
+
+
+def _physical_page_size_bytes(spec: KVCacheSpec) -> int:
+    """Use the unpadded page size for independent physical backing tensors."""
+    return getattr(spec, "unpadded_page_size_bytes", spec.page_size_bytes)
+
+
+def _is_kimi_k3_pa_nz_groups(kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
+    """Only the opt-in PA_NZ layout needs layout-separated physical tensors."""
+    if not all(isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in kv_cache_groups):
+        return False
+    for group in kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        assert isinstance(group_spec, UniformTypeKVCacheSpecs)
+        if any(getattr(spec, "flash_mla_layout", None) == "pa_nz" for spec in group_spec.kv_cache_specs.values()):
+            return True
+    return False
+
+
+def _kimi_k3_physical_layout_buckets(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> tuple[dict[tuple[str, int], list[str]], dict[str, int], list[str], int]:
+    """Bucket Kimi K3 layers by physical layout and layer-tuple position."""
+    bucketed: dict[tuple[str, int], list[str]] = defaultdict(list)
+    tuple_counts: dict[str, int] = defaultdict(int)
+    mtp_layer_names: list[str] = []
+    mtp_page_size = 0
+    for group in kv_cache_groups:
+        assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        specs = group.kv_cache_spec.kv_cache_specs
+        for layer_name in group.layer_names:
+            spec = specs[layer_name]
+            if "mtp" in layer_name:
+                mtp_layer_names.append(layer_name)
+                mtp_page_size = _physical_page_size_bytes(spec)
+                continue
+            layout_key = _kimi_k3_physical_layout_key(layer_name, spec)
+            page_size = _physical_page_size_bytes(spec)
+            bucket = bucketed[(layout_key, page_size)]
+            bucket.append(layer_name)
+            tuple_counts[layout_key] = max(tuple_counts[layout_key], len(bucket))
+    return bucketed, tuple_counts, mtp_layer_names, mtp_page_size
+
+
+def _kimi_k3_physical_page_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+    bucketed, tuple_counts, mtp_layer_names, mtp_page_size = _kimi_k3_physical_layout_buckets(kv_cache_groups)
+    page_sizes_by_layout: dict[str, set[int]] = defaultdict(set)
+    for layout_key, page_size in bucketed:
+        page_sizes_by_layout[layout_key].add(page_size)
+    total = sum(
+        page_size * tuple_counts[layout_key]
+        for layout_key, page_sizes in page_sizes_by_layout.items()
+        for page_size in page_sizes
+    )
+    return total + len(mtp_layer_names) * mtp_page_size
+
+
+def _get_kimi_k3_physical_kv_cache_config(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> tuple[int, list[KVCacheTensor]]:
+    """Plan Kimi K3 tensors without sharing incompatible physical layouts."""
+    bucketed, tuple_counts, mtp_layer_names, mtp_page_size = _kimi_k3_physical_layout_buckets(kv_cache_groups)
+    page_sizes_by_layout: dict[str, set[int]] = defaultdict(set)
+    for (layout_key, page_size) in bucketed:
+        page_sizes_by_layout[layout_key].add(page_size)
+    physical_page_bytes_per_block = _kimi_k3_physical_page_bytes_per_block(kv_cache_groups)
+    assert physical_page_bytes_per_block > 0
+    num_blocks = available_memory // physical_page_bytes_per_block
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+
+    kv_cache_tensors: list[KVCacheTensor] = []
+    layout_order = sorted(
+        page_sizes_by_layout,
+        key=lambda layout_key: (layout_key != "target_attention", layout_key),
+    )
+    for layout_key in layout_order:
+        for tuple_idx in range(tuple_counts[layout_key]):
+            for page_size in sorted(page_sizes_by_layout[layout_key]):
+                shared_by: list[str] = []
+                for group in kv_cache_groups:
+                    assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                    specs = group.kv_cache_spec.kv_cache_specs
+                    candidates = [
+                        layer_name
+                        for layer_name in group.layer_names
+                        if "mtp" not in layer_name
+                        and _kimi_k3_physical_layout_key(layer_name, specs[layer_name]) == layout_key
+                        and _physical_page_size_bytes(specs[layer_name]) == page_size
+                    ]
+                    if tuple_idx < len(candidates):
+                        shared_by.append(candidates[tuple_idx])
+                if shared_by:
+                    kv_cache_tensors.append(
+                        KVCacheTensor(size=page_size * num_blocks, layers=shared_by)
+                    )
+    for layer_name in mtp_layer_names:
+        kv_cache_tensors.append(
+            KVCacheTensor(size=mtp_page_size * num_blocks, layers=[layer_name])
+        )
+    logger.info(
+        "Using Kimi K3 layout-separated KV cache tensors: layouts=%s, tensors=%d",
+        dict(sorted(tuple_counts.items())),
+        len(kv_cache_tensors),
+    )
+    return num_blocks, kv_cache_tensors
+
+
 def _get_kimi_k3_dspark_mixed_kv_cache_groups(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec] | None:
@@ -165,7 +284,7 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
     draft_attention_specs = {
         name: spec
         for name, spec in kv_cache_spec.items()
-        if name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) and isinstance(spec, FullAttentionSpec)
+        if name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) and isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
     }
     mamba_specs = {
         name: spec
@@ -188,7 +307,7 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
     # own groups and may use max_model_len as block_size when cache_mode=none.
     if (
         len({spec.block_size for spec in attention_specs}) != 1
-        or len({spec.page_size_bytes for spec in all_specs}) != 1
+        or len({_physical_page_size_bytes(spec) for spec in all_specs}) != 1
     ):
         return None
 
@@ -552,6 +671,8 @@ def _ascend_pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int
         return get_deepseek_v41_pool_bytes_per_block(kv_cache_groups)
     if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
         return get_glm5_next_pool_bytes_per_block(kv_cache_groups)
+    if _is_kimi_k3_pa_nz_groups(kv_cache_groups):
+        return _kimi_k3_physical_page_bytes_per_block(kv_cache_groups)
     if not _is_deepseek_v4_groups(kv_cache_groups):
         return _orig_pool_bytes_per_block(kv_cache_groups)
 
@@ -615,6 +736,18 @@ def _ascend_get_kv_cache_config_from_groups(
         kv_cache_config = get_deepseek_v41_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
     elif _get_glm5_next_cache_layout(kv_cache_groups) is not None:
         kv_cache_config = get_glm5_next_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
+    elif _is_kimi_k3_pa_nz_groups(kv_cache_groups):
+        num_blocks, kv_cache_tensors = _get_kimi_k3_physical_kv_cache_config(
+            vllm_config,
+            kv_cache_groups,
+            available_memory,
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=kv_cache_groups,
+            prefix_cache_retention_interval=vllm_config.cache_config.prefix_cache_retention_interval,
+        )
     elif not _is_deepseek_v4_groups(kv_cache_groups):
         kv_cache_config = _orig_get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, available_memory)
     else:
