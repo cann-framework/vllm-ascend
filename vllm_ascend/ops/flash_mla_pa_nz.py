@@ -228,10 +228,10 @@ def mla_prolog_no_rope(
     prolog_op = _get_bf16_mla_prolog_op()
     return prolog_op(
         hidden_states.contiguous(),
-        weight_dq,
-        weight_uq_qr,
-        weight_dkv_kr,
-        weight_uk,
+        weight_dq.detach(),
+        weight_uq_qr.detach(),
+        weight_dkv_kr.detach(),
+        weight_uk.detach(),
         q_norm_weight.float().contiguous(),
         kv_norm_weight.float().contiguous(),
         kv_cache,
