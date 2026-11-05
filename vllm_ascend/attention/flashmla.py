@@ -11,7 +11,7 @@ in preflight tests: the decode hot path must not copy lengths or tables to the C
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -95,12 +95,14 @@ class FlashMLAConfig:
     return_softmax_lse: bool = False
 
     def __post_init__(self) -> None:
-        if self.num_heads not in MLA_FLASH_SUPPORTED_Q_HEADS:
+        if self.layout_kv not in ("PA_BBND", "PA_NZ"):
+            raise ValueError("FlashMLA layout_kv must be PA_BBND or PA_NZ")
+        if self.layout_kv == "PA_BBND" and self.num_heads not in MLA_FLASH_SUPPORTED_Q_HEADS:
             raise ValueError(f"FlashMLA requires local Q heads in {MLA_FLASH_SUPPORTED_Q_HEADS}, got {self.num_heads}")
+        if self.layout_kv == "PA_NZ" and self.num_heads <= 0:
+            raise ValueError("PA_NZ FlashMLA requires a positive local Q head count")
         if self.mask_mode not in (0, 3):
             raise ValueError("FlashMLA mask_mode must be 0 or 3")
-        if self.layout_kv != "PA_BBND":
-            raise ValueError("FlashMLA layout_kv must be PA_BBND")
 
 
 def _check_tensor(name: str, tensor: torch.Tensor, shape: tuple[int, ...], dtype: torch.dtype) -> None:
@@ -158,12 +160,14 @@ class FlashMLAImpl:
         cache_seqlens: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         seqused_q: torch.Tensor | None = None,
+        q_len: int = 1,
     ) -> torch.Tensor:
         """Generate metadata for these device lengths, or query capacity on Meta.
 
         The package Meta implementation may query NPU core counts; select the
         worker device first. Do not replace -1 with CPU maximum-length bounds.
         """
+        del q_len  # PA_BBND metadata does not need the per-request query length.
         _check_lengths(cache_seqlens, cu_seqlens_q, seqused_q)
         return self.metadata_op(
             cache_seqlens,
@@ -261,11 +265,102 @@ class FlashMLAImpl:
                 raise ValueError("FlashMLA inputs must be on the same device")
 
 
+@dataclass(frozen=True)
+class PaNzFlashMLAImpl:
+    """BF16 adapter for the v0.27 PA_NZ flash_mla operator.
+
+    The operator module is imported in ``load`` only, so the default PA_BBND
+    path never touches the optional 0.27 CANN/cannbot-dsl packages.
+    """
+
+    config: FlashMLAConfig
+    ops: Any
+
+    @classmethod
+    def load(cls, config: FlashMLAConfig) -> "PaNzFlashMLAImpl":
+        if config.layout_kv != "PA_NZ":
+            raise ValueError("PaNzFlashMLAImpl requires layout_kv='PA_NZ'")
+        from vllm_ascend.ops import flash_mla_pa_nz as ops  # noqa: PLC0415
+
+        # Fail fast here if the optional operators are missing.
+        ops._get_pa_nz_flash_mla_ops()
+        ops._get_bf16_mla_prolog_op()
+        return cls(config, ops)
+
+    def build_metadata(
+        self,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        seqused_q: torch.Tensor | None = None,
+        q_len: int = 1,
+    ) -> torch.Tensor:
+        _check_lengths(cache_seqlens, cu_seqlens_q, seqused_q)
+        return self.ops.flash_mla_metadata(
+            cache_seqlens,
+            num_heads_q=self.config.num_heads,
+            cu_seqlens_q=cu_seqlens_q,
+            q_len=max(1, q_len),
+            head_dim_qk=FLASHMLA_QK_DIM,
+            head_dim_v=FLASHMLA_V_DIM,
+            mask_mode=0 if q_len == 1 else 3,
+            seqused_q=seqused_q,
+        )
+
+    def attention(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        *,
+        block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        metadata: torch.Tensor,
+        seqused_q: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
+        q_len: int | None = None,
+    ) -> tuple[torch.Tensor, None]:
+        self.validate_cache(k_cache)
+        if q.ndim != 3 or q.shape[1:] != (self.config.num_heads, FLASHMLA_QK_DIM):
+            raise ValueError("PA_NZ FlashMLA q must be TND with configured local heads and width 576")
+        if q.dtype != torch.bfloat16:
+            raise ValueError("PA_NZ FlashMLA requires BF16 q")
+        if q_len is None:
+            q_len = max(1, int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())) if cu_seqlens_q.numel() > 1 else 1
+        output = self.ops.flash_mla_with_kvcache(
+            q,
+            k_cache,
+            block_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            q_len,
+            self.config.softmax_scale,
+            FLASHMLA_V_DIM,
+            attn_mask=attn_mask if q_len > 1 else None,
+            metadata=metadata,
+            seqused_q=seqused_q,
+        )
+        return output, None
+
+    def validate_cache(self, kv_cache: torch.Tensor) -> None:
+        if kv_cache.ndim != 4 or kv_cache.shape[2] != 1 or kv_cache.shape[-1] != FLASHMLA_QK_DIM:
+            raise ValueError(f"PA_NZ FlashMLA cache must be [blocks, block_size, 1, {FLASHMLA_QK_DIM}]")
+        if kv_cache.dtype != torch.bfloat16:
+            raise ValueError("PA_NZ FlashMLA cache must be BF16")
+        if not kv_cache.is_contiguous():
+            raise ValueError("PA_NZ FlashMLA cache must be contiguous")
+
+
+def create_flash_mla_adapter(config: FlashMLAConfig) -> FlashMLAImpl | PaNzFlashMLAImpl:
+    if config.layout_kv == "PA_NZ":
+        return PaNzFlashMLAImpl.load(config)
+    return FlashMLAImpl.load(config)
+
+
 @dataclass
 class FlashMLACurrent:
     """Replicated current chunk, independent of persistent KV and prefix pages."""
 
-    adapter: FlashMLAImpl
+    adapter: FlashMLAImpl | PaNzFlashMLAImpl
     query: torch.Tensor
     schedule: torch.Tensor
     cache: torch.Tensor
@@ -276,7 +371,7 @@ class FlashMLACurrent:
 
 @dataclass
 class FlashMLADecode:
-    adapter: FlashMLAImpl
+    adapter: FlashMLAImpl | PaNzFlashMLAImpl
     query: torch.Tensor
     schedule: torch.Tensor
     cu: torch.Tensor
@@ -291,6 +386,10 @@ class FlashMLADecode:
     cos: torch.Tensor | None
     sin: torch.Tensor | None
     current: FlashMLACurrent | None = None
+    layout: str = "PA_BBND"
+    q_len: int = 1
+    tail_metadata: tuple[torch.Tensor, torch.Tensor] | None = None
+    block_table_prepared: bool = False
 
 
 class FlashMLAMetadataBuilder:
@@ -307,12 +406,25 @@ class FlashMLAMetadataBuilder:
         # speculative causal queries need the replicated current chunk.
         self.use_spec_decode = impl.vllm_config.speculative_config is not None
         self.cp_interleave = impl.vllm_config.parallel_config.cp_kv_cache_interleave_size if self.dcp_size > 1 else 1
-        adapter = FlashMLAImpl.load(FlashMLAConfig(impl.num_heads, impl.scale, return_softmax_lse=self.dcp_size > 1))
-        self.current_adapter = adapter
-        history_adapter = replace(
-            adapter,
-            config=replace(adapter.config, num_heads=impl.num_heads * self.dcp_size, mask_mode=0),
+        layout = "PA_NZ" if getattr(impl, "flash_mla_layout", "pa_bbnd") == "pa_nz" else "PA_BBND"
+        if layout == "PA_NZ" and self.dcp_size > 1:
+            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA does not support DCP yet.")
+        adapter = create_flash_mla_adapter(
+            FlashMLAConfig(
+                impl.num_heads,
+                impl.scale,
+                layout_kv=layout,
+                return_softmax_lse=self.dcp_size > 1,
+            )
         )
+        self.current_adapter = adapter
+        if layout == "PA_NZ":
+            history_adapter = adapter
+        else:
+            history_adapter = replace(
+                adapter,
+                config=replace(adapter.config, num_heads=impl.num_heads * self.dcp_size, mask_mode=0),
+            )
         self.adapters = {True: history_adapter if self.dcp_size > 1 else adapter, False: history_adapter}
         self.device = device
         self.dtype = impl.dtype
@@ -327,18 +439,27 @@ class FlashMLAMetadataBuilder:
         cu = torch.zeros(rows + 1, **ints)
         used = torch.zeros(rows, **ints)
         lengths = torch.zeros(rows, **ints)
-        schedule_meta = adapter.build_metadata(
-            torch.empty_like(lengths, device="meta"),
-            torch.empty_like(cu, device="meta"),
-            torch.empty_like(used, device="meta"),
-        )
+        if adapter.config.layout_kv == "PA_NZ":
+            # The 0.27 metadata operator has no meta implementation.  Build
+            # one dummy device schedule here; refresh() overwrites it in place.
+            cu.copy_(torch.arange(rows + 1, dtype=torch.int32, device=self.device))
+            used.fill_(1)
+            lengths.fill_(1)
+            schedule = adapter.build_metadata(lengths, cu, used, q_len=1)
+        else:
+            schedule_meta = adapter.build_metadata(
+                torch.empty_like(lengths, device="meta"),
+                torch.empty_like(cu, device="meta"),
+                torch.empty_like(used, device="meta"),
+            )
+            schedule = torch.empty_like(schedule_meta, device=self.device)
         rope_shape = (tokens, 1, 1, FLASHMLA_QK_DIM - FLASHMLA_V_DIM)
         flash = FlashMLADecode(
             adapter=adapter,
             query=torch.empty(
                 (tokens, adapter.config.num_heads, FLASHMLA_QK_DIM), dtype=self.dtype, device=self.device
             ),
-            schedule=torch.empty_like(schedule_meta, device=self.device),
+            schedule=schedule,
             cu=cu,
             used_q=used,
             cache_lens=lengths,
@@ -350,6 +471,7 @@ class FlashMLAMetadataBuilder:
             attn_mask=self.attn_mask if adapter.config.mask_mode == 3 else None,
             cos=torch.empty(rope_shape, dtype=self.dtype, device=self.device) if self.use_rope else None,
             sin=torch.empty(rope_shape, dtype=self.dtype, device=self.device) if self.use_rope else None,
+            layout=adapter.config.layout_kv,
         )
         if self.dcp_size > 1 and causal and self.use_spec_decode:
             # As in split DCP attention, each rank retains every current row.
@@ -403,6 +525,10 @@ class FlashMLAMetadataBuilder:
             else:
                 flash = cached_flash
 
+        flash.q_len = max(1, int(getattr(common, "max_query_len", 1) or 1))
+        if flash.layout == "PA_NZ" and flash.q_len != 1:
+            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA supports q_len=1 only in Phase 1.")
+
         def refresh():
             # The extra zero-used request owns physical graph/SP padding.
             flash.cu.fill_(tokens)
@@ -444,7 +570,9 @@ class FlashMLAMetadataBuilder:
                 cos, sin = get_cos_and_sin_mla(flash.positions)
                 flash.cos.copy_(cos)
                 flash.sin.copy_(sin)
-            flash.schedule.copy_(flash.adapter.build_metadata(flash.cache_lens, flash.cu, flash.used_q))
+            flash.schedule.copy_(
+                flash.adapter.build_metadata(flash.cache_lens, flash.cu, flash.used_q, q_len=flash.q_len)
+            )
             if flash.current is not None:
                 current = flash.current
                 page_counts = (flash.used_q + FLASHMLA_BLOCK_SIZE - 1) // FLASHMLA_BLOCK_SIZE

@@ -111,6 +111,7 @@ from vllm_ascend.utils import (
 from vllm_ascend.worker.kvpp_cache import allocate_kvpp_cache
 from vllm_ascend.worker.utils import (
     get_single_raw_mla_backing,
+    make_pa_nz_cache_view,
     make_page_strided_cache_view,
 )
 
@@ -291,6 +292,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 non_causal_multi_token_decode=spec.non_causal_multi_token_decode,
                 model_version=model_version,
                 indexes_kv_by_block_stride=indexes_kv_by_block_stride,
+                flash_mla_layout=getattr(getattr(attn_module, "impl", None), "flash_mla_layout", "pa_bbnd"),
                 **ratio_kwargs,
             )
         if isinstance(attn_module, DeepseekV32IndexerCache):
@@ -949,7 +951,7 @@ def _uses_single_raw_mla_cache(
         return False
     if not kv_cache_spec.supports_single_raw_backing:
         return False
-    if not supports_component_major_mla_pd(vllm_config) or enable_sfa(vllm_config):
+    if enable_sfa(vllm_config):
         return False
 
     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase, [layer_name])
@@ -964,6 +966,16 @@ def _uses_single_raw_mla_cache(
     if getattr(impl, "pcp_enabled", False) or getattr(impl, "is_pcp_decode_sharded", False):
         # PCP gathers and sharded-decode writes still use the legacy
         # preprocessing contract. Keep their allocation compatible with it.
+        return False
+    if getattr(impl, "flash_mla_layout", None) == "pa_nz":
+        # The 0.27 PA_NZ operator requires dense pages and does not support
+        # the PD/component-major transfer contract yet.
+        if vllm_config.kv_transfer_config is not None:
+            return False
+        if not kv_cache_spec.requires_contiguous_page:
+            return False
+        return bool(getattr(impl, "use_flashmla", False))
+    if not supports_component_major_mla_pd(vllm_config):
         return False
     if getattr(impl, "use_flashmla", False):
         # The external reader retains its fused-cache contract, including
@@ -1783,6 +1795,17 @@ def _reshape_kv_cache_v2(
                 fused_dim = nope_dim + rope_dim
 
                 attn_impl = vllm_config.compilation_config.static_forward_context[layer_name].impl
+                if getattr(attn_impl, "flash_mla_layout", None) == "pa_nz":
+                    # The 0.27 BF16 FlashMLA operator owns a dense merged
+                    # PA_NZ page; padded block strides are rejected.
+                    slot_bytes_unpadded = kv_cache_spec.unpadded_page_size_bytes // kernel_blocks_per_manager
+                    kv_caches[layer_name] = make_pa_nz_cache_view(
+                        single_raw_mla_cache,
+                        (*component_shape, fused_dim),
+                        kv_cache_spec.dtype,
+                        slot_bytes_unpadded,
+                    )
+                    continue
                 if attn_impl.use_flashmla:
                     # FlashMLA consumes one token-fused tensor with
                     # [nope | rope] in the trailing 576 lanes of every token.
