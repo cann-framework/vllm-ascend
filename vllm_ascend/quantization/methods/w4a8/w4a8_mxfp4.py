@@ -494,6 +494,9 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         assert layer is not None
         if (
             not use_grouped_situ
+            # A5 SiTU keeps PR35's separate GMM1 + activation/quant path
+            # even when the optional grouped SiTU operator is unavailable.
+            and not get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP)
             and mlp_compute_input.shared_expert_schedule is None
             and not hasattr(layer, "cann_mega_moe_w13_weight_list")
             and mlp_compute_input.activation == MoEActivation.SITU

@@ -24,7 +24,11 @@ class KimiDecodeSchedule:
         prepared = shared.prepare_for_router_overlap(prepared_input, router_ready)
         assert prepared is not None
         limit = MXFP_SHARED_CORE_LIMIT if hasattr(shared.layer.gate_up_proj, "weight_scale") else BF16_SHARED_CORE_LIMIT
-        with torch_npu.npu.npugraph_ex.scope.limit_core_num(*limit):
+        # Select the producer stream before applying its core limit.
+        with (
+            npu_stream_switch(shared_experts_calculation_stream()),
+            torch_npu.npu.npugraph_ex.scope.limit_core_num(*limit),
+        ):
             self.submitted = shared.enqueue_gate_up_after_router(prepared, router_ready)
         self.down_input = None
         self.output = None
@@ -34,8 +38,9 @@ class KimiDecodeSchedule:
         dispatch_done = main.record_event()
         with npu_stream_switch(shared_experts_calculation_stream()):
             torch.npu.current_stream().wait_event(dispatch_done)
-            activated = self.shared.apply_activation(self.submitted.gate_up)
-            self.down_input = self.shared._prepare_linear_input_for_overlap(self.shared.layer.down_proj, activated)
+            # PR51 releases GMM1 after SiTU alone. Keep Down's input
+            # quantization in its registered linear, after GMM1 completes.
+            self.down_input = self.shared.apply_activation(self.submitted.gate_up)
             activation_done = torch.npu.current_stream().record_event()
         # Both BF16 and MXFP shared paths release GMM1 only after SiTU.
         main.wait_event(activation_done)

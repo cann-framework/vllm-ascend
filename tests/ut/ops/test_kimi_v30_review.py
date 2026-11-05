@@ -274,6 +274,100 @@ class TestKimiMigrationReview(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         self.assertIsNone(runner._kimi_router_logits)
 
+    def test_mxfp_shared_keeps_sparse_activation_in_all_execution_modes(self):
+        class Sparse:
+            beta = 4.0
+            linear_beta = 25.0
+
+        fused = Mock(side_effect=AssertionError("Kimi sparse SiTU was bypassed by fused quantization"))
+        ns = dict(
+            AscendSharedSparseSituAndMul=Sparse,
+            torch=NS(ops=NS(_C_ascend=NS(situ_mx_quant=fused))),
+            SITU_MX_DST_TYPE_E4M3FN=36,
+        )
+        cls = load_class("vllm_ascend/ops/fused_moe/shared_experts.py", "AscendSharedExperts", {"_run_a8_mxfp_mlp"}, ns)
+        shared = cls()
+        shared.situ_activation = Sparse()
+        activated = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
+        shared.apply_activation = Mock(return_value=activated)
+        shared._wait_for_routed_stage = Mock()
+        shared.part2 = Mock(return_value=activated + 1)
+        submitted = NS(gate_up=torch.ones(1, 4, dtype=torch.bfloat16), hidden_states=torch.ones(1, 2))
+        for mode in ("prefill", "serial", "ordinary_decode"):
+            with self.subTest(mode=mode):
+                milestones = NS(shared_activation_overlap_start=object(), routed_combine_start=object())
+                output = shared._run_a8_mxfp_mlp(submitted, milestones)
+                torch.testing.assert_close(output, activated + 1)
+                self.assertIs(shared.part2.call_args.args[1], activated)
+        self.assertEqual(shared.apply_activation.call_count, 3)
+        fused.assert_not_called()
+
+    def test_decode_schedule_is_limited_to_source_pr51_schemes(self):
+        from unittest.mock import patch
+
+        class Routed:
+            pass
+
+        class Linear:
+            pass
+
+        class Latent:
+            pass
+
+        class Router:
+            pass
+
+        modules = {
+            "vllm_ascend.ops.fused_moe.router.fused_topk_router": NS(AscendFusedTopKRouter=Router),
+            "vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4": NS(
+                AscendW4A8MXFPDynamicFusedMoEMethod=Routed, AscendW4A8MXFPDynamicLinearMethod=Linear
+            ),
+            "vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8": NS(AscendW8A8MXFP8DynamicLinearMethod=Latent),
+        }
+        ns = dict(
+            torch=torch,
+            get_forward_context=lambda: NS(attn_metadata={"layer": NS(num_prefills=0)}),
+            get_current_hardware_profile=lambda: NS(supports=lambda cap: True),
+            HardwareCapability=NS(CANN_MEGAMOE_MXFP=1),
+            _EXTRA_CTX=NS(moe_comm_type="mc2"),
+            MoECommType=NS(MC2="mc2"),
+            QuantType=NS(W4A8MXFP="fp4"),
+        )
+        cls = load_class("vllm_ascend/ops/fused_moe/fused_moe.py", "AscendMoERunner", {"_can_run_kimi_decode"}, ns)
+        runner = cls()
+        runner.quant_type = "fp4"
+        runner.moe_config = NS(is_sequence_parallel=True)
+        runner._can_overlap_sp_shared_with = lambda transform: True
+        runner.routed_input_transform = NS(quant_method=NS(quant_method=Latent()))
+        runner.routed_output_transform = object()
+        router = Router()
+        router.custom_routing_function = None
+        router.tid2eid = None
+        scheme = Routed()
+        scheme.use_expert_weight_list = False
+        runner.routed_experts = NS(quant_method=NS(quant_method=scheme), router=router, dynamic_eplb=False)
+        layer = NS(
+            gate_up_proj=NS(weight=torch.ones(2, 2, dtype=torch.bfloat16)),
+            down_proj=NS(weight=torch.ones(2, 2, dtype=torch.bfloat16)),
+        )
+        runner.ascend_shared_experts = NS(layer=layer, situ_activation=object())
+        x = torch.ones(2, 2, dtype=torch.bfloat16)
+        with patch.dict("sys.modules", modules):
+            self.assertTrue(runner._can_run_kimi_decode(x))
+            for obj, attribute, value in [
+                (scheme, "use_expert_weight_list", True),
+                (router, "custom_routing_function", lambda: None),
+                (router, "tid2eid", object()),
+                (layer, "expert_gate", object()),
+                (runner.routed_experts, "_ascend_moe_lora_context", object()),
+            ]:
+                old = getattr(obj, attribute, None)
+                setattr(obj, attribute, value)
+                self.assertFalse(runner._can_run_kimi_decode(x), attribute)
+                setattr(obj, attribute, old)
+            runner.routed_input_transform.quant_method.quant_method = object()
+            self.assertFalse(runner._can_run_kimi_decode(x))
+
 
 if __name__ == "__main__":
     unittest.main()

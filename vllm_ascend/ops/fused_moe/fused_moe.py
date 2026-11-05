@@ -627,6 +627,15 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         return router_logits, shared_input_ready, router_output_ready, submitted_gate_up
 
     def _can_run_kimi_decode(self, hidden_states: torch.Tensor) -> bool:
+        # Quant schemes import routed/shared MoE code; load these after module
+        # initialization and enforce PR51's exact validated implementation scope.
+        from vllm_ascend.ops.fused_moe.router.fused_topk_router import AscendFusedTopKRouter
+        from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
+            AscendW4A8MXFPDynamicFusedMoEMethod,
+            AscendW4A8MXFPDynamicLinearMethod,
+        )
+        from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
+
         metadata = get_forward_context().attn_metadata
         metadata = list(metadata.values()) if isinstance(metadata, dict) else [metadata]
         shared = self.ascend_shared_experts
@@ -635,16 +644,25 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         linears = (shared.layer.gate_up_proj, shared.layer.down_proj)
         bf16 = all(linear.weight.dtype == torch.bfloat16 and not hasattr(linear, "weight_scale") for linear in linears)
         mxfp4 = all(
-            type(getattr(getattr(linear, "quant_method", None), "quant_method", None)).__name__
-            == "AscendW4A8MXFPDynamicLinearMethod"
+            type(getattr(getattr(linear, "quant_method", None), "quant_method", None))
+            is AscendW4A8MXFPDynamicLinearMethod
             for linear in linears
         )
+        routed_scheme = getattr(self.routed_experts.quant_method, "quant_method", None)
+        down_scheme = getattr(getattr(self.routed_input_transform, "quant_method", None), "quant_method", None)
+        router = self.routed_experts.router
         return (
             get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP)
             and bool(metadata)
             and all(getattr(m, "num_prefills", None) == 0 for m in metadata)
             and _EXTRA_CTX.moe_comm_type is MoECommType.MC2
             and self.quant_type is QuantType.W4A8MXFP
+            and type(routed_scheme) is AscendW4A8MXFPDynamicFusedMoEMethod
+            and not routed_scheme.use_expert_weight_list
+            and type(down_scheme) is AscendW8A8MXFP8DynamicLinearMethod
+            and type(router) is AscendFusedTopKRouter
+            and router.custom_routing_function is None
+            and router.tid2eid is None
             and self._can_overlap_sp_shared_with(self.routed_input_transform)
             and self._can_overlap_sp_shared_with(self.routed_output_transform)
             and self.moe_config.is_sequence_parallel
@@ -652,6 +670,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             and not self.routed_experts.dynamic_eplb
             and getattr(self.routed_experts, "_ascend_moe_lora_context", None) is None
             and shared.situ_activation is not None
+            and getattr(shared.layer, "expert_gate", None) is None
             and (bf16 or mxfp4)
         )
 

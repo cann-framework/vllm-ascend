@@ -158,7 +158,7 @@ class TestSituHooks(unittest.TestCase):
         del custom.grouped_situ_mx_quant
         calls.clear()
         method.apply_gmm1_act_quant(inp)
-        self.assertEqual(calls, ["fused"])
+        self.assertEqual(calls, ["gmm1", "legacy_situ"])
         # After MegaMoE loading the dense weights were released. Even without
         # the custom grouped SiTU op or a shared schedule, use live GMM views.
         inp.layer.cann_mega_moe_w13_weight_list = []
@@ -214,7 +214,11 @@ class TestDecodeDependencies(unittest.TestCase):
         ns = dict(
             torch=NS(npu=npu),
             torch_npu=NS(
-                npu=NS(npugraph_ex=NS(scope=NS(limit_core_num=lambda *limit: (limits.append(limit) or nullcontext()))))
+                npu=NS(
+                    npugraph_ex=NS(
+                        scope=NS(limit_core_num=lambda *limit: (limits.append((current[0], limit)) or nullcontext()))
+                    )
+                )
             ),
             npu_stream_switch=switch,
             shared_experts_calculation_stream=lambda: streams["shared"],
@@ -237,6 +241,8 @@ class TestDecodeDependencies(unittest.TestCase):
             return x * 2
 
         def down(x, y):
+            if quantized:
+                op("shared_down_quant")
             op("shared_down")
             return y + 3
 
@@ -250,7 +256,7 @@ class TestDecodeDependencies(unittest.TestCase):
             prepare_for_router_overlap=lambda p, r: p,
             enqueue_gate_up_after_router=gate_up,
             apply_activation=activate,
-            _prepare_linear_input_for_overlap=lambda layer, x: x,
+            _prepare_linear_input_for_overlap=Mock(side_effect=AssertionError("Down quantization ran before GMM1")),
             part2=down,
             _pad_and_reduce_scatter=scatter,
         )
@@ -283,7 +289,10 @@ class TestDecodeDependencies(unittest.TestCase):
         ]:
             self.assertIn(ids[before], ancestors(ids[after]))
         self.assertNotIn(ids["shared_down"], ancestors(ids["routed_situ"]))
-        self.assertEqual(limits, [(16, 32) if quantized else (32, 1)])
+        shared._prepare_linear_input_for_overlap.assert_not_called()
+        if quantized:
+            self.assertIn(ids["gmm1"], ancestors(ids["shared_down_quant"]))
+        self.assertEqual(limits, [("shared", (16, 32) if quantized else (32, 1))])
 
 
 class TestRuntimeMoEBoundary(unittest.TestCase):
