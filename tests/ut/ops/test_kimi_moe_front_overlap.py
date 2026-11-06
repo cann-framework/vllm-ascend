@@ -85,10 +85,14 @@ class TestKimiFrontOverlap(unittest.TestCase):
 
     def test_router_quant_and_topk_projection_remain_independent(self):
         for preprojected in (False, True):
-            with self.subTest(preprojected=preprojected):
-                self.check_front(preprojected)
+            for superkernel in (False, True):
+                with self.subTest(preprojected=preprojected, superkernel=superkernel):
+                    self.check_front(preprojected, superkernel=superkernel)
 
-    def check_front(self, preprojected):
+    def test_non_decode_retains_main_stream_gather_wait(self):
+        self.check_front(True, decode=False)
+
+    def check_front(self, preprojected, *, decode=True, superkernel=False):
         graph = EventGraph()
         inputs = torch.arange(24).reshape(3, 8).to(torch.bfloat16)
         projected = inputs[:, :4] * 2
@@ -117,10 +121,16 @@ class TestKimiFrontOverlap(unittest.TestCase):
             PreparedSharedExpertInput=NS,
             shared_experts_calculation_stream=lambda: graph.streams["shared"],
             tensor_model_parallel_all_gather=gather,
-            SharedExpertParallelMode=NS(SEQUENCE_PARALLEL_ONLY="sp"),
+            SharedExpertParallelMode=NS(SEQUENCE_PARALLEL_ONLY="sp", SHARED_EXPERT_DATA_PARALLEL_ONLY="dp"),
+            RoutedMoEMilestones=NS,
+            PreparedSharedExpertExecution=NS,
+            _EXTRA_CTX=NS(num_tokens=6),
         )
         shared_cls = load_class(
-            "vllm_ascend/ops/fused_moe/shared_experts.py", "AscendSharedExperts", {"prepare_input_async"}, ns
+            "vllm_ascend/ops/fused_moe/shared_experts.py",
+            "AscendSharedExperts",
+            {"prepare_input_async", "prepare_for_router_overlap", "_prepare_execution_input", "_wait_for_milestone"},
+            ns,
         )
         shared = shared_cls()
         shared.multistream_overlap = True
@@ -159,7 +169,7 @@ class TestKimiFrontOverlap(unittest.TestCase):
             ROUTER_CORE_LIMIT=(32, 1),
             MoECommType=NS(MC2=1),
             get_moe_comm_method=lambda *args: NS(prepare_finalize=NS(tp_size=2)),
-            _EXTRA_CTX=NS(padded_num_tokens=10, in_profile_run=False),
+            _EXTRA_CTX=NS(padded_num_tokens=10, in_profile_run=False, num_tokens=6),
             PreparedSharedExpertInput=lambda hidden_states, **kw: NS(
                 hidden_states=hidden_states, ready_event=kw.pop("ready_event", None), **kw
             ),
@@ -167,7 +177,7 @@ class TestKimiFrontOverlap(unittest.TestCase):
         cls = load_class(
             "vllm_ascend/ops/fused_moe/fused_moe.py",
             "AscendMoERunner",
-            {"apply_routed_input_transform", "_prepare_kimi_decode_topk"},
+            {"apply_routed_input_transform", "_prepare_kimi_decode_topk", "_forward_impl"},
             ns,
             "Base",
         )
@@ -177,7 +187,10 @@ class TestKimiFrontOverlap(unittest.TestCase):
         runner._kimi_router_stream = graph.streams["router"]
         runner._kimi_shared_comm_stream = graph.streams["comm"]
         runner._can_overlap_sp_shared_with = lambda transform: True
-        runner._can_run_kimi_decode = lambda x: True
+        runner._can_run_kimi_decode = lambda x: decode
+        runner._kimi_superkernel_active = superkernel
+        # A new invocation must overwrite an earlier call's readiness.
+        runner._kimi_shared_input_ready = object()
         runner._compute_router_logits = lambda *args: (graph.op("router_gemm") and logits)
         runner.routed_input_transform = Projection()
         runner.routed_experts = NS(_select_experts=select)
@@ -189,7 +202,7 @@ class TestKimiFrontOverlap(unittest.TestCase):
             )
         self.assertIs(actual, projected)
         torch.testing.assert_close(shared_input, inputs.repeat(2, 1))
-        self.assertEqual(limits, [("router", (32, 1))])
+        self.assertEqual(limits, [("router", (32, 1))] if decode else [])
         self.assertIn("comm", records)
         self.assertEqual(graph.nodes[graph.index("all_gather")][0], "comm")
         self.assertNotIn(graph.index("all_gather"), graph.ancestors(graph.index("router_gemm")))
@@ -207,6 +220,60 @@ class TestKimiFrontOverlap(unittest.TestCase):
             self.assertNotIn(topk, graph.ancestors(projection))
             self.assertNotIn(projection, graph.ancestors(topk))
             self.assertNotIn(graph.index("all_gather"), graph.ancestors(projection))
+
+        if not decode:
+            dispatch = graph.op("fallback_dispatch")
+            self.assertIn(graph.index("all_gather"), graph.ancestors(dispatch))
+            self.assertIsNone(runner._kimi_shared_input_ready)
+            return
+
+        # Exercise the real runner handoff and Shared input preparation:
+        # Dispatch must not inherit AG, but Shared quantization/Gate-Up must.
+        def prepare_shared(x):
+            torch.testing.assert_close(x, inputs.repeat(2, 1))
+            graph.op("shared_quant")
+            return x
+
+        def enqueue_shared(prepared, ready):
+            graph.streams["shared"].wait_event(ready)
+            graph.op("shared_gate_up")
+            return NS(gate_up=prepared.gate_up_input)
+
+        shared._prepare_gate_up_input = prepare_shared
+        shared.enqueue_gate_up_after_router = enqueue_shared
+        shared.apply_activation = lambda x: (graph.op("shared_situ"), x)[1]
+        shared.layer = NS(gate_up_proj=NS())
+        ns.update(BF16_SHARED_CORE_LIMIT=(32, 1), MXFP_SHARED_CORE_LIMIT=(16, 32))
+        schedule_cls = load_class(
+            "vllm_ascend/ops/fused_moe/kimi_decode_schedule.py",
+            "KimiDecodeSchedule",
+            {"__init__", "before_dispatch", "after_dispatch"},
+            ns,
+        )
+        schedule_cls.finalize = lambda schedule: shared_input
+        ns["KimiDecodeSchedule"] = schedule_cls
+        runner._sequence_parallel_context = nullcontext
+        runner.routed_output_transform = object()
+
+        def routed_forward(**kwargs):
+            schedule = kwargs["shared_expert_schedule"]
+            schedule.before_dispatch(npu.current_stream().record_event())
+            graph.op("dispatch")
+            schedule.after_dispatch()
+            graph.op("gmm1")
+            return projected, None
+
+        runner.routed_experts.forward_impl = routed_forward
+        with patch.object(torch.Tensor, "record_stream", lambda *args: None):
+            runner._forward_impl(projected, logits, shared_input)
+        ag = graph.index("all_gather")
+        self.assertNotIn(ag, graph.ancestors(graph.index("dispatch")))
+        for name in ("shared_quant", "shared_gate_up"):
+            self.assertEqual(graph.nodes[graph.index(name)][0], "shared")
+            self.assertIn(ag, graph.ancestors(graph.index(name)))
+        self.assertNotIn(graph.index("dispatch"), graph.ancestors(graph.index("shared_gate_up")))
+        self.assertIn(graph.index("dispatch"), graph.ancestors(graph.index("shared_situ")))
+        self.assertIn(graph.index("shared_situ"), graph.ancestors(graph.index("gmm1")))
 
     def test_precomputed_topk_preserves_mc2_prepare_masks_and_finalization(self):
         states = torch.ones(3, 4, dtype=torch.bfloat16)

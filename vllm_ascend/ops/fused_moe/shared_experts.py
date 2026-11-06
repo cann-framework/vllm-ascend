@@ -339,9 +339,9 @@ class AscendSharedExperts:
     ) -> PreparedSharedExpertInput:
         """Start the SP-only input all-gather on the shared-expert stream.
 
-        The caller must wait for ``ready_event`` before enqueueing routed-path
-        collectives.  This method is intended to overlap the gather only with
-        a routed input transform such as Kimi-K3's latent projection.
+        Generic callers wait for ``ready_event`` before routed collectives.
+        Kimi's dedicated MC2 Decode schedule instead passes it to shared
+        input preparation, allowing Dispatch to overlap the gather tail.
         """
         if not (self.multistream_overlap and self.parallel_mode() is SharedExpertParallelMode.SEQUENCE_PARALLEL_ONLY):
             return PreparedSharedExpertInput(hidden_states=hidden_states)
@@ -424,6 +424,10 @@ class AscendSharedExperts:
             milestones.shared_input_ready,
             "shared_input_ready",
         )
+        # Kimi Decode hands the AG event directly to this consumer stream.
+        # Wait before any activation preparation, including quantization.
+        if prepared_input.ready_event is not None:
+            torch.npu.current_stream().wait_event(prepared_input.ready_event)
         hidden_states = prepared_input.hidden_states
         local_dp_metadata = None
         if mode is SharedExpertParallelMode.SHARED_EXPERT_DATA_PARALLEL_ONLY:
