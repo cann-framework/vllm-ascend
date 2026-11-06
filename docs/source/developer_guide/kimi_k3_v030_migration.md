@@ -143,7 +143,11 @@ above. The existing `multistream_overlap_shared_expert` switch controls the
 schedule independently of `enable_super_kernel`. Prefill retains its fallback
 schedule without the Decode projection core limits.
 
-Kimi now imports the existing Ascend SP operations. Their custom-op boundary
+Kimi and its BF16 O-projection MM/RS fallback now import the existing Ascend SP
+operations. The fallback performs its own RS because the decoder skips a second
+reduction when the O-projection operator is installed. Both call sites must use
+runtime padding; switching only the model import leaves the fallback exposed
+to unaligned token counts in compiled execution. Their custom-op boundary
 keeps token padding inside the runtime operation when a compiled graph is
 reused for smaller capture sizes. For TP8, a graph traced with 16 tokens must
 also produce nonempty shards for 12, 8, 4, 2 and 1 token. Hidden-state and

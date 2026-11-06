@@ -96,6 +96,59 @@ class TestKimiV2SequenceParallel(unittest.TestCase):
         self.assertNotIn("fallback_ag", calls)
         self.assertNotIn("fallback_rs", calls)
 
+        # The Kimi-specific BF16 O-projection fallback owns its own RS. It
+        # skips the decoder's SP reduction, so changing only the model import
+        # leaves this second import and its trace-sensitive padding exposed.
+        linear_path = ROOT / "vllm_ascend/ops/linear_op.py"
+        linear_tree = ast.parse(linear_path.read_text())
+        imports = [
+            n for n in linear_tree.body if isinstance(n, ast.ImportFrom) and n.module.endswith("ops.sequence_parallel")
+        ]
+        projection_ns = dict(
+            torch=torch,
+            is_forward_context_available=lambda: True,
+            get_forward_context=lambda: NS(attn_metadata=NS(num_prefills=0, num_decodes=1)),
+        )
+        with patch.dict(sys.modules, {"vllm_ascend.models.common.ops.sequence_parallel": NS(**ns)}):
+            exec(compile(ast.Module(body=imports, type_ignores=[]), str(linear_path), "exec"), projection_ns)
+        cls = next(
+            n for n in linear_tree.body if isinstance(n, ast.ClassDef) and n.name == "KimiOProjMMReduceScatterOp"
+        )
+        cls.bases = []
+        cls.body = [n for n in cls.body if getattr(n, "name", None) in ("apply_impl", "_can_fuse")]
+        exec(compile(ast.Module(body=[cls], type_ignores=[]), str(linear_path), "exec"), projection_ns)
+        projection = projection_ns["KimiOProjMMReduceScatterOp"]()
+        projection.layer = NS()
+        projection.get_input_parallel = lambda x: x
+        projection.quant_method = NS(apply=lambda layer, x, bias: x @ layer.weight.t())
+
+        @torch.library.custom_op("kimi_v2_sp_test::reduce_scatter", mutates_args=())
+        def reduce_scatter(x: torch.Tensor) -> torch.Tensor:
+            # Match the communicator assertion from the reported traceback.
+            assert x.shape[0] % 8 == 0, (x.shape, 8)
+            return x.chunk(8)[rank[0]].clone() * 8
+
+        @reduce_scatter.register_fake
+        def fake_reduce_scatter(x):
+            return x.new_empty((x.shape[0] // 8, x.shape[1]))
+
+        ns["get_tp_group"] = lambda: NS(device_communicator=None)
+        ns["tensor_model_parallel_reduce_scatter"] = lambda x, dim: reduce_scatter(x)
+
+        def project(x, weight):
+            projection.layer.weight = weight
+            return projection.apply_impl(x)[0]
+
+        weight = torch.arange(32 * 256).reshape(32, 256).float() / 256
+        compiled_projection = make_fx(project, tracing_mode="symbolic")(torch.ones(16, 256), weight)
+        for current_rank in range(8):
+            rank[0] = current_rank
+            for tokens in (16, 12, 8, 4, 2, 1, 17):
+                with self.subTest(projection_rank=current_rank, tokens=tokens):
+                    x = torch.arange(tokens * 256).reshape(tokens, 256).float() / 256
+                    expected = torch.nn.functional.pad(x @ weight.t(), (0, 0, 0, (-tokens) % 8))
+                    torch.testing.assert_close(compiled_projection(x, weight), expected.chunk(8)[current_rank] * 8)
+
 
 if __name__ == "__main__":
     unittest.main()
