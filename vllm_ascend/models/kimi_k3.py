@@ -1047,6 +1047,24 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
         else:
             self.attn_res_query_plan.refresh(specs)
 
+    def _start_flash_mla_metadata(self) -> None:
+        """Start one shared FlashMLA metadata build before the layer loop."""
+        if not is_forward_context_available():
+            return
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return
+        for layer in self.layers:
+            self_attn = getattr(layer, "self_attn", None)
+            impl = getattr(self_attn, "impl", None)
+            if impl is None or not hasattr(impl, "start_flash_mla_metadata"):
+                continue
+            layer_metadata = attn_metadata.get(getattr(impl, "layer_name", None))
+            if layer_metadata is None or getattr(layer_metadata, "num_decode_tokens", 0) <= 0:
+                continue
+            impl.start_flash_mla_metadata(layer_metadata)
+            return
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1055,6 +1073,7 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        self._start_flash_mla_metadata()
         if self.config.attn_res_block_size is None:
             return super().forward(
                 input_ids=input_ids,
