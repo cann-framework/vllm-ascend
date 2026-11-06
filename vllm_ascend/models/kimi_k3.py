@@ -172,8 +172,8 @@ class AscendKimiK3DeltaAttention(AscendKimiK3DeltaAttentionBase):
     def __init__(self, config, vllm_config, prefix: str = "") -> None:
         super().__init__(config, vllm_config, prefix)
         if self.uses_mixed_projection:
-            # Set before weight loading so fused QKV uses the same NZ GMM
-            # layout as the routed projections.
+            # Keep the single-group NZ layout for the eager fused QKV path.
+            # Latent MoE projections use ordinary NZ Quant Matmul instead.
             self.in_proj_qkvgfab._single_group_gmm_nz = True
 
     def _matmul_fused_qkv(
@@ -414,7 +414,10 @@ class AscendKimiMoE(nn.Module):
         self.routed_expert_up_proj: ReplicatedLinear | None
         self.routed_output_transform: KimiRoutedOutputTransform | None
         if self.use_latent_moe:
-            self.routed_expert_down_proj = AscendKimiK3RoutedLinear(
+            # Match recipes: use Quant Matmul in both warmup and graph capture.
+            # Ordinary ReplicatedLinear keeps the logical weight [K, N] before
+            # the configured NZ conversion, without a singleton GMM dimension.
+            self.routed_expert_down_proj = ReplicatedLinear(
                 hidden_size,
                 self.moe_hidden_size,
                 bias=False,
@@ -424,7 +427,7 @@ class AscendKimiMoE(nn.Module):
             self.routed_expert_norm = (
                 RMSNorm(self.moe_hidden_size, eps=config.rms_norm_eps) if self.latent_moe_use_norm else None
             )
-            self.routed_expert_up_proj = AscendKimiK3RoutedLinear(
+            self.routed_expert_up_proj = ReplicatedLinear(
                 self.moe_hidden_size,
                 hidden_size,
                 bias=False,
