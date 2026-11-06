@@ -164,7 +164,11 @@ def _is_kimi_k3_pa_nz_groups(kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
     for group in kv_cache_groups:
         group_spec = group.kv_cache_spec
         assert isinstance(group_spec, UniformTypeKVCacheSpecs)
-        if any(getattr(spec, "flash_mla_layout", None) == "pa_nz" for spec in group_spec.kv_cache_specs.values()):
+        if any(
+            getattr(spec, "flash_mla_layout", None) == "pa_nz"
+            or getattr(spec, "flash_mla_reserved_pages", 0) > 0
+            for spec in group_spec.kv_cache_specs.values()
+        ):
             return True
     return False
 
@@ -221,7 +225,13 @@ def _kimi_k3_reserved_pages(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
             reserved = max(
                 reserved,
                 max(
-                    (getattr(spec, "flash_mla_reserved_pages", 0) for spec in group_spec.kv_cache_specs.values()),
+                    (
+                        max(
+                            getattr(spec, "flash_mla_reserved_pages", 0),
+                            2 if getattr(spec, "flash_mla_layout", None) == "pa_nz" else 0,
+                        )
+                        for spec in group_spec.kv_cache_specs.values()
+                    ),
                     default=0,
                 ),
             )
