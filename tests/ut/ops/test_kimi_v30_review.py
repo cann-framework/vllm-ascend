@@ -310,7 +310,7 @@ class TestKimiMigrationReview(unittest.TestCase):
         self.assertEqual(shared.apply_activation.call_count, 3)
         fused.assert_not_called()
 
-    def test_decode_schedule_is_limited_to_source_pr51_schemes(self):
+    def test_both_runners_admit_decode_and_reject_unsupported_schemes(self):
         from unittest.mock import patch
 
         class Routed:
@@ -332,9 +332,10 @@ class TestKimiMigrationReview(unittest.TestCase):
             ),
             "vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8": NS(AscendW8A8MXFP8DynamicLinearMethod=Latent),
         }
+        context = NS(attn_metadata={"layer": NS(num_prefills=0)})
         ns = dict(
             torch=torch,
-            get_forward_context=lambda: NS(attn_metadata={"layer": NS(num_prefills=0)}),
+            get_forward_context=lambda: context,
             get_current_hardware_profile=lambda: NS(supports=lambda cap: True),
             HardwareCapability=NS(CANN_MEGAMOE_MXFP=1),
             _EXTRA_CTX=NS(moe_comm_type="mc2", is_draft_model=False),
@@ -364,11 +365,29 @@ class TestKimiMigrationReview(unittest.TestCase):
         runner.ascend_shared_experts = NS(layer=layer, situ_activation=object())
         x = torch.ones(2, 2, dtype=torch.bfloat16)
         with patch.dict("sys.modules", modules):
-            self.assertTrue(runner._can_run_kimi_decode(x))
+            for runner_v2 in (False, True):
+                runner.routed_experts._use_v2_model_runner = runner_v2
+                self.assertTrue(runner._can_run_kimi_decode(x))
+                # Hybrid KDA/MLA metadata and MTP verification are Decode
+                # when every attention group reports zero prefill requests.
+                context.attn_metadata = {"kda": NS(num_prefills=0), "mla": NS(num_prefills=0)}
+                self.assertTrue(runner._can_run_kimi_decode(x))
+                for metadata in (
+                    None,
+                    {},
+                    {"layer": NS()},
+                    {"layer": NS(num_prefills=1)},
+                    {"kda": NS(num_prefills=0), "mla": NS(num_prefills=1)},
+                ):
+                    context.attn_metadata = metadata
+                    self.assertFalse(runner._can_run_kimi_decode(x), (runner_v2, metadata))
+                context.attn_metadata = {"layer": NS(num_prefills=0)}
             for obj, attribute, value in [
                 (router, "bias_vl", object()),
                 (ns["_EXTRA_CTX"], "is_draft_model", True),
-                (runner.routed_experts, "_use_v2_model_runner", True),
+                (runner.moe_config, "is_sequence_parallel", False),
+                (runner.routed_experts, "dynamic_eplb", True),
+                (ns["_EXTRA_CTX"], "moe_comm_type", "alltoall"),
                 (scheme, "use_expert_weight_list", True),
                 (router, "custom_routing_function", lambda: None),
                 (router, "tid2eid", object()),

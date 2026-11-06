@@ -76,16 +76,18 @@ preserving native arguments, softmax renormalization and int32 expert IDs.
 Use the existing 0.30 `ascend_compilation_config.enable_super_kernel` flag.
 Its existing default inheritance from `enable_static_kernel` is unchanged;
 there is no additional Kimi SuperKernel switch. On A5 Kimi with shared
-multistream and the v1 runner, capture optimizes only graphs that emitted
+multistream and either model runner, capture optimizes only graphs that emitted
 eligible Decode MoE scopes. Draft, Prefill and unsupported batches do not emit
-these scopes. Other models and the v2 runner retain their generic 0.30 policy.
+these scopes. Other models retain their generic 0.30 policy.
 
 Named scopes cover Router/latent down through routed Combine and latent
 norm/up. Nested exclusions keep shared AllGather, shared ReduceScatter, the
 final join and Add outside fusion. The owning ACL graph is optimized once
 after successful capture with `dcci_disable_on_kernel=[".*"]` and
 `auto_op_parallel=1`; replay never repeats optimization. Capture tracking is
-local to the forward context and restores nested/failed captures. Compiler
+local to the forward context for V1 and to the owning `UpdatableGraph` capture
+resources for V2, where the forward context is created and destroyed inside
+the graph context. Failed captures are not optimized. Compiler
 options/cache keys distinguish this policy from generic whole-model fusion.
 Draft configuration keeps the v0.30 construction order: mark the returned copy
 with `runner_type="draft"` without replacing the proposer's target configuration.
@@ -132,6 +134,55 @@ Early shared ReduceScatter applies only to the validated MC2 Decode ladder;
 all other paths retain 0.30's collective ordering. Shared input AllGather still
 joins before routed EP communication. Multi-rank capture/replay must validate
 the new overlap; CPU dependency tests do not establish HCCL deadlock freedom.
+
+## Model Runner V2 validation
+
+V2 reuses the same MC2 Dispatch and routed GMM1 callbacks as V1. Enabling V2
+does not relax the Decode, hardware, SP, quantization, LoRA or EPLB checks
+above. The existing `multistream_overlap_shared_expert` switch controls the
+schedule independently of `enable_super_kernel`. Prefill retains its fallback
+schedule without the Decode projection core limits.
+
+Kimi now imports the existing Ascend SP operations. Their custom-op boundary
+keeps token padding inside the runtime operation when a compiled graph is
+reused for smaller capture sizes. For TP8, a graph traced with 16 tokens must
+also produce nonempty shards for 12, 8, 4, 2 and 1 token. Hidden-state and
+padding-mask partitioning must agree on every rank. This does not change the
+configured capture-size list or speculative decoding's batch descriptors.
+
+For hardware validation, retain the deployment's model/quantization/EP/TP and
+PD options, and set `VLLM_USE_V2_MODEL_RUNNER=1` before starting workers.
+Merge these settings into the existing additional configuration:
+
+```json
+{
+  "multistream_overlap_shared_expert": true,
+  "ascend_compilation_config": {
+    "enable_npugraph_ex": true,
+    "enable_static_kernel": true,
+    "enable_super_kernel": true
+  }
+}
+```
+
+First compare real-weight inference with `enable_super_kernel=false`, then
+enable SK and repeat the same requests. Include default capture sizes and
+explicit sizes below TP, both with and without speculative decoding. Validate
+standalone and PD Decode deployments separately; include a mixed Prefill/Decode
+batch to verify fallback selection. Restart workers between configurations
+and retain each run's logs and compile artifacts.
+
+Set `ASCEND_OP_COMPILE_SAVE_KERNEL_META=1` before startup to inspect scope
+membership. Profiling should show shared Down releasing shared RS without
+waiting for routed GMM2/Combine, and final Add waiting for both branches.
+Check static-kernel names and fusion-failure reasons in `sk_meta`, rather than
+inferring fusion from the task-time `static` column or requiring one kernel
+per scope.
+
+Local validation covers CPU eligibility, event dependencies, graph ownership,
+failure cleanup and compiled SP padding. Multi-rank NPU capture/replay,
+real-weight accuracy, deadlock freedom and latency remain hardware validation
+items; CPU tests do not establish those results.
 
 The per-forward schedule is passed through typed fused-expert/MLP inputs.
 Its temporary layer reference is cleared in the existing `finally` block.
@@ -187,6 +238,7 @@ python tests/ut/ops/test_kimi_moe_front_overlap.py -v
 python tests/ut/ops/test_kimi_v30_review.py -v
 python tests/ut/ops/test_kimi_situ_loading.py -v
 python tests/ut/compilation/test_kimi_moe_superkernel.py -v
+python tests/ut/models/test_kimi_v2_sequence_parallel.py -v
 python tests/ut/worker/test_kimi_megamoe_phase_policy.py -v
 ```
 

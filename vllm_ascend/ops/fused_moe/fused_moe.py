@@ -674,7 +674,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
 
     def _can_run_kimi_decode(self, hidden_states: torch.Tensor) -> bool:
         # Quant schemes import routed/shared MoE code; load these after module
-        # initialization and enforce PR51's exact validated implementation scope.
+        # initialization. Both runners use the same MC2/GMM callbacks; keep
+        # the Decode, quantization and shared-expert requirements identical.
         from vllm_ascend.ops.fused_moe.router.fused_topk_router import AscendFusedTopKRouter
         from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
             AscendW4A8MXFPDynamicFusedMoEMethod,
@@ -716,7 +717,6 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             and hidden_states.dtype == torch.bfloat16
             and not self.routed_experts.dynamic_eplb
             and not _EXTRA_CTX.is_draft_model
-            and not self.routed_experts._use_v2_model_runner
             and getattr(self.routed_experts, "_ascend_moe_lora_context", None) is None
             and shared.situ_activation is not None
             and getattr(shared.layer, "expert_gate", None) is None

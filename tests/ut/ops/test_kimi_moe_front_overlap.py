@@ -238,6 +238,7 @@ class TestKimiFrontOverlap(unittest.TestCase):
             _EXTRA_CTX=ctx,
             get_moe_comm_method=lambda *args: comm,
             AllGatherCommImpl=type("AllGather", (), {}),
+            _record_v2_eplb_load=Mock(),
         )
         cls = load_class("vllm_ascend/ops/fused_moe/routed_experts.py", "AscendRoutedExperts", {"forward_impl"}, ns)
         layer = cls()
@@ -245,7 +246,7 @@ class TestKimiFrontOverlap(unittest.TestCase):
         layer.moe_config = NS(is_sequence_parallel=True)
         layer.quant_type = "mxfp4"
         layer.router = object()
-        layer._use_v2_model_runner = False
+        layer._use_v2_model_runner = True
         layer.dynamic_eplb = False
         layer.return_with_event = False
         layer._select_experts_with_stream = Mock(side_effect=AssertionError("TopK recomputed"))
@@ -254,13 +255,18 @@ class TestKimiFrontOverlap(unittest.TestCase):
             self.assertIs(kw["topk_weights"], weights)
             self.assertIs(kw["topk_ids"], ids)
             self.assertIs(layer.ascend_mc2_mask, mask)
+            self.assertIs(layer._ascend_shared_schedule, schedule)
             return NS(routed_out=kw["x"])
 
         layer.quant_method = NS(apply=Mock(side_effect=apply))
+        schedule = object()
         done = object()
         with patch.object(torch.Tensor, "record_stream") as records:
             out = layer.forward_impl(
-                hidden_states=states, router_logits=torch.ones(3, 6), precomputed_topk=(weights, ids, done)
+                hidden_states=states,
+                router_logits=torch.ones(3, 6),
+                precomputed_topk=(weights, ids, done),
+                shared_expert_schedule=schedule,
             )
         self.assertEqual(out.shape, (3, 4))
         prepare.assert_called_once()
@@ -268,6 +274,7 @@ class TestKimiFrontOverlap(unittest.TestCase):
         self.assertEqual(records.call_count, 2)
         self.assertIsNone(layer.ascend_mc2_mask)
         self.assertIsNone(layer._ascend_shared_schedule)
+        ns["_record_v2_eplb_load"].assert_called_once()
         with self.assertRaisesRegex(RuntimeError, "padding"):
             layer.forward_impl(
                 hidden_states=states, router_logits=torch.ones(3, 6), precomputed_topk=(weights[:3], ids[:3], done)
