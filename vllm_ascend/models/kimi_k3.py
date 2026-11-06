@@ -53,6 +53,12 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
+from vllm.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_padding_mask,
+    sp_reduce_scatter,
+    sp_shard,
+)
 from vllm.models.kimi_k3.amd.linear import (
     KimiDecoderLayer as UpstreamKimiDecoderLayer,
 )
@@ -85,12 +91,6 @@ from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.utils import mark_fused_preprocess_weights
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
-from vllm_ascend.models.common.ops.sequence_parallel import (
-    sp_all_gather,
-    sp_padding_mask,
-    sp_reduce_scatter,
-    sp_shard,
-)
 from vllm_ascend.ops.fused_moe.shared_experts import AscendSharedSparseSituAndMul
 from vllm_ascend.ops.kimi_attn_res import (
     AttnResBackend,
