@@ -1100,6 +1100,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         flash = attn_metadata.external_flashmla
         if flash is None or self.flash_mla_metadata_builder is None:
             return
+        if _EXTRA_CTX.capturing:
+            # The warmup forward may have recorded an earlier fork/join; the
+            # captured graph needs its own pair inside the capture region.
+            flash.metadata_started = False
         self.flash_mla_metadata_builder.start_metadata(flash)
 
     def wait_flash_mla_metadata(self, attn_metadata: M) -> None:

@@ -332,13 +332,11 @@ class FlashMLAMetadataBuilder:
         # DCP splits the query between history and current adapters on the
         # attention stream, so its schedule stays synchronous for now.
         self.enable_async = bool(enable_async) and self.dcp_size == 1
-        self.metadata_stream = None
+        self.metadata_stream = torch.npu.Stream() if self.enable_async else None
+        # Re-record per step: a fresh event keeps every captured graph's
+        # fork/join self-contained instead of sharing one event object.
         self.metadata_start = None
         self.metadata_ready = None
-        if self.enable_async:
-            self.metadata_stream = torch.npu.Stream()
-            self.metadata_start = torch.npu.Event()
-            self.metadata_ready = torch.npu.Event()
 
     def _allocate(self, tokens: int, rows: int, columns: int, causal: bool) -> FlashMLADecode:
         ints = {"dtype": torch.int32, "device": self.device}
@@ -418,9 +416,12 @@ class FlashMLAMetadataBuilder:
             cached_flash = self.buffers.get(key)
             if cached_flash is None:
                 flash = self._allocate(tokens, rows, columns, common.causal)
-                # Captured buffers keep the schedule build on the caller's
-                # stream: graph replay never runs the model-level start/wait.
-                flash.metadata_async = self.enable_async and not retain_for_graph
+                # With the side stream enabled, a captured forward records the
+                # stream fork/join inside the graph, so the schedule node
+                # replays with the graph and never depends on Python running
+                # again. With the switch off the captured buffers keep the
+                # synchronous pre-replay build.
+                flash.metadata_async = self.enable_async
                 if retain_for_graph:
                     self.buffers[key] = flash
             else:
@@ -495,20 +496,42 @@ class FlashMLAMetadataBuilder:
             current.schedule.copy_(current.adapter.build_metadata(flash.used_q, flash.cu, flash.used_q))
 
     def start_metadata(self, flash: FlashMLADecode) -> None:
-        """Build this step's schedule on the side stream before the layer loop."""
+        """Build this step's schedule before the layer loop.
+
+        Eager decode forks the persistent side stream. Under graph capture the
+        same fork/join is recorded into the graph, so replay rebuilds the
+        schedule without running Python.
+        """
         if not flash.metadata_async or flash.metadata_started:
             return
-        if self.metadata_stream is None or self.metadata_start is None or self.metadata_ready is None:
+        if self.metadata_stream is None:
             flash.metadata_async = False
             self._refresh_schedule(flash)
+            flash.metadata_started = True
             return
         main_stream = torch.npu.current_stream()
-        self.metadata_start.record(main_stream)
+        self.metadata_start = main_stream.record_event()
         self.metadata_stream.wait_event(self.metadata_start)
+        self._record_metadata_stream(flash)
         with torch.npu.stream(self.metadata_stream):
             self._refresh_schedule(flash)
-            self.metadata_ready.record()
+            self.metadata_ready = torch.npu.current_stream().record_event()
         flash.metadata_started = True
+
+    def _record_metadata_stream(self, flash: FlashMLADecode) -> None:
+        """Record side-stream use of the persistent decode buffers.
+
+        The schedule and its length inputs are allocated on the main stream,
+        but the metadata operator reads and writes them on the side stream.
+        Without record_stream the caching allocator may reuse their storage on
+        the main-stream timeline while the side stream still references it.
+        """
+        if self.metadata_stream is None:
+            return
+        for tensor in (flash.schedule, flash.cache_lens, flash.cu, flash.used_q):
+            tensor.record_stream(self.metadata_stream)
+        if flash.current is not None:
+            flash.current.schedule.record_stream(self.metadata_stream)
 
     def wait_metadata(self, flash: FlashMLADecode) -> None:
         """Order the current stream after the side-stream schedule build."""
