@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
 )
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_kv_cache_config,
@@ -161,11 +162,21 @@ def _kimi_k3_pa_nz_from_config(vllm_config: VllmConfig | None) -> bool:
     if vllm_config is None:
         return False
     static_forward_context = getattr(vllm_config.compilation_config, "static_forward_context", None) or {}
-    return any(
+    if any(
         getattr(getattr(module, "impl", None), "flash_mla_layout", None) == "pa_nz"
         and layer_name.startswith((_KIMI_K3_TARGET_LAYER_PREFIX, _KIMI_K3_DRAFT_LAYER_PREFIX))
         for layer_name, module in static_forward_context.items()
-    )
+    ):
+        return True
+    # The scheduler may build KV cache groups before the worker's static
+    # forward context is populated. The environment switch is the same
+    # model-level opt-in used by AscendMLAImpl, so use it as the fallback.
+    if not ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+        return False
+    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    text_config = getattr(hf_config, "text_config", hf_config)
+    model_type = getattr(text_config, "model_type", getattr(hf_config, "model_type", None))
+    return model_type in ("kimi_k3", "kimi_linear")
 
 
 def _is_kimi_k3_pa_nz_groups(
@@ -184,6 +195,12 @@ def _is_kimi_k3_pa_nz_groups(
             for spec in group_spec.kv_cache_specs.values()
         ):
             return True
+    if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA and any(
+        layer_name.startswith((_KIMI_K3_TARGET_LAYER_PREFIX, _KIMI_K3_DRAFT_LAYER_PREFIX))
+        for group in kv_cache_groups
+        for layer_name in group.layer_names
+    ):
+        return True
     return _kimi_k3_pa_nz_from_config(vllm_config)
 
 
@@ -255,7 +272,17 @@ def _kimi_k3_reserved_pages(
                     default=0,
                 ),
             )
-    if reserved == 0 and _kimi_k3_pa_nz_from_config(vllm_config):
+    if reserved == 0 and (
+        _kimi_k3_pa_nz_from_config(vllm_config)
+        or (
+            ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA
+            and any(
+                layer_name.startswith((_KIMI_K3_TARGET_LAYER_PREFIX, _KIMI_K3_DRAFT_LAYER_PREFIX))
+                for group in kv_cache_groups
+                for layer_name in group.layer_names
+            )
+        )
+    ):
         return 2
     return reserved
 
