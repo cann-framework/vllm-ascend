@@ -157,7 +157,21 @@ def _physical_page_size_bytes(spec: KVCacheSpec) -> int:
     return getattr(spec, "unpadded_page_size_bytes", spec.page_size_bytes)
 
 
-def _is_kimi_k3_pa_nz_groups(kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
+def _kimi_k3_pa_nz_from_config(vllm_config: VllmConfig | None) -> bool:
+    if vllm_config is None:
+        return False
+    static_forward_context = getattr(vllm_config.compilation_config, "static_forward_context", None) or {}
+    return any(
+        getattr(getattr(module, "impl", None), "flash_mla_layout", None) == "pa_nz"
+        and layer_name.startswith((_KIMI_K3_TARGET_LAYER_PREFIX, _KIMI_K3_DRAFT_LAYER_PREFIX))
+        for layer_name, module in static_forward_context.items()
+    )
+
+
+def _is_kimi_k3_pa_nz_groups(
+    kv_cache_groups: list[KVCacheGroupSpec],
+    vllm_config: VllmConfig | None = None,
+) -> bool:
     """Only the opt-in PA_NZ layout needs layout-separated physical tensors."""
     if not all(isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in kv_cache_groups):
         return False
@@ -170,7 +184,7 @@ def _is_kimi_k3_pa_nz_groups(kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
             for spec in group_spec.kv_cache_specs.values()
         ):
             return True
-    return False
+    return _kimi_k3_pa_nz_from_config(vllm_config)
 
 
 def _kimi_k3_physical_layout_buckets(
@@ -198,7 +212,10 @@ def _kimi_k3_physical_layout_buckets(
     return bucketed, tuple_counts, mtp_layer_names, mtp_page_size
 
 
-def _kimi_k3_physical_page_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+def _kimi_k3_physical_page_bytes_per_block(
+    kv_cache_groups: list[KVCacheGroupSpec],
+    vllm_config: VllmConfig | None = None,
+) -> int:
     bucketed, tuple_counts, mtp_layer_names, mtp_page_size = _kimi_k3_physical_layout_buckets(kv_cache_groups)
     page_sizes_by_layout: dict[str, set[int]] = defaultdict(set)
     for layout_key, page_size in bucketed:
@@ -208,7 +225,7 @@ def _kimi_k3_physical_page_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpe
         for layout_key, page_sizes in page_sizes_by_layout.items()
         for page_size in page_sizes
     )
-    reserved_pages = _kimi_k3_reserved_pages(kv_cache_groups)
+    reserved_pages = _kimi_k3_reserved_pages(kv_cache_groups, vllm_config)
     total += reserved_pages * sum(
         page_size
         for page_sizes in page_sizes_by_layout.values()
@@ -217,7 +234,10 @@ def _kimi_k3_physical_page_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpe
     return total + len(mtp_layer_names) * mtp_page_size
 
 
-def _kimi_k3_reserved_pages(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+def _kimi_k3_reserved_pages(
+    kv_cache_groups: list[KVCacheGroupSpec],
+    vllm_config: VllmConfig | None = None,
+) -> int:
     reserved = 0
     for group in kv_cache_groups:
         group_spec = group.kv_cache_spec
@@ -235,6 +255,8 @@ def _kimi_k3_reserved_pages(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
                     default=0,
                 ),
             )
+    if reserved == 0 and _kimi_k3_pa_nz_from_config(vllm_config):
+        return 2
     return reserved
 
 
@@ -248,7 +270,7 @@ def _get_kimi_k3_physical_kv_cache_config(
     page_sizes_by_layout: dict[str, set[int]] = defaultdict(set)
     for (layout_key, page_size) in bucketed:
         page_sizes_by_layout[layout_key].add(page_size)
-    physical_page_bytes_per_block = _kimi_k3_physical_page_bytes_per_block(kv_cache_groups)
+    physical_page_bytes_per_block = _kimi_k3_physical_page_bytes_per_block(kv_cache_groups, vllm_config)
     assert physical_page_bytes_per_block > 0
     num_blocks = available_memory // physical_page_bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
@@ -275,7 +297,7 @@ def _get_kimi_k3_physical_kv_cache_config(
                     if tuple_idx < len(candidates):
                         shared_by.append(candidates[tuple_idx])
                 if shared_by:
-                    reserved_pages = _kimi_k3_reserved_pages(kv_cache_groups)
+                    reserved_pages = _kimi_k3_reserved_pages(kv_cache_groups, vllm_config)
                     layer_stride = page_size * (num_blocks + reserved_pages)
                     kv_cache_tensors.append(
                         KVCacheTensor(
@@ -285,7 +307,7 @@ def _get_kimi_k3_physical_kv_cache_config(
                             block_stride=page_size,
                         )
                     )
-    reserved_pages = _kimi_k3_reserved_pages(kv_cache_groups)
+    reserved_pages = _kimi_k3_reserved_pages(kv_cache_groups, vllm_config)
     for layer_name in mtp_layer_names:
         layer_stride = mtp_page_size * (num_blocks + reserved_pages)
         kv_cache_tensors.append(
@@ -781,7 +803,7 @@ def _ascend_get_kv_cache_config_from_groups(
         kv_cache_config = get_deepseek_v41_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
     elif _get_glm5_next_cache_layout(kv_cache_groups) is not None:
         kv_cache_config = get_glm5_next_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
-    elif _is_kimi_k3_pa_nz_groups(kv_cache_groups):
+    elif _is_kimi_k3_pa_nz_groups(kv_cache_groups, vllm_config):
         num_blocks, kv_cache_tensors = _get_kimi_k3_physical_kv_cache_config(
             vllm_config,
             kv_cache_groups,
