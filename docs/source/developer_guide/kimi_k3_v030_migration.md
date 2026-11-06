@@ -1,6 +1,8 @@
 # Kimi K3 changes ported to v0.30.0
 
-This migration uses `cann-framework/vllm-ascend` branch `releases/v0.30.0` at `56848620f` as its base.
+This migration uses `cann-framework/vllm-ascend` branch `releases/v0.30.0` at `0807cef70` as its base.
+The base already includes GitHub PR11 and PR5; this PR keeps only the remaining
+MoE, compilation and model runner V2 changes on top of them.
 The source is the following merged PRs in `wangtao43/vllm-ascend` on GitCode.
 It transfers their behavior through the 0.30 interfaces rather than restoring
 0.27 files or merging the entire 0.27 release branch.
@@ -149,8 +151,10 @@ reduction when the O-projection operator is installed. Both call sites must use
 runtime padding; switching only the model import leaves the fallback exposed
 to unaligned token counts in compiled execution. Their custom-op boundary
 keeps token padding inside the runtime operation when a compiled graph is
-reused for smaller capture sizes. For TP8, a graph traced with 16 tokens must
-also produce nonempty shards for 12, 8, 4, 2 and 1 token. Hidden-state and
+reused for other token counts, including requests outside the capture-size list.
+For TP8, a graph traced with 320 tokens must still pad 318 tokens to 320
+before sharding, rather than truncating them to 312. A graph traced with
+16 tokens must also produce nonempty shards for 12, 8, 4, 2 and 1 token. Hidden-state and
 padding-mask partitioning must agree on every rank. This does not change the
 configured capture-size list or speculative decoding's batch descriptors.
 
