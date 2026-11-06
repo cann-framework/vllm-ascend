@@ -88,6 +88,7 @@ def _ascend_kimi_moe(
     runner._kimi_superkernel_active = enabled
     runner._kimi_topk = None
     runner._kimi_shared_output_done = None
+    runner._kimi_shared_input_ready = None
     try:
         with moe_superkernel_scope(f"{runner.layer_name}_1.moe" if enabled else None, enabled):
             return runner._forward_standard(
@@ -103,6 +104,7 @@ def _ascend_kimi_moe(
         runner._kimi_superkernel_active = False
         runner._kimi_topk = None
         runner._kimi_shared_output_done = None
+        runner._kimi_shared_input_ready = None
 
 
 direct_register_custom_op(
@@ -474,6 +476,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         router_logits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Start the SP shared-input gather before the latent down projection."""
+        self._kimi_shared_input_ready = None
         prepared_input = PreparedSharedExpertInput(hidden_states)
         shared_experts = self.ascend_shared_experts
         if self._can_overlap_sp_shared_with(self.routed_input_transform):
@@ -521,7 +524,12 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         else:
             shared_input = hidden_states
         if prepared_input.ready_event is not None:
-            torch.npu.current_stream().wait_event(prepared_input.ready_event)
+            if kimi_gate is not None and self._kimi_decode_active:
+                # Decode Dispatch does not consume the gathered activations.
+                # Hand readiness to the shared stream instead of blocking MC2.
+                self._kimi_shared_input_ready = prepared_input.ready_event
+            else:
+                torch.npu.current_stream().wait_event(prepared_input.ready_event)
             shared_input = prepared_input.hidden_states
         return routed_input, shared_input
 
@@ -751,7 +759,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             shared_input_is_gathered = self._can_overlap_sp_shared_with(self.routed_input_transform)
             defer_shared_output_wait = self._can_overlap_sp_shared_with(self.routed_output_transform)
             prepared_shared_input = (
-                PreparedSharedExpertInput(shared_hidden_states, is_gathered=True)
+                PreparedSharedExpertInput(
+                    shared_hidden_states,
+                    is_gathered=True,
+                    ready_event=getattr(self, "_kimi_shared_input_ready", None),
+                )
                 if shared_input_is_gathered
                 else self.ascend_shared_experts.prepare_input_before_routed(shared_hidden_states)
             )
