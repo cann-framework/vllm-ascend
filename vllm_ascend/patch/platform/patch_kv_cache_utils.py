@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
@@ -137,7 +138,57 @@ def _ascend_resolve_kv_cache_block_sizes(
         hash_block_size = math.gcd(*group_block_sizes)
         return scheduler_block_size, hash_block_size
 
+    # Kimi K3 Window-GQA DSpark has a small sliding-window draft block next
+    # to the target/Mamba block.  The upstream resolver deliberately falls
+    # back to scheduler_block_size when a Mamba block differs from the global
+    # cache block size.  That fallback is invalid here: after engine-core
+    # normalizes cache_config.block_size to the smallest group (the SWA
+    # kernel block), the SlidingWindowManager still owns that small block and
+    # every real group must be divisible by the hash granularity.
+    if _is_kimi_k3_dspark_window_kv_cache_config(groups):
+        group_block_sizes = [group.kv_cache_spec.block_size for group in groups]
+        scheduler_block_size = math.lcm(*group_block_sizes)
+        if not cache_config.enable_prefix_caching and vllm_config.kv_transfer_config is None:
+            return scheduler_block_size, scheduler_block_size
+        requested = cache_config.prefix_match_unit
+        hash_block_size = requested if requested is not None else math.gcd(*group_block_sizes)
+        if hash_block_size <= 0 or any(block_size % hash_block_size != 0 for block_size in group_block_sizes):
+            raise ValueError(
+                f"Invalid prefix_match_unit={hash_block_size}; all Kimi K3 DSpark "
+                f"KV cache group block sizes must be divisible by it. "
+                f"Got group block sizes={group_block_sizes}."
+            )
+        logger.info(
+            "Kimi K3 Window-GQA DSpark KV blocks: group sizes=%s, scheduler=%d, hash=%d",
+            sorted(set(group_block_sizes)),
+            scheduler_block_size,
+            hash_block_size,
+        )
+        return scheduler_block_size, hash_block_size
+
     return _orig_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+
+
+def _is_kimi_k3_dspark_window_kv_cache_config(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> bool:
+    """Recognize Kimi K3 + Window-GQA DSpark with aligned Mamba states."""
+    has_target = False
+    has_window_draft = False
+    has_mamba = False
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = next(iter(spec.kv_cache_specs.values()))
+        if isinstance(spec, MambaSpec) and spec.mamba_cache_mode != "align":
+            return False
+        layer_names = group.layer_names
+        if any(name.startswith(_KIMI_K3_TARGET_LAYER_PREFIX) for name in layer_names):
+            has_target |= isinstance(spec, FullAttentionSpec)
+            has_mamba |= isinstance(spec, MambaSpec)
+        if any(name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) for name in layer_names):
+            has_window_draft |= isinstance(spec, SlidingWindowSpec)
+    return has_target and has_window_draft and has_mamba
 
 
 def _get_kimi_k3_dspark_mixed_kv_cache_groups(
