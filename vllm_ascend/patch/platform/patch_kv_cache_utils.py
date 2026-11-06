@@ -204,7 +204,28 @@ def _kimi_k3_physical_page_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpe
         for layout_key, page_sizes in page_sizes_by_layout.items()
         for page_size in page_sizes
     )
+    reserved_pages = _kimi_k3_reserved_pages(kv_cache_groups)
+    total += reserved_pages * sum(
+        page_size
+        for page_sizes in page_sizes_by_layout.values()
+        for page_size in page_sizes
+    )
     return total + len(mtp_layer_names) * mtp_page_size
+
+
+def _kimi_k3_reserved_pages(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+    reserved = 0
+    for group in kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        if isinstance(group_spec, UniformTypeKVCacheSpecs):
+            reserved = max(
+                reserved,
+                max(
+                    (getattr(spec, "flash_mla_reserved_pages", 0) for spec in group_spec.kv_cache_specs.values()),
+                    default=0,
+                ),
+            )
+    return reserved
 
 
 def _get_kimi_k3_physical_kv_cache_config(
@@ -244,12 +265,26 @@ def _get_kimi_k3_physical_kv_cache_config(
                     if tuple_idx < len(candidates):
                         shared_by.append(candidates[tuple_idx])
                 if shared_by:
+                    reserved_pages = _kimi_k3_reserved_pages(kv_cache_groups)
+                    layer_stride = page_size * (num_blocks + reserved_pages)
                     kv_cache_tensors.append(
-                        KVCacheTensor(size=page_size * num_blocks, layers=shared_by)
+                        KVCacheTensor(
+                            size=layer_stride * len(shared_by),
+                            layers=shared_by,
+                            layer_stride=layer_stride,
+                            block_stride=page_size,
+                        )
                     )
+    reserved_pages = _kimi_k3_reserved_pages(kv_cache_groups)
     for layer_name in mtp_layer_names:
+        layer_stride = mtp_page_size * (num_blocks + reserved_pages)
         kv_cache_tensors.append(
-            KVCacheTensor(size=mtp_page_size * num_blocks, layers=[layer_name])
+            KVCacheTensor(
+                size=layer_stride,
+                layers=[layer_name],
+                layer_stride=layer_stride,
+                block_stride=mtp_page_size,
+            )
         )
     logger.info(
         "Using Kimi K3 layout-separated KV cache tensors: layouts=%s, tensors=%d",

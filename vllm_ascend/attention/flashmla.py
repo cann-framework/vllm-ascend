@@ -318,7 +318,7 @@ class PaNzFlashMLAImpl:
         seqused_q: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
         q_len: int | None = None,
-    ) -> tuple[torch.Tensor, None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         self.validate_cache(k_cache)
         if q.ndim != 3 or q.shape[1:] != (self.config.num_heads, FLASHMLA_QK_DIM):
             raise ValueError("PA_NZ FlashMLA q must be TND with configured local heads and width 576")
@@ -326,7 +326,7 @@ class PaNzFlashMLAImpl:
             raise ValueError("PA_NZ FlashMLA requires BF16 q")
         if q_len is None:
             q_len = max(1, int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())) if cu_seqlens_q.numel() > 1 else 1
-        output = self.ops.flash_mla_with_kvcache(
+        output, lse = self.ops.flash_mla_with_kvcache(
             q,
             k_cache,
             block_table,
@@ -338,8 +338,19 @@ class PaNzFlashMLAImpl:
             attn_mask=attn_mask if q_len > 1 else None,
             metadata=metadata,
             seqused_q=seqused_q,
+            return_softmax_lse=self.config.return_softmax_lse,
         )
-        return output, None
+        if self.config.return_softmax_lse:
+            if lse is None:
+                raise RuntimeError("PA_NZ FlashMLA requested LSE but the operator returned None.")
+            if lse.ndim == 2 and lse.shape == (q.shape[0], q.shape[1]):
+                lse = lse.transpose(0, 1).contiguous()
+            if lse.shape != (q.shape[1], q.shape[0]) or lse.dtype != torch.float32:
+                raise ValueError(
+                    "PA_NZ FlashMLA softmax_lse must have shape "
+                    f"({q.shape[1]}, {q.shape[0]}) and dtype float32; got {lse.shape}, {lse.dtype}"
+                )
+        return output, lse
 
     def validate_cache(self, kv_cache: torch.Tensor) -> None:
         if kv_cache.ndim != 4 or kv_cache.shape[2] != 1 or kv_cache.shape[-1] != FLASHMLA_QK_DIM:
@@ -399,6 +410,7 @@ class FlashMLADecode:
     metadata_started: bool = False
     metadata_generated: bool = False
     metadata_async: bool = False
+    reserved_pages: int = 0
 
 
 class FlashMLAMetadataBuilder:
@@ -409,8 +421,10 @@ class FlashMLAMetadataBuilder:
         max_num_reqs: int,
         attn_mask: torch.Tensor,
         enable_async: bool = False,
+        reserved_pages: int = 0,
     ):
         self.enable_async = bool(enable_async)
+        self.reserved_pages = int(reserved_pages)
         self.metadata_stream = torch.npu.Stream() if self.enable_async else None
         self.metadata_start = torch.npu.Event() if self.enable_async else None
         self.metadata_ready = torch.npu.Event() if self.enable_async else None
@@ -427,8 +441,6 @@ class FlashMLAMetadataBuilder:
         self.use_spec_decode = impl.vllm_config.speculative_config is not None
         self.cp_interleave = impl.vllm_config.parallel_config.cp_kv_cache_interleave_size if self.dcp_size > 1 else 1
         layout = "PA_NZ" if getattr(impl, "flash_mla_layout", "pa_bbnd") == "pa_nz" else "PA_BBND"
-        if layout == "PA_NZ" and self.dcp_size > 1:
-            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA does not support DCP yet.")
         adapter = create_flash_mla_adapter(
             FlashMLAConfig(
                 impl.num_heads,
@@ -438,13 +450,14 @@ class FlashMLAMetadataBuilder:
             )
         )
         self.current_adapter = adapter
-        if layout == "PA_NZ":
-            history_adapter = adapter
-        else:
-            history_adapter = replace(
+        history_adapter = (
+            replace(
                 adapter,
                 config=replace(adapter.config, num_heads=impl.num_heads * self.dcp_size, mask_mode=0),
             )
+            if self.dcp_size > 1
+            else adapter
+        )
         self.adapters = {True: history_adapter if self.dcp_size > 1 else adapter, False: history_adapter}
         self.device = device
         self.dtype = impl.dtype
@@ -519,6 +532,7 @@ class FlashMLAMetadataBuilder:
             tail_offsets=tail_offsets,
             prolog_slots=torch.full((tokens,), -1, dtype=torch.int64, device=self.device),
             block_columns=torch.arange(columns, dtype=torch.int64, device=self.device),
+            reserved_pages=self.reserved_pages,
         )
         if self.dcp_size > 1 and causal and self.use_spec_decode:
             # As in split DCP attention, each rank retains every current row.

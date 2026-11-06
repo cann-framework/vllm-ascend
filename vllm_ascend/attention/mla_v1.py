@@ -268,6 +268,12 @@ class AscendMLAMetadata:
     pcp_cos: torch.Tensor | None = None
     pcp_sin: torch.Tensor | None = None
     external_flashmla: FlashMLADecode | None = None
+    external_flashmla_by_layout: dict[str, FlashMLADecode] | None = None
+
+    def get_external_flashmla(self, layout: str | None = None) -> FlashMLADecode | None:
+        if self.external_flashmla_by_layout is not None:
+            return self.external_flashmla_by_layout.get(layout or "")
+        return self.external_flashmla
 
     def __post_init__(self):
         pass
@@ -361,41 +367,42 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         self.seq_lens: torch.Tensor = None
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
         self.flashmla_state = None
-        flashmla_choices = {static_forward_context[name].impl.use_flashmla for name in layer_names}
-        if len(flashmla_choices) > 1:
-            raise ValueError("MLA layers in one attention group must use the same decode backend")
+        self.flashmla_states: dict[str, FlashMLAMetadataBuilder] = {}
         flashmla_layouts = {
             getattr(static_forward_context[name].impl, "flash_mla_layout", "pa_bbnd") for name in layer_names
         }
-        if len(flashmla_layouts) > 1:
-            raise ValueError("MLA layers in one attention group must use the same FlashMLA layout")
         if layer_names:
-            layout = next(iter(flashmla_layouts), "pa_bbnd")
             logger.info(
-                "MLA decode backend for group starting at %s: %s (%s)",
+                "MLA decode backends for group starting at %s: layouts=%s",
                 layer_names[0],
-                "FlashMLA" if True in flashmla_choices else "FIA",
-                layout,
+                sorted(flashmla_layouts),
             )
-        if True in flashmla_choices:
-            impl = static_forward_context[layer_names[0]].impl
-            self.flashmla_state = FlashMLAMetadataBuilder(
-                impl,
-                device,
-                scheduler_config.max_num_seqs,
-                self.attn_mask_builder.get_splitfuse_attn_mask(),
-                enable_async=(
-                    get_ascend_config().enable_multi_streams
-                    and next(iter(flashmla_layouts), "pa_bbnd") == "pa_nz"
-                ),
-            )
-            for name in layer_names:
-                static_forward_context[name].impl.flash_mla_state = self.flashmla_state
+        for name in layer_names:
+            impl = static_forward_context[name].impl
+            if not getattr(impl, "use_flashmla", False):
+                continue
+            layout = getattr(impl, "flash_mla_layout", "pa_bbnd")
+            state = self.flashmla_states.get(layout)
+            if state is None:
+                state = FlashMLAMetadataBuilder(
+                    impl,
+                    device,
+                    scheduler_config.max_num_seqs,
+                    self.attn_mask_builder.get_splitfuse_attn_mask(),
+                    enable_async=(
+                        get_ascend_config().enable_multi_streams
+                        and layout == "pa_nz"
+                    ),
+                    reserved_pages=getattr(kv_cache_spec, "flash_mla_reserved_pages", 0),
+                )
+                self.flashmla_states[layout] = state
+                if self.flashmla_state is None:
+                    self.flashmla_state = state
+            impl.flash_mla_state = state
 
     def _build_external_flashmla(self, common_prefix_len, common, *, retain_for_graph: bool = False):
         """Keep FIA prefill metadata, but build decode inputs from device state."""
-        state = self.flashmla_state
-        assert state is not None
+        assert self.flashmla_states
         self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = split_flashmla_requests(
             common
         )
@@ -415,31 +422,34 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             self.seq_lens = self.seq_lens[: common.num_reqs]
             prefill = self.build_prefill_metadata(common_prefix_len, common)
 
-        flash = None
+        flash_by_layout: dict[str, FlashMLADecode] = {}
         decode = None
         decode_tokens = self.num_decode_tokens
         if self.num_decodes:
-            flash = state.build(
-                common,
-                self.num_decodes,
-                decode_tokens,
-                self.num_prefills > 0,
-                retain_for_graph=retain_for_graph,
-            )
-            decode_tokens = flash.query.shape[0]
-            decode = self.decode_metadata_cls(
-                input_positions=flash.positions,
-                block_table=flash.block_table,
-                seq_lens=flash.cache_lens,
-                max_seq_lens=common.max_seq_len,
-                seq_lens_list=[],
-                actual_seq_lengths_q=None,
-                cos=flash.cos,
-                sin=flash.sin,
-            )
-            # Mixed eager batches retain the original prefill slot slice.
-            if not self.num_prefills:
-                self.slot_mapping = flash.slots
+            for layout, layout_state in self.flashmla_states.items():
+                layout_flash = layout_state.build(
+                    common,
+                    self.num_decodes,
+                    decode_tokens,
+                    self.num_prefills > 0,
+                    retain_for_graph=retain_for_graph,
+                )
+                flash_by_layout[layout] = layout_flash
+                if decode is None:
+                    decode_tokens = layout_flash.query.shape[0]
+                    decode = self.decode_metadata_cls(
+                        input_positions=layout_flash.positions,
+                        block_table=layout_flash.block_table,
+                        seq_lens=layout_flash.cache_lens,
+                        max_seq_lens=common.max_seq_len,
+                        seq_lens_list=[],
+                        actual_seq_lengths_q=None,
+                        cos=layout_flash.cos,
+                        sin=layout_flash.sin,
+                    )
+                    if not self.num_prefills:
+                        self.slot_mapping = layout_flash.slots
+        flash = flash_by_layout.get("pa_nz") or next(iter(flash_by_layout.values()), None)
         return self.metadata_cls(
             num_actual_tokens=self.num_actual_tokens,
             num_input_tokens=common.num_input_tokens,
@@ -456,6 +466,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             attn_state=common.attn_state,
             causal=common.causal,
             external_flashmla=flash,
+            external_flashmla_by_layout=flash_by_layout,
         )
 
     @staticmethod
@@ -1073,7 +1084,21 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.mlapo_num_heads = self.num_heads
         self.mlapo_weight_quant_mode = 3
         self._mlapo_uses_native_weights = False
-        self.flash_mla_layout = "pa_nz" if envs_ascend.VLLM_ASCEND_ENABLE_FLASH_MLA else "pa_bbnd"
+        self.flash_mla_pa_nz_requested = bool(envs_ascend.VLLM_ASCEND_ENABLE_FLASH_MLA)
+        self.flash_mla_feature_mode = self.pcp_enabled
+        self.flash_mla_layout = (
+            "pa_nz"
+            if self.flash_mla_pa_nz_requested
+            and not self.is_draft_model
+            and not self.flash_mla_feature_mode
+            else "pa_bbnd"
+        )
+        if self.flash_mla_pa_nz_requested and self.flash_mla_layout == "pa_bbnd":
+            logger.info(
+                "PA_NZ disabled for layer %s because it is a draft layer or PCP is enabled; "
+                "using the native PA_BBND path.",
+                self.layer_name,
+            )
         if self.flash_mla_layout == "pa_nz":
             self._validate_flash_mla_pa_nz_layer()
         self.use_flashmla: bool = self._can_use_flashmla()
@@ -1112,12 +1137,13 @@ class AscendMLAImpl(MLAAttentionImpl):
             raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 requires one KV head.")
         if self.dtype != torch.bfloat16:
             raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 supports BF16 only.")
-        if self.pcp_enabled or self.dcp_enabled:
-            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 does not support PCP/DCP yet.")
-        if getattr(config, "speculative_config", None) is not None:
-            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 does not support speculative decoding yet.")
-        if getattr(config, "kv_transfer_config", None) is not None:
-            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 does not support PD/KV transfer yet.")
+        if self.pcp_enabled:
+            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 does not support PCP yet.")
+        speculative_config = getattr(config, "speculative_config", None)
+        if speculative_config is not None and speculative_config.method != "dspark":
+            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 supports only DSpark speculative decoding.")
+        if self.is_draft_model:
+            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 is not supported for draft models.")
         if enable_sfa(config):
             raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 does not support SFA.")
         for projection in (self.fused_qkv_a_proj, self.q_proj):
@@ -2210,7 +2236,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         num_tokens = attn_metadata.num_decode_tokens
         if not (
             self._supports_flashmla_mlapo()
-            and attn_metadata.external_flashmla is not None
+            and attn_metadata.get_external_flashmla(self.flash_mla_layout) is not None
             and attn_metadata.num_prefills == 0
             and 0 < num_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
         ):
@@ -2755,7 +2781,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             self.layerwise_kv_cache_hook.wait_for_layer(self.layer_name)
 
         if num_decode_tokens > 0:
-            flash = attn_metadata.external_flashmla
+            flash = attn_metadata.get_external_flashmla(self.flash_mla_layout)
             history_slots = flash.slots if flash is not None else attn_metadata.slot_mapping[:num_decode_tokens]
             current_k_nope = current_k_pe = None
             if decode_requires_current_kv:
@@ -3314,7 +3340,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             mla_prolog_no_rope,
         )
 
-        flash = attn_metadata.external_flashmla
+        flash = attn_metadata.get_external_flashmla(self.flash_mla_layout)
         assert flash is not None
         assert self.q_a_layernorm is not None
         assert self.kv_a_layernorm is not None
@@ -3326,6 +3352,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         num_decodes = attn_metadata.num_decodes
         merged_cache = kv_cache if isinstance(kv_cache, torch.Tensor) else kv_cache[0]
         block_size = merged_cache.shape[1]
+        reserved_pages = flash.reserved_pages
+        hidden_page = merged_cache.shape[0] - reserved_pages if reserved_pages else None
+        scratch_page = merged_cache.shape[0] - 1 if reserved_pages else None
         if flash.block_columns is not None:
             valid_cols = (flash.cache_lens + block_size - 1) // block_size
             last_columns = (valid_cols - 1).clamp_min(0).to(torch.long)
@@ -3335,9 +3364,12 @@ class AscendMLAImpl(MLAAttentionImpl):
                 last_columns[:, None],
             ).squeeze(1)
             stale = flash.block_columns[None, :] >= valid_cols[:, None]
-            flash.block_table.copy_(
-                torch.where(stale, last_blocks[:, None], flash.block_table)
-            )
+            if hidden_page is not None:
+                flash.block_table.masked_fill_(stale, hidden_page)
+            else:
+                flash.block_table.copy_(
+                    torch.where(stale, last_blocks[:, None], flash.block_table)
+                )
         if num_decodes > 0 and flash.tail_last_block_ids is not None and flash.tail_invalid is not None:
             clear_partial_block_tail(
                 merged_cache,
@@ -3349,15 +3381,15 @@ class AscendMLAImpl(MLAAttentionImpl):
                     flash.tail_invalid[:num_decodes],
                 ),
             )
-        if num_decode_tokens > attn_metadata.num_actual_tokens:
-            raise RuntimeError(
-                "PA_NZ decode with graph/batch padding requires a reserved scratch page; "
-                "padded prolog writes are not allowed until that allocator support lands."
-            )
+        if num_decode_tokens > attn_metadata.num_actual_tokens and reserved_pages == 0:
+            raise RuntimeError("PA_NZ decode with graph/batch padding requires a reserved scratch page.")
         if flash.metadata_async and flash.metadata_builder is not None and not flash.metadata_started:
             flash.metadata_builder.start_metadata(flash)
         if flash.prolog_slots is not None:
-            cache_indices = flash.prolog_slots[:num_decode_tokens].to(torch.int64).clamp_min(0)
+            if scratch_page is not None:
+                scratch_slot = scratch_page * block_size
+                flash.prolog_slots.masked_fill_(~flash.token_live, scratch_slot)
+            cache_indices = flash.prolog_slots[:num_decode_tokens].to(torch.int64)
         else:
             cache_indices = flash.slots[:num_decode_tokens].to(torch.int64).clamp_min(0)
         q, *_ = mla_prolog_no_rope(
@@ -3377,6 +3409,33 @@ class AscendMLAImpl(MLAAttentionImpl):
         q = q[:, head_start : head_start + self.num_heads, :]
         if flash.metadata_builder is not None:
             flash.metadata_builder.wait_metadata(flash)
+        if self.dcp_enabled:
+            split_attention = getattr(self, "_forward_decode_split_attention", None)
+            if split_attention is None:
+                raise RuntimeError("PA_NZ DCP requires the DCP MLA implementation.")
+            q_nope = q[..., : self.kv_lora_rank]
+            q_pe = q[..., self.kv_lora_rank :]
+            history_q_nope, history_q_pe = self.reorg_decode_q(q_nope, q_pe)
+            current_k_nope = current_k_pe = None
+            if flash.current is not None:
+                flat_cache = merged_cache.reshape(-1, merged_cache.shape[-1])
+                current_rows = flat_cache.index_select(0, cache_indices)
+                current_k_nope = current_rows[..., : self.kv_lora_rank].view(
+                    num_decode_tokens, self.num_kv_heads, self.kv_lora_rank
+                )
+                current_k_pe = current_rows[..., self.kv_lora_rank :].view(
+                    num_decode_tokens, self.num_kv_heads, self.qk_rope_head_dim
+                )
+            return split_attention(
+                history_q_nope,
+                history_q_pe,
+                merged_cache,
+                None,
+                current_k_nope,
+                current_k_pe,
+                block_size,
+                attn_metadata,
+            )
         record_attention_compute_start()
         attn_output, _ = flash.adapter.attention(
             q,
@@ -3401,7 +3460,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         return attn_output.reshape(num_decode_tokens, self.num_heads * self.v_head_dim)
 
     def _forward_external_flashmla(self, preprocessed, fused_cache, metadata):
-        flash = metadata.external_flashmla
+        flash = metadata.get_external_flashmla(self.flash_mla_layout)
         assert flash is not None
         if not isinstance(fused_cache, torch.Tensor):
             raise RuntimeError(
@@ -3430,9 +3489,10 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         bsz = attn_metadata.num_decode_tokens
         history_slots = attn_metadata.slot_mapping[:bsz]
-        flash_mlapo = attn_metadata.external_flashmla is not None
+        layout_flash = attn_metadata.get_external_flashmla(self.flash_mla_layout)
+        flash_mlapo = layout_flash is not None
         if flash_mlapo:
-            history_slots = attn_metadata.external_flashmla.slots[:bsz]
+            history_slots = layout_flash.slots[:bsz]
         return_current_kv = self._decode_requires_current_kv(attn_metadata)
         scatter_history = return_current_kv or flash_mlapo
         if return_current_kv or (flash_mlapo and self.dcp_enabled):
@@ -3659,8 +3719,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
             decode_q_pe = (decode_q_pe / dequant_scale_q_nope.unsqueeze(-1) / self.fak_descale_float).to(torch.bfloat16)
         decode_slots = attn_metadata.slot_mapping[:num_decode_tokens:1]
-        if attn_metadata.external_flashmla is not None:
-            decode_slots = attn_metadata.external_flashmla.slots
+        layout_flash = attn_metadata.get_external_flashmla(self.flash_mla_layout)
+        if layout_flash is not None:
+            decode_slots = layout_flash.slots
         decode_kv_no_split = kv_no_split[:num_decode_tokens]
         return_current_kv = self._decode_requires_current_kv(attn_metadata)
         if written_kv is None:
@@ -3912,7 +3973,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
         if decode_preprocess_res is not None:
             # MLA Preprocess for decoding
-            if attn_metadata.external_flashmla is not None:
+            if attn_metadata.get_external_flashmla(self.flash_mla_layout) is not None:
                 output_decode = self._forward_external_flashmla(
                     decode_preprocess_res, external_flash_cache, attn_metadata
                 )

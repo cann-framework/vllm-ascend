@@ -1004,7 +1004,11 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
             if state is None:
                 continue
             layer_metadata = attn_metadata.get(getattr(impl, "layer_name", None))
-            flash = getattr(layer_metadata, "external_flashmla", None) if layer_metadata is not None else None
+            flash = (
+                layer_metadata.get_external_flashmla(getattr(impl, "flash_mla_layout", None))
+                if layer_metadata is not None
+                else None
+            )
             if (
                 flash is None
                 or not getattr(flash, "metadata_async", False)

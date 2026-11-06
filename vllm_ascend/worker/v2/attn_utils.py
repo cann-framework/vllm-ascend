@@ -293,6 +293,12 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 model_version=model_version,
                 indexes_kv_by_block_stride=indexes_kv_by_block_stride,
                 flash_mla_layout=getattr(getattr(attn_module, "impl", None), "flash_mla_layout", "pa_bbnd"),
+                flash_mla_reserved_pages=(
+                    2
+                    if getattr(getattr(attn_module, "impl", None), "flash_mla_layout", "pa_bbnd")
+                    == "pa_nz"
+                    else 0
+                ),
                 **ratio_kwargs,
             )
         if isinstance(attn_module, DeepseekV32IndexerCache):
@@ -968,9 +974,7 @@ def _uses_single_raw_mla_cache(
         # preprocessing contract. Keep their allocation compatible with it.
         return False
     if getattr(impl, "flash_mla_layout", None) == "pa_nz":
-        # The 0.27 PA_NZ operator requires dense pages and does not support
-        # the PD/component-major transfer contract yet.
-        if vllm_config.kv_transfer_config is not None:
+        if vllm_config.kv_transfer_config is not None and not supports_component_major_mla_pd(vllm_config):
             return False
         if not kv_cache_spec.requires_contiguous_page:
             return False
@@ -1268,9 +1272,13 @@ def _allocate_kv_cache(
             continue
 
         if hybrid_backing is not None:
+            reserved_pages = max(
+                (getattr(spec, "flash_mla_reserved_pages", 0) for spec in layer_kv_cache_spec.values()),
+                default=0,
+            )
             for layer_idx, layer_name in enumerate(shared_names):
                 layer_spec = layer_kv_cache_spec[layer_name]
-                layer_size = kv_cache_config.num_blocks * layer_spec.page_size_bytes
+                layer_size = (kv_cache_config.num_blocks + reserved_pages) * layer_spec.page_size_bytes
                 if (
                     kv_cache_tensor.layer_stride != layer_size
                     or kv_cache_tensor.block_stride != layer_spec.page_size_bytes
@@ -1797,14 +1805,24 @@ def _reshape_kv_cache_v2(
                 attn_impl = vllm_config.compilation_config.static_forward_context[layer_name].impl
                 if getattr(attn_impl, "flash_mla_layout", None) == "pa_nz":
                     # The 0.27 BF16 FlashMLA operator owns a dense merged
-                    # PA_NZ page; padded block strides are rejected.
+                    # PA_NZ page; padded block strides are rejected. Reserve
+                    # hidden/scratch pages at the end of the physical backing.
+                    reserved_pages = getattr(kv_cache_spec, "flash_mla_reserved_pages", 0)
+                    pa_nz_component_shape = (
+                        (kv_cache_config.num_blocks + reserved_pages) * kernel_blocks_per_manager,
+                        kernel_block_size,
+                        kv_cache_spec.num_kv_heads,
+                    )
                     slot_bytes_unpadded = kv_cache_spec.unpadded_page_size_bytes // kernel_blocks_per_manager
-                    kv_caches[layer_name] = make_pa_nz_cache_view(
+                    pa_nz_cache = make_pa_nz_cache_view(
                         single_raw_mla_cache,
-                        (*component_shape, fused_dim),
+                        (*pa_nz_component_shape, fused_dim),
                         kv_cache_spec.dtype,
                         slot_bytes_unpadded,
                     )
+                    if reserved_pages:
+                        pa_nz_cache[-reserved_pages:].zero_()
+                    kv_caches[layer_name] = pa_nz_cache
                     continue
                 if attn_impl.use_flashmla:
                     # FlashMLA consumes one token-fused tensor with

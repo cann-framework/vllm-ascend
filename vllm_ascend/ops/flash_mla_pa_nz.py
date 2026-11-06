@@ -279,7 +279,8 @@ def flash_mla_with_kvcache(
     attn_mask: torch.Tensor | None = None,
     metadata: torch.Tensor | None = None,
     seqused_q: torch.Tensor | None = None,
-) -> torch.Tensor:
+    return_softmax_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """Run BF16 FlashMLA against the merged PA_NZ latent cache."""
     mask_mode = _MASK_MODE_NONE if q_len == 1 else _MASK_MODE_CAUSAL
     if metadata is None:
@@ -294,7 +295,7 @@ def flash_mla_with_kvcache(
             seqused_q=seqused_q,
         )
     attention_op, _ = _get_pa_nz_flash_mla_ops()
-    output, _ = attention_op(
+    output, lse = attention_op(
         q.contiguous(),
         pa_nz_cache_view(kv_cache),
         block_table=block_table,
@@ -311,6 +312,8 @@ def flash_mla_with_kvcache(
         layout_q="TND",
         layout_kv="PA_NZ",
         layout_out="TND",
-        return_softmax_lse=False,
+        return_softmax_lse=return_softmax_lse,
     )
-    return output
+    if return_softmax_lse:
+        return output, lse
+    return output, None

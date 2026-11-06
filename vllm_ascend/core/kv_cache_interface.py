@@ -146,6 +146,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     # "pa_nz": the 0.27-style merged PA_NZ cache selected by
     # VLLM_ASCEND_ENABLE_FLASH_MLA. PA_NZ requires a contiguous page.
     flash_mla_layout: str = "pa_bbnd"
+    flash_mla_reserved_pages: int = 0
 
     @property
     def uses_packed_sfa_main_cache(self) -> bool:
@@ -197,7 +198,6 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
                 spec.alignment,
                 get_kv_cache_compression_ratio(spec),
                 spec.indexes_kv_by_block_stride,
-                spec.flash_mla_layout,
             )
             for spec in specs
         }
@@ -221,6 +221,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             store_on_host=first_spec.store_on_host,
             indexes_kv_by_block_stride=first_spec.indexes_kv_by_block_stride,
             flash_mla_layout=first_spec.flash_mla_layout,
+            flash_mla_reserved_pages=max(spec.flash_mla_reserved_pages for spec in specs),
         )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
