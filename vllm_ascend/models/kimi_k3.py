@@ -88,9 +88,11 @@ from vllm.utils.math_utils import cdiv
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.utils import mark_fused_preprocess_weights
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.ops.fused_moe.shared_experts import AscendSharedSparseSituAndMul
 from vllm_ascend.ops.kimi_kda import (
     AscendKimiK3DeltaAttention as AscendKimiK3DeltaAttentionBase,
 )
+from vllm_ascend.ops.kimi_situ import initialize_kimi_situ_ops
 from vllm_ascend.ops.linear_op import KimiOProjMMReduceScatterOp
 from vllm_ascend.quantization.methods.base import PreparedLinearInput
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
@@ -361,6 +363,11 @@ class AscendKimiMoE(nn.Module):
         activation_situ_beta = config.activation_situ_beta if config.hidden_act == "situ" else None
         activation_situ_linear_beta = config.activation_situ_linear_beta if config.hidden_act == "situ" else None
 
+        if config.hidden_act == "situ" and get_current_hardware_profile().supports(
+            HardwareCapability.CANN_MEGAMOE_MXFP
+        ):
+            initialize_kimi_situ_ops()
+
         self.gate = GateLinear(
             input_size=hidden_size,
             output_size=num_experts,
@@ -381,6 +388,15 @@ class AscendKimiMoE(nn.Module):
                 activation_situ_beta=activation_situ_beta,
                 activation_situ_linear_beta=activation_situ_linear_beta,
             )
+            if (
+                config.hidden_act == "situ"
+                and activation_situ_linear_beta is not None
+                and get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP)
+            ):
+                self.shared_experts.act_fn = AscendSharedSparseSituAndMul(
+                    self.shared_experts.act_fn.beta,
+                    self.shared_experts.act_fn.linear_beta,
+                )
         else:
             self.shared_experts = None
 
@@ -441,6 +457,21 @@ class AscendKimiMoE(nn.Module):
             num_redundant_experts=num_redundant_experts,
         )
 
+        # Keep routing and stream decisions inside the runtime MoE op. The
+        # gate remains registered only here for checkpoint compatibility.
+        object.__setattr__(self.experts, "_kimi_gate", self.gate)
+        object.__setattr__(
+            self.experts,
+            "_kimi_router_stream",
+            torch.npu.Stream() if get_ascend_config().multistream_overlap_shared_expert else None,
+        )
+        if self.shared_experts is not None and get_ascend_config().multistream_overlap_shared_expert:
+            # Share a communication stream across this model's MoE layers;
+            # keep it separate from both Router and shared Cube/Vector work.
+            if not hasattr(vllm_config, "_kimi_shared_comm_stream"):
+                vllm_config._kimi_shared_comm_stream = torch.npu.Stream()
+            object.__setattr__(self.experts, "_kimi_shared_comm_stream", vllm_config._kimi_shared_comm_stream)
+
         # Use the factory's validated counts, including its effective EP size.
         moe_config = self.experts.moe_config
         self.n_routed_experts = num_experts
@@ -452,10 +483,9 @@ class AscendKimiMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
-            router_logits=router_logits,
+            router_logits=hidden_states,
         )
         return final_hidden_states.view(num_tokens, hidden_size)
 
