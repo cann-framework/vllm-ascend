@@ -3386,6 +3386,17 @@ class AscendMLAImpl(MLAAttentionImpl):
             decode_q_pe = decode_q_pe[:, : self.num_heads]
         return decode_q_nope, decode_q_pe
 
+    @staticmethod
+    def _extend_pa_nz_cache(cache: torch.Tensor, reserved_pages: int) -> torch.Tensor:
+        if reserved_pages <= 0:
+            return cache
+        return torch.as_strided(
+            cache,
+            size=(cache.shape[0] + reserved_pages, *cache.shape[1:]),
+            stride=cache.stride(),
+            storage_offset=cache.storage_offset(),
+        )
+
     def _forward_decode_flash_bf16(
         self,
         hidden_states: torch.Tensor,
@@ -3409,8 +3420,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_decodes = attn_metadata.num_decodes
         merged_cache = kv_cache if isinstance(kv_cache, torch.Tensor) else kv_cache[0]
-        block_size = merged_cache.shape[1]
         reserved_pages = flash.reserved_pages
+        if reserved_pages:
+            merged_cache = self._extend_pa_nz_cache(merged_cache, reserved_pages)
+        block_size = merged_cache.shape[1]
         hidden_page = merged_cache.shape[0] - reserved_pages if reserved_pages else None
         scratch_page = merged_cache.shape[0] - 1 if reserved_pages else None
         if not self._logged_pa_nz_decode:

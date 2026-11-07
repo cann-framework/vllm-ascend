@@ -1853,20 +1853,16 @@ def _reshape_kv_cache_v2(
                     # PA_NZ page; padded block strides are rejected. Reserve
                     # hidden/scratch pages at the end of the physical backing.
                     reserved_pages = getattr(kv_cache_spec, "flash_mla_reserved_pages", 0)
-                    pa_nz_component_shape = (
-                        (kv_cache_config.num_blocks + reserved_pages) * kernel_blocks_per_manager,
-                        kernel_block_size,
-                        kv_cache_spec.num_kv_heads,
-                    )
                     slot_bytes_unpadded = kv_cache_spec.unpadded_page_size_bytes // kernel_blocks_per_manager
+                    # Keep the view presented to the runner at the logical
+                    # num_blocks. The reserved pages stay in the backing
+                    # storage and are exposed only to the PA_NZ prolog.
                     pa_nz_cache = make_pa_nz_cache_view(
                         single_raw_mla_cache,
-                        (*pa_nz_component_shape, fused_dim),
+                        (*component_shape, fused_dim),
                         kv_cache_spec.dtype,
                         slot_bytes_unpadded,
                     )
-                    if reserved_pages:
-                        pa_nz_cache[-reserved_pages:].zero_()
                     logger.info(
                         "[PA_NZ][kv] layer=%s blocks=%d reserved=%d block_size=%d fused_dim=%d dtype=%s view=%s",
                         layer_name,
