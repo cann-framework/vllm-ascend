@@ -283,7 +283,7 @@ def _kimi_k3_reserved_pages(
             )
         )
     ):
-        logger.info_once(
+        logger.info(
             "K3 PA_NZ planner: reserved pages fallback -> 2 (config_pa_nz=%s env=%s)",
             _kimi_k3_pa_nz_from_config(vllm_config),
             ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA,

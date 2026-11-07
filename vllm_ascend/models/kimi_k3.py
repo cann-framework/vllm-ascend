@@ -1016,7 +1016,7 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
             ):
                 continue
             state.start_metadata(flash)
-            logger.info_once(
+            logger.info(
                 "[FlashMLA] model hook started metadata: layer=%s decode_tokens=%d async=%s layout=%s",
                 impl.layer_name,
                 layer_metadata.num_decode_tokens,

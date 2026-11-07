@@ -3552,7 +3552,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             raise RuntimeError(
                 "External FlashMLA requires the original fused BBND cache; component-major tuples are invalid"
             )
-        logger.info_once(
+        logger.info(
             "[FlashMLA] external attention: layer=%s q=%s cache=%s schedule=%d",
             self.layer_name,
             tuple(flash.query.shape),

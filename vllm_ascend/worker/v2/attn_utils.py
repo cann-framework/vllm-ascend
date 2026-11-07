@@ -978,7 +978,7 @@ def _uses_single_raw_mla_cache(
             return False
         if not kv_cache_spec.requires_contiguous_page:
             return False
-        logger.info_once(
+        logger.info(
             "[PA_NZ][kv] single raw backing: transfer=%s component_major_pd=%s contiguous=%s",
             vllm_config.kv_transfer_config is not None,
             supports_component_major_mla_pd(vllm_config),
