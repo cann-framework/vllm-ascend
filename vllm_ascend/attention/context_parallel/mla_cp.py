@@ -625,6 +625,7 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
             seqused_q=flash.used_q,
             metadata=schedule,
             attn_mask=attn_mask,
+            q_len=flash.q_len,
         )
         return output.transpose(0, 1), lse.transpose(0, 1).unsqueeze(-1)
 

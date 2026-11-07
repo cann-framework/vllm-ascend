@@ -333,7 +333,11 @@ class PaNzFlashMLAImpl:
         if q.dtype != torch.bfloat16:
             raise ValueError("PA_NZ FlashMLA requires BF16 q")
         if q_len is None:
-            q_len = max(1, int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())) if cu_seqlens_q.numel() > 1 else 1
+            # Never read cu_seqlens_q back to the host here: this method runs
+            # inside ACL graph capture, where a scalar .item() would
+            # synchronize a copy stream and abort capture. Every caller that
+            # can see multi-token queries passes flash.q_len explicitly.
+            q_len = 1
         q_len = max(1, q_len)
         output, lse = self.ops.flash_mla_with_kvcache(
             q,
@@ -719,7 +723,14 @@ class FlashMLAMetadataBuilder:
                 requests = torch.searchsorted(flash.cu[1:], indices.to(torch.int32), right=True)
                 current.slots.copy_(page_starts[requests] * FLASHMLA_BLOCK_SIZE + indices - flash.cu[requests])
                 current.slots.masked_fill_(~flash.token_live, -1)
-                current.schedule.copy_(current.adapter.build_metadata(flash.used_q, flash.cu, flash.used_q))
+                current.schedule.copy_(
+                    current.adapter.build_metadata(
+                        flash.used_q,
+                        flash.cu,
+                        flash.used_q,
+                        q_len=flash.q_len,
+                    )
+                )
 
         # Refresh on the caller's stream before return; captured buffer caching
         # preserves the addresses used by graph replay.
