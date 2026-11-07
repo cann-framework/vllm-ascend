@@ -2034,41 +2034,53 @@ def _reshape_kv_cache_v2(
     for layer_name, target_layer_name in shared_kv_cache_layers.items():
         kv_caches[layer_name] = kv_caches[target_layer_name]
 
-    # PA_NZ keeps hidden/scratch pages in the raw backing. A few shared
-    # reshape paths can still expose them through the first dimension. Trim
-    # those attention views back to the logical kernel-block count so the
-    # runner/PD/block-zeroer sees exactly num_blocks logical blocks.
+    # Reserved PA_NZ pages live in the raw backing, but some reshape paths
+    # (notably a draft-only KV config, where no layer advertises the target's
+    # reserved-page count) still fold them into the first dimension. Recover
+    # the logical kernel-block count from the tensor geometry itself so the
+    # runner/PD/block-zeroer always sees exactly num_blocks logical blocks.
     layer_specs = _get_layer_kv_cache_specs(kv_cache_config)
-    reserved_pages = max(
-        (getattr(spec, "flash_mla_reserved_pages", 0) for spec in layer_specs.values()),
-        default=0,
-    )
-    if reserved_pages:
-        logical_pages = kv_cache_config.num_blocks + reserved_pages
-        for layer_name, cache in list(kv_caches.items()):
-            spec = layer_specs.get(layer_name)
-            if not isinstance(spec, (AscendMLAAttentionSpec, MLAAttentionSpec)):
-                continue
-            tensors = cache if isinstance(cache, tuple) else (cache,)
-            trimmed: list[torch.Tensor] = []
-            changed = False
-            for tensor in tensors:
-                if (
-                    tensor.shape[0] > kv_cache_config.num_blocks
-                    and tensor.shape[0] % logical_pages == 0
-                ):
-                    logical_blocks = kv_cache_config.num_blocks * (tensor.shape[0] // logical_pages)
-                    if logical_blocks < tensor.shape[0]:
-                        tensor = torch.as_strided(
-                            tensor,
-                            size=(logical_blocks, *tensor.shape[1:]),
-                            stride=tensor.stride(),
-                            storage_offset=tensor.storage_offset(),
-                        )
-                        changed = True
+    num_logical_blocks = kv_cache_config.num_blocks
+    for layer_name, cache in list(kv_caches.items()):
+        spec = layer_specs.get(layer_name)
+        if not isinstance(spec, (AscendMLAAttentionSpec, MLAAttentionSpec, AscendSlidingWindowMLASpec)):
+            continue
+        tensors = cache if isinstance(cache, tuple) else (cache,)
+        trimmed: list[torch.Tensor] = []
+        changed = False
+        for tensor in tensors:
+            if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
                 trimmed.append(tensor)
-            if changed:
-                kv_caches[layer_name] = tuple(trimmed) if isinstance(cache, tuple) else trimmed[0]
+                continue
+            kernel_blocks = tensor.shape[0]
+            if kernel_blocks > num_logical_blocks and kernel_blocks % num_logical_blocks != 0:
+                # Extra hidden/scratch pages make the raw block count
+                # (num_blocks + reserved) * kernel_blocks_per_page.
+                for extra_pages in range(1, 17):
+                    physical_blocks = num_logical_blocks + extra_pages
+                    if kernel_blocks % physical_blocks == 0:
+                        logical_blocks = num_logical_blocks * (kernel_blocks // physical_blocks)
+                        if logical_blocks < kernel_blocks:
+                            logger.info(
+                                "[PA_NZ][kv] trim layer=%s kernel_blocks=%d -> %d "
+                                "(logical_blocks=%d reserved=%d)",
+                                layer_name,
+                                kernel_blocks,
+                                logical_blocks,
+                                num_logical_blocks,
+                                extra_pages,
+                            )
+                            tensor = torch.as_strided(
+                                tensor,
+                                size=(logical_blocks, *tensor.shape[1:]),
+                                stride=tensor.stride(),
+                                storage_offset=tensor.storage_offset(),
+                            )
+                            changed = True
+                        break
+            trimmed.append(tensor)
+        if changed:
+            kv_caches[layer_name] = tuple(trimmed) if isinstance(cache, tuple) else trimmed[0]
 
     return kv_caches
 
