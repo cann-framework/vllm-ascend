@@ -2033,6 +2033,43 @@ def _reshape_kv_cache_v2(
 
     for layer_name, target_layer_name in shared_kv_cache_layers.items():
         kv_caches[layer_name] = kv_caches[target_layer_name]
+
+    # PA_NZ keeps hidden/scratch pages in the raw backing. A few shared
+    # reshape paths can still expose them through the first dimension. Trim
+    # those attention views back to the logical kernel-block count so the
+    # runner/PD/block-zeroer sees exactly num_blocks logical blocks.
+    layer_specs = _get_layer_kv_cache_specs(kv_cache_config)
+    reserved_pages = max(
+        (getattr(spec, "flash_mla_reserved_pages", 0) for spec in layer_specs.values()),
+        default=0,
+    )
+    if reserved_pages:
+        logical_pages = kv_cache_config.num_blocks + reserved_pages
+        for layer_name, cache in list(kv_caches.items()):
+            spec = layer_specs.get(layer_name)
+            if not isinstance(spec, (AscendMLAAttentionSpec, MLAAttentionSpec)):
+                continue
+            tensors = cache if isinstance(cache, tuple) else (cache,)
+            trimmed: list[torch.Tensor] = []
+            changed = False
+            for tensor in tensors:
+                if (
+                    tensor.shape[0] > kv_cache_config.num_blocks
+                    and tensor.shape[0] % logical_pages == 0
+                ):
+                    logical_blocks = kv_cache_config.num_blocks * (tensor.shape[0] // logical_pages)
+                    if logical_blocks < tensor.shape[0]:
+                        tensor = torch.as_strided(
+                            tensor,
+                            size=(logical_blocks, *tensor.shape[1:]),
+                            stride=tensor.stride(),
+                            storage_offset=tensor.storage_offset(),
+                        )
+                        changed = True
+                trimmed.append(tensor)
+            if changed:
+                kv_caches[layer_name] = tuple(trimmed) if isinstance(cache, tuple) else trimmed[0]
+
     return kv_caches
 
 
