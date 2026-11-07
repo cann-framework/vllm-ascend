@@ -215,33 +215,35 @@ def _kimi_k3_layer_reserved_pages(spec: KVCacheSpec) -> int:
     )
 
 
-def _kimi_k3_group_page_bytes(group: KVCacheGroupSpec) -> int:
-    """Bytes needed by one scheduler block for every layer in a group."""
-    return sum(_physical_page_size_bytes(spec) for spec in _kv_cache_group_specs(group).values())
-
-
-def _kimi_k3_group_reserved_bytes(group: KVCacheGroupSpec) -> int:
-    return sum(
-        _physical_page_size_bytes(spec) * _kimi_k3_layer_reserved_pages(spec)
-        for spec in _kv_cache_group_specs(group).values()
-    )
+def _kimi_k3_group_page_bytes_by_size(group: KVCacheGroupSpec) -> dict[int, int]:
+    """Per-page-size bytes needed by one scheduler block in a group."""
+    result: dict[int, int] = defaultdict(int)
+    for spec in _kv_cache_group_specs(group).values():
+        page_size = _physical_page_size_bytes(spec)
+        result[page_size] += page_size
+    return result
 
 
 def _kimi_k3_physical_page_bytes_per_block(
     kv_cache_groups: list[KVCacheGroupSpec],
     vllm_config: VllmConfig | None = None,
 ) -> int:
-    """Return the largest cache group's bytes per block.
+    """Return total bytes per block when groups are partitioned by page size.
 
-    Hybrid groups alias the same scheduler block IDs from one shared pool. The
-    pool is sized for the largest group, not the sum of every group; the latter
-    over-allocates target/draft/Mamba layouts that can never be live for the
-    same block ID.
+    Groups with the same page size may alias one backing because a scheduler
+    block ID belongs to one group at a time. Groups with different page sizes
+    must not alias: block ``b`` occupies different byte ranges, and a live
+    smaller-page block can overlap another group's block even when the IDs
+    differ. Allocate one pool per page size and sum their largest groups.
     """
     del vllm_config
     if not kv_cache_groups:
         return 0
-    return max(_kimi_k3_group_page_bytes(group) for group in kv_cache_groups)
+    pool_bytes: dict[int, int] = defaultdict(int)
+    for group in kv_cache_groups:
+        for page_size, group_bytes in _kimi_k3_group_page_bytes_by_size(group).items():
+            pool_bytes[page_size] = max(pool_bytes[page_size], group_bytes)
+    return sum(pool_bytes.values())
 
 
 def _kimi_k3_reserved_pages(
@@ -288,34 +290,37 @@ def _get_kimi_k3_physical_kv_cache_config(
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
 ) -> tuple[int, list[KVCacheTensor]]:
-    """Plan Kimi K3 physical pages inside one shared hybrid pool.
+    """Plan Kimi K3 physical pages with one aliasing pool per page size.
 
-    The generic vLLM planner uses::
-
-        bytes_per_block = max_group(sum(group layer page sizes))
-        num_blocks      = available_memory // bytes_per_block
-
-    Every group aliases that pool from byte 0 because the block pool hands a
-    given scheduler block ID to at most one group at a time. PA_NZ keeps the
-    same budget model; only per-layer page sizes and the reserved scratch pages
-    differ.
+    A scheduler block ID belongs to one group at a time, so groups with the
+    same page size may alias. Groups with different page sizes cannot: their
+    block byte ranges differ and a live smaller-page block can overlap another
+    group's block even when the IDs differ. Each page-size pool therefore gets
+    its own non-overlapping region inside the backing.
     """
-    group_layouts: list[tuple[KVCacheGroupSpec, list[tuple[str, KVCacheSpec, int, int]], int, int]] = []
+    group_layouts: list[tuple[KVCacheGroupSpec, list[tuple[str, KVCacheSpec, int, int]]]] = []
+    pool_page_bytes: dict[int, int] = defaultdict(int)
+    pool_reserved_bytes: dict[int, int] = defaultdict(int)
     for group in kv_cache_groups:
         specs = _kv_cache_group_specs(group)
         entries: list[tuple[str, KVCacheSpec, int, int]] = []
-        page_bytes = 0
-        reserved_bytes = 0
+        group_page_bytes: dict[int, int] = defaultdict(int)
+        group_reserved_bytes: dict[int, int] = defaultdict(int)
         for layer_name in group.layer_names:
             spec = specs[layer_name]
             page_size = _physical_page_size_bytes(spec)
             reserved_pages = _kimi_k3_layer_reserved_pages(spec)
             entries.append((layer_name, spec, page_size, reserved_pages))
-            page_bytes += page_size
-            reserved_bytes += page_size * reserved_pages
-        group_layouts.append((group, entries, page_bytes, reserved_bytes))
+            group_page_bytes[page_size] += page_size
+            group_reserved_bytes[page_size] += page_size * reserved_pages
+        group_layouts.append((group, entries))
+        for page_size, page_bytes in group_page_bytes.items():
+            pool_page_bytes[page_size] = max(pool_page_bytes[page_size], page_bytes)
+            pool_reserved_bytes[page_size] = max(
+                pool_reserved_bytes[page_size], group_reserved_bytes[page_size]
+            )
 
-    physical_page_bytes_per_block = max(page_bytes for _, _, page_bytes, _ in group_layouts)
+    physical_page_bytes_per_block = sum(pool_page_bytes.values())
     assert physical_page_bytes_per_block > 0
     # Keep num_blocks exactly equal to available_memory // bytes_per_block.
     # get_kv_cache_configs re-plans every worker with
@@ -324,26 +329,34 @@ def _get_kimi_k3_physical_kv_cache_config(
     # generate_scheduler_kv_cache_config's equality assertion.
     num_blocks = available_memory // physical_page_bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
-    pool_size = max(
-        page_bytes * num_blocks + reserved_bytes for _, _, page_bytes, reserved_bytes in group_layouts
-    )
+    pool_size_by_page = {
+        page_size: page_bytes * num_blocks + pool_reserved_bytes[page_size]
+        for page_size, page_bytes in pool_page_bytes.items()
+    }
+    pool_base: dict[int, int] = {}
+    pool_size = 0
+    for page_size in sorted(pool_size_by_page):
+        pool_base[page_size] = pool_size
+        pool_size += pool_size_by_page[page_size]
     logger.info(
-        "K3 PA_NZ planner: num_blocks=%s page_bytes=%s pool_bytes=%s",
+        "K3 PA_NZ planner: num_blocks=%s page_bytes=%s pool_bytes=%s pools=%s",
         num_blocks,
         physical_page_bytes_per_block,
         pool_size,
+        pool_size_by_page,
     )
 
     kv_cache_tensors: list[KVCacheTensor] = []
-    for group, entries, page_bytes, _ in group_layouts:
+    for group, entries in group_layouts:
         logger.info(
             "K3 PA_NZ planner group: layers=%d page_bytes=%d",
             len(entries),
-            page_bytes,
+            sum(page_size for _, _, page_size, _ in entries),
         )
-        offset = 0
+        offsets: dict[int, int] = defaultdict(int)
         for layer_name, spec, page_size, reserved_pages in entries:
             layer_stride = page_size * (num_blocks + reserved_pages)
+            offset = pool_base[page_size] + offsets[page_size]
             kv_cache_tensors.append(
                 KVCacheTensor(
                     size=pool_size,
@@ -353,21 +366,23 @@ def _get_kimi_k3_physical_kv_cache_config(
                     offset=offset,
                 )
             )
-            offset += layer_stride
+            offsets[page_size] += layer_stride
             logger.info(
                 "K3 PA_NZ tensor: layer=%s layout=%s page_bytes=%d "
-                "reserved=%d layer_stride=%d offset=%d",
+                "reserved=%d layer_stride=%d offset=%d pool=%d",
                 layer_name,
                 _kimi_k3_physical_layout_key(layer_name, spec),
                 page_size,
                 reserved_pages,
                 layer_stride,
-                offset - layer_stride,
+                offset,
+                pool_base[page_size],
             )
     logger.info(
-        "Using Kimi K3 shared KV cache pool: groups=%d tensors=%d",
+        "Using Kimi K3 page-size-partitioned KV cache pool: groups=%d tensors=%d pools=%d",
         len(group_layouts),
         len(kv_cache_tensors),
+        len(pool_size_by_page),
     )
     return num_blocks, kv_cache_tensors
 
