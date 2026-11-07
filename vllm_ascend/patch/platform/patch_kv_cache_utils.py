@@ -317,23 +317,21 @@ def _get_kimi_k3_physical_kv_cache_config(
 
     physical_page_bytes_per_block = max(page_bytes for _, _, page_bytes, _ in group_layouts)
     assert physical_page_bytes_per_block > 0
-    max_reserved_bytes = max(
-        reserved_bytes
-        for _, _, page_bytes, reserved_bytes in group_layouts
-        if page_bytes == physical_page_bytes_per_block
-    )
-    usable_memory = max(0, available_memory - max_reserved_bytes)
-    num_blocks = usable_memory // physical_page_bytes_per_block
+    # Keep num_blocks exactly equal to available_memory // bytes_per_block.
+    # get_kv_cache_configs re-plans every worker with
+    # min_num_blocks * _pool_bytes_per_block(groups); subtracting reserved
+    # pages here makes that re-plan return a different num_blocks and trips
+    # generate_scheduler_kv_cache_config's equality assertion.
+    num_blocks = available_memory // physical_page_bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     pool_size = max(
         page_bytes * num_blocks + reserved_bytes for _, _, page_bytes, reserved_bytes in group_layouts
     )
     logger.info(
-        "K3 PA_NZ planner: num_blocks=%s page_bytes=%s pool_bytes=%s reserved_bytes=%s",
+        "K3 PA_NZ planner: num_blocks=%s page_bytes=%s pool_bytes=%s",
         num_blocks,
         physical_page_bytes_per_block,
         pool_size,
-        max_reserved_bytes,
     )
 
     kv_cache_tensors: list[KVCacheTensor] = []
