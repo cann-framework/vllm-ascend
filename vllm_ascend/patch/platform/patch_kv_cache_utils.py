@@ -179,20 +179,23 @@ def _kimi_k3_pa_nz_from_config(vllm_config: VllmConfig | None) -> bool:
     return model_type in ("kimi_k3", "kimi_linear")
 
 
+def _kv_cache_group_specs(group: KVCacheGroupSpec) -> dict[str, KVCacheSpec]:
+    group_spec = group.kv_cache_spec
+    if isinstance(group_spec, UniformTypeKVCacheSpecs):
+        return group_spec.kv_cache_specs
+    return {layer_name: group_spec for layer_name in group.layer_names}
+
+
 def _is_kimi_k3_pa_nz_groups(
     kv_cache_groups: list[KVCacheGroupSpec],
     vllm_config: VllmConfig | None = None,
 ) -> bool:
     """Only the opt-in PA_NZ layout needs layout-separated physical tensors."""
-    if not all(isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in kv_cache_groups):
-        return False
     for group in kv_cache_groups:
-        group_spec = group.kv_cache_spec
-        assert isinstance(group_spec, UniformTypeKVCacheSpecs)
         if any(
             getattr(spec, "flash_mla_layout", None) == "pa_nz"
             or getattr(spec, "flash_mla_reserved_pages", 0) > 0
-            for spec in group_spec.kv_cache_specs.values()
+            for spec in _kv_cache_group_specs(group).values()
         ):
             return True
     if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA and any(
@@ -213,8 +216,7 @@ def _kimi_k3_physical_layout_buckets(
     mtp_layer_names: list[str] = []
     mtp_page_size = 0
     for group in kv_cache_groups:
-        assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-        specs = group.kv_cache_spec.kv_cache_specs
+        specs = _kv_cache_group_specs(group)
         for layer_name in group.layer_names:
             spec = specs[layer_name]
             if "mtp" in layer_name:
@@ -257,21 +259,19 @@ def _kimi_k3_reserved_pages(
 ) -> int:
     reserved = 0
     for group in kv_cache_groups:
-        group_spec = group.kv_cache_spec
-        if isinstance(group_spec, UniformTypeKVCacheSpecs):
-            reserved = max(
-                reserved,
-                max(
-                    (
-                        max(
-                            getattr(spec, "flash_mla_reserved_pages", 0),
-                            2 if getattr(spec, "flash_mla_layout", None) == "pa_nz" else 0,
-                        )
-                        for spec in group_spec.kv_cache_specs.values()
-                    ),
-                    default=0,
+        reserved = max(
+            reserved,
+            max(
+                (
+                    max(
+                        getattr(spec, "flash_mla_reserved_pages", 0),
+                        2 if getattr(spec, "flash_mla_layout", None) == "pa_nz" else 0,
+                    )
+                    for spec in _kv_cache_group_specs(group).values()
                 ),
-            )
+                default=0,
+            ),
+        )
     if reserved == 0 and (
         _kimi_k3_pa_nz_from_config(vllm_config)
         or (
@@ -338,8 +338,7 @@ def _get_kimi_k3_physical_kv_cache_config(
             for page_size in sorted(page_sizes_by_layout[layout_key]):
                 shared_by: list[str] = []
                 for group in kv_cache_groups:
-                    assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-                    specs = group.kv_cache_spec.kv_cache_specs
+                    specs = _kv_cache_group_specs(group)
                     candidates = [
                         layer_name
                         for layer_name in group.layer_names

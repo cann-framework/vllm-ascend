@@ -1289,7 +1289,7 @@ def _allocate_kv_cache(
                     kv_cache_tensor.layer_stride != layer_size
                     or kv_cache_tensor.block_stride != layer_spec.page_size_bytes
                 ):
-                    logger.error(
+                    logger.info(
                         "Hybrid KV geometry mismatch for %s: layer_stride=%s, "
                         "expected=%s (num_blocks=%s, reserved_pages=%s, page_size=%s), "
                         "block_stride=%s",
