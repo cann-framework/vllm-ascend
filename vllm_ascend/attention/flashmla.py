@@ -320,6 +320,7 @@ class PaNzFlashMLAImpl:
         attn_mask: torch.Tensor | None = None,
         q_len: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return NTD latent output and NT FP32 LSE for a TND query."""
         self.validate_cache(k_cache)
         if q.ndim != 3 or q.shape[1:] != (self.config.num_heads, FLASHMLA_QK_DIM):
             raise ValueError("PA_NZ FlashMLA q must be TND with configured local heads and width 576")

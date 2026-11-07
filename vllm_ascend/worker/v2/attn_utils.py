@@ -1175,17 +1175,17 @@ def _allocate_kv_cache(
         for layer_name, start, layer_size in dsv4_regions:
             kv_cache_raw_tensors[layer_name] = dsv4_backing[start : start + layer_size]
 
-    # Kimi K3 PA_NZ uses layout-separated physical tensors. Their sizes and
-    # page strides intentionally differ between target/draft/Mamba, so they
-    # cannot share the single hybrid backing below. Materialize every
-    # descriptor independently and slice each layer by its own layer_stride.
+    # Kimi K3 PA_NZ keeps target/draft/Mamba page strides distinct, but they
+    # still alias one shared hybrid pool. A block ID is owned by one group at
+    # a time, so the pool is the largest group's bytes per block, not the sum
+    # of all groups. Allocating every descriptor independently multiplies the
+    # pools and can exhaust the KV budget before capture.
     if any(getattr(spec, "flash_mla_layout", None) == "pa_nz" for spec in layer_kv_cache_spec.values()):
-        reserved_pages = max(
-            (getattr(spec, "flash_mla_reserved_pages", 0) for spec in layer_kv_cache_spec.values()),
-            default=0,
-        )
+        pool_size = max((allocation.size for allocation in kv_cache_config.kv_cache_tensors), default=0)
+        if pool_size <= 0:
+            raise ValueError("PA_NZ KV cache config has no allocation.")
+        backing = _allocate_int8_cache_tensor(pool_size, alignment, device)
         for allocation in kv_cache_config.kv_cache_tensors:
-            backing = _allocate_int8_cache_tensor(allocation.size, alignment, device)
             layer_names = get_kv_cache_tensor_layers(allocation)
             layer_count = max(1, len(layer_names))
             layer_stride = allocation.layer_stride or (allocation.size // layer_count)
@@ -1197,7 +1197,7 @@ def _allocate_kv_cache(
                         "PA_NZ KV cache view for "
                         f"{layer_name} exceeds backing: size={backing.numel()}, "
                         f"start={start}, end={end}, layer_stride={layer_stride}, "
-                        f"num_blocks={kv_cache_config.num_blocks}, reserved={reserved_pages}."
+                        f"num_blocks={kv_cache_config.num_blocks}."
                     )
                 kv_cache_raw_tensors[layer_name] = backing[start:end]
         return kv_cache_raw_tensors

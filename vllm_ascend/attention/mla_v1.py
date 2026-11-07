@@ -3547,16 +3547,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             attn_mask=flash.attn_mask if flash.q_len > 1 else None,
             q_len=flash.q_len,
         )
-        attn_output = torch_npu.npu_transpose_batchmatmul(
-            attn_output,
-            self.W_UV,
-            bias=None,
-            scale=None,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-        )
-        return attn_output.reshape(num_decode_tokens, self.num_heads * self.v_head_dim)
+        # PA_NZ FlashMLA returns NTD latent output. Keep the same V-up
+        # projection contract as the PA_BBND adapter.
+        return self._v_up_proj(attn_output)
 
     def _forward_external_flashmla(self, preprocessed, fused_cache, metadata):
         flash = metadata.get_external_flashmla(self.flash_mla_layout)

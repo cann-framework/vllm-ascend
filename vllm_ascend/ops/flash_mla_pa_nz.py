@@ -311,7 +311,9 @@ def flash_mla_with_kvcache(
         max_seqlen_kv=-1,
         layout_q="TND",
         layout_kv="PA_NZ",
-        layout_out="TND",
+        # This operator version only accepts NTD output for TND queries.
+        # Callers that need token-major output transpose the leading two dims.
+        layout_out="NTD",
         return_softmax_lse=return_softmax_lse,
     )
     if return_softmax_lse:

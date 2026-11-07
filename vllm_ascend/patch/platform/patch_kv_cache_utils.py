@@ -207,50 +207,41 @@ def _is_kimi_k3_pa_nz_groups(
     return _kimi_k3_pa_nz_from_config(vllm_config)
 
 
-def _kimi_k3_physical_layout_buckets(
-    kv_cache_groups: list[KVCacheGroupSpec],
-) -> tuple[dict[tuple[str, int], list[str]], dict[str, int], list[str], int]:
-    """Bucket Kimi K3 layers by physical layout and layer-tuple position."""
-    bucketed: dict[tuple[str, int], list[str]] = defaultdict(list)
-    tuple_counts: dict[str, int] = defaultdict(int)
-    mtp_layer_names: list[str] = []
-    mtp_page_size = 0
-    for group in kv_cache_groups:
-        specs = _kv_cache_group_specs(group)
-        for layer_name in group.layer_names:
-            spec = specs[layer_name]
-            if "mtp" in layer_name:
-                mtp_layer_names.append(layer_name)
-                mtp_page_size = _physical_page_size_bytes(spec)
-                continue
-            layout_key = _kimi_k3_physical_layout_key(layer_name, spec)
-            page_size = _physical_page_size_bytes(spec)
-            bucket = bucketed[(layout_key, page_size)]
-            bucket.append(layer_name)
-            tuple_counts[layout_key] = max(tuple_counts[layout_key], len(bucket))
-    return bucketed, tuple_counts, mtp_layer_names, mtp_page_size
+def _kimi_k3_layer_reserved_pages(spec: KVCacheSpec) -> int:
+    """Reserved scratch pages owned by one physical layer."""
+    return max(
+        int(getattr(spec, "flash_mla_reserved_pages", 0) or 0),
+        2 if getattr(spec, "flash_mla_layout", None) == "pa_nz" else 0,
+    )
+
+
+def _kimi_k3_group_page_bytes(group: KVCacheGroupSpec) -> int:
+    """Bytes needed by one scheduler block for every layer in a group."""
+    return sum(_physical_page_size_bytes(spec) for spec in _kv_cache_group_specs(group).values())
+
+
+def _kimi_k3_group_reserved_bytes(group: KVCacheGroupSpec) -> int:
+    return sum(
+        _physical_page_size_bytes(spec) * _kimi_k3_layer_reserved_pages(spec)
+        for spec in _kv_cache_group_specs(group).values()
+    )
 
 
 def _kimi_k3_physical_page_bytes_per_block(
     kv_cache_groups: list[KVCacheGroupSpec],
     vllm_config: VllmConfig | None = None,
 ) -> int:
-    bucketed, tuple_counts, mtp_layer_names, mtp_page_size = _kimi_k3_physical_layout_buckets(kv_cache_groups)
-    page_sizes_by_layout: dict[str, set[int]] = defaultdict(set)
-    for layout_key, page_size in bucketed:
-        page_sizes_by_layout[layout_key].add(page_size)
-    total = sum(
-        page_size * tuple_counts[layout_key]
-        for layout_key, page_sizes in page_sizes_by_layout.items()
-        for page_size in page_sizes
-    )
-    reserved_pages = _kimi_k3_reserved_pages(kv_cache_groups, vllm_config)
-    total += reserved_pages * sum(
-        page_size
-        for page_sizes in page_sizes_by_layout.values()
-        for page_size in page_sizes
-    )
-    return total + len(mtp_layer_names) * mtp_page_size
+    """Return the largest cache group's bytes per block.
+
+    Hybrid groups alias the same scheduler block IDs from one shared pool. The
+    pool is sized for the largest group, not the sum of every group; the latter
+    over-allocates target/draft/Mamba layouts that can never be live for the
+    same block ID.
+    """
+    del vllm_config
+    if not kv_cache_groups:
+        return 0
+    return max(_kimi_k3_group_page_bytes(group) for group in kv_cache_groups)
 
 
 def _kimi_k3_reserved_pages(
@@ -297,96 +288,87 @@ def _get_kimi_k3_physical_kv_cache_config(
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
 ) -> tuple[int, list[KVCacheTensor]]:
-    """Plan Kimi K3 tensors without sharing incompatible physical layouts."""
-    bucketed, tuple_counts, mtp_layer_names, mtp_page_size = _kimi_k3_physical_layout_buckets(kv_cache_groups)
-    page_sizes_by_layout: dict[str, set[int]] = defaultdict(set)
-    for (layout_key, page_size) in bucketed:
-        page_sizes_by_layout[layout_key].add(page_size)
-    physical_page_bytes_per_block = _kimi_k3_physical_page_bytes_per_block(kv_cache_groups, vllm_config)
+    """Plan Kimi K3 physical pages inside one shared hybrid pool.
+
+    The generic vLLM planner uses::
+
+        bytes_per_block = max_group(sum(group layer page sizes))
+        num_blocks      = available_memory // bytes_per_block
+
+    Every group aliases that pool from byte 0 because the block pool hands a
+    given scheduler block ID to at most one group at a time. PA_NZ keeps the
+    same budget model; only per-layer page sizes and the reserved scratch pages
+    differ.
+    """
+    group_layouts: list[tuple[KVCacheGroupSpec, list[tuple[str, KVCacheSpec, int, int]], int, int]] = []
+    for group in kv_cache_groups:
+        specs = _kv_cache_group_specs(group)
+        entries: list[tuple[str, KVCacheSpec, int, int]] = []
+        page_bytes = 0
+        reserved_bytes = 0
+        for layer_name in group.layer_names:
+            spec = specs[layer_name]
+            page_size = _physical_page_size_bytes(spec)
+            reserved_pages = _kimi_k3_layer_reserved_pages(spec)
+            entries.append((layer_name, spec, page_size, reserved_pages))
+            page_bytes += page_size
+            reserved_bytes += page_size * reserved_pages
+        group_layouts.append((group, entries, page_bytes, reserved_bytes))
+
+    physical_page_bytes_per_block = max(page_bytes for _, _, page_bytes, _ in group_layouts)
     assert physical_page_bytes_per_block > 0
-    num_blocks = available_memory // physical_page_bytes_per_block
-    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
-    reserved_pages = _kimi_k3_reserved_pages(kv_cache_groups, vllm_config)
-    logger.info(
-        "K3 PA_NZ planner: num_blocks=%s reserved=%s page_bytes=%s",
-        num_blocks,
-        reserved_pages,
-        physical_page_bytes_per_block,
+    max_reserved_bytes = max(
+        reserved_bytes
+        for _, _, page_bytes, reserved_bytes in group_layouts
+        if page_bytes == physical_page_bytes_per_block
     )
-    for (layout_key, page_size), bucket_layers in sorted(bucketed.items()):
-        logger.info(
-            "K3 PA_NZ planner bucket: layout=%s page_bytes=%d layers=%d tuple_count=%d",
-            layout_key,
-            page_size,
-            len(bucket_layers),
-            tuple_counts[layout_key],
-        )
-    if mtp_layer_names:
-        logger.info(
-            "K3 PA_NZ planner: mtp_layers=%d mtp_page_bytes=%d",
-            len(mtp_layer_names),
-            mtp_page_size,
-        )
+    usable_memory = max(0, available_memory - max_reserved_bytes)
+    num_blocks = usable_memory // physical_page_bytes_per_block
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    pool_size = max(
+        page_bytes * num_blocks + reserved_bytes for _, _, page_bytes, reserved_bytes in group_layouts
+    )
+    logger.info(
+        "K3 PA_NZ planner: num_blocks=%s page_bytes=%s pool_bytes=%s reserved_bytes=%s",
+        num_blocks,
+        physical_page_bytes_per_block,
+        pool_size,
+        max_reserved_bytes,
+    )
 
     kv_cache_tensors: list[KVCacheTensor] = []
-    layout_order = sorted(
-        page_sizes_by_layout,
-        key=lambda layout_key: (layout_key != "target_attention", layout_key),
-    )
-    for layout_key in layout_order:
-        for tuple_idx in range(tuple_counts[layout_key]):
-            for page_size in sorted(page_sizes_by_layout[layout_key]):
-                shared_by: list[str] = []
-                for group in kv_cache_groups:
-                    specs = _kv_cache_group_specs(group)
-                    candidates = [
-                        layer_name
-                        for layer_name in group.layer_names
-                        if "mtp" not in layer_name
-                        and _kimi_k3_physical_layout_key(layer_name, specs[layer_name]) == layout_key
-                        and _physical_page_size_bytes(specs[layer_name]) == page_size
-                    ]
-                    if tuple_idx < len(candidates):
-                        shared_by.append(candidates[tuple_idx])
-                if shared_by:
-                    layer_stride = page_size * (num_blocks + reserved_pages)
-                    kv_cache_tensors.append(
-                        KVCacheTensor(
-                            size=layer_stride * len(shared_by),
-                            layers=shared_by,
-                            layer_stride=layer_stride,
-                            block_stride=page_size,
-                        )
-                    )
-                    logger.info(
-                        "K3 PA_NZ tensor: layout=%s tuple=%d page_bytes=%d layers=%d "
-                        "layer_stride=%d size=%d",
-                        layout_key,
-                        tuple_idx,
-                        page_size,
-                        len(shared_by),
-                        layer_stride,
-                        layer_stride * len(shared_by),
-                    )
-    for layer_name in mtp_layer_names:
-        layer_stride = mtp_page_size * (num_blocks + reserved_pages)
-        kv_cache_tensors.append(
-            KVCacheTensor(
-                size=layer_stride,
-                layers=[layer_name],
-                layer_stride=layer_stride,
-                block_stride=mtp_page_size,
-            )
-        )
+    for group, entries, page_bytes, _ in group_layouts:
         logger.info(
-            "K3 PA_NZ tensor: mtp layer=%s page_bytes=%d layer_stride=%d",
-            layer_name,
-            mtp_page_size,
-            layer_stride,
+            "K3 PA_NZ planner group: layers=%d page_bytes=%d",
+            len(entries),
+            page_bytes,
         )
+        offset = 0
+        for layer_name, spec, page_size, reserved_pages in entries:
+            layer_stride = page_size * (num_blocks + reserved_pages)
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=pool_size,
+                    layers=[layer_name],
+                    layer_stride=layer_stride,
+                    block_stride=page_size,
+                    offset=offset,
+                )
+            )
+            offset += layer_stride
+            logger.info(
+                "K3 PA_NZ tensor: layer=%s layout=%s page_bytes=%d "
+                "reserved=%d layer_stride=%d offset=%d",
+                layer_name,
+                _kimi_k3_physical_layout_key(layer_name, spec),
+                page_size,
+                reserved_pages,
+                layer_stride,
+                offset - layer_stride,
+            )
     logger.info(
-        "Using Kimi K3 layout-separated KV cache tensors: layouts=%s, tensors=%d",
-        dict(sorted(tuple_counts.items())),
+        "Using Kimi K3 shared KV cache pool: groups=%d tensors=%d",
+        len(group_layouts),
         len(kv_cache_tensors),
     )
     return num_blocks, kv_cache_tensors
@@ -409,6 +391,10 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
     relation. An unrecognized or incompatible signature falls back to vLLM's
     generic hybrid grouping.
     """
+    allow_pa_nz = bool(ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA)
+    draft_spec_types: tuple[type[KVCacheSpec], ...] = (
+        (FullAttentionSpec, SlidingWindowSpec) if allow_pa_nz else (FullAttentionSpec,)
+    )
     target_attention_specs = {
         name: spec
         for name, spec in kv_cache_spec.items()
@@ -417,7 +403,7 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
     draft_attention_specs = {
         name: spec
         for name, spec in kv_cache_spec.items()
-        if name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) and isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
+        if name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) and isinstance(spec, draft_spec_types)
     }
     mamba_specs = {
         name: spec
@@ -438,9 +424,11 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
     all_specs = [*attention_specs, *mamba_specs.values()]
     # Only attention layers share a scheduler block table. Mamba keeps its
     # own groups and may use max_model_len as block_size when cache_mode=none.
-    if (
-        len({spec.block_size for spec in attention_specs}) != 1
-        or len({_physical_page_size_bytes(spec) for spec in all_specs}) != 1
+    # PA_NZ target/draft pages have different physical widths; they must still
+    # share one attention group so scheduler block IDs stay paired. The
+    # layout-separated planner below sizes their sum within one shared pool.
+    if len({spec.block_size for spec in attention_specs}) != 1 or (
+        not allow_pa_nz and len({_physical_page_size_bytes(spec) for spec in all_specs}) != 1
     ):
         return None
 
