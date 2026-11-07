@@ -1531,7 +1531,12 @@ class AscendMLAImpl(MLAAttentionImpl):
         self._prepare_strided_kv_workspace()
 
         if self.use_flashmla and not self.use_flashmla_pa_nz and (
-            self.supports_prolog_v3_writer() or (self._supports_flashmla_mlapo() and not self.dcp_enabled)
+            # DSpark context-KV writes use the PROLOG_V3 writer eagerly before
+            # the captured draft decode. Allocate its dense workspace during
+            # weight loading so graph capture never sees a late allocation.
+            self.is_draft_model
+            or self.supports_prolog_v3_writer()
+            or (self._supports_flashmla_mlapo() and not self.dcp_enabled)
         ):
             self._prepare_flashmla_writer_buffers()
 
@@ -1557,6 +1562,11 @@ class AscendMLAImpl(MLAAttentionImpl):
         if not getattr(self, "use_flashmla", False) or not needs_dense_writer:
             return kv_cache, slots, False
         buffers = self._flashmla_writer_buffers
+        if buffers is None:
+            if torch.npu.is_current_stream_capturing():
+                raise RuntimeError("FlashMLA PROLOG writer workspace was not prepared before capture")
+            self._prepare_flashmla_writer_buffers()
+            buffers = self._flashmla_writer_buffers
         if buffers is None or num_tokens > buffers[2].numel():
             raise RuntimeError("FlashMLA PROLOG writer workspace does not cover the scheduled token rows")
         nope, rope, indices = buffers
@@ -3005,16 +3015,26 @@ class AscendMLAImpl(MLAAttentionImpl):
             raise RuntimeError("PROLOG_V3 DSpark context writes require cos/sin.")
 
         self._validate_prolog_v3_cache(kv_cache)
+        buffers = self._flashmla_writer_buffers
+        if buffers is None:
+            self._prepare_flashmla_writer_buffers()
+            buffers = self._flashmla_writer_buffers
+        if buffers is None or buffers[2].numel() <= 0:
+            raise RuntimeError("DSpark PROLOG_V3 context writer has no workspace.")
+        capacity = buffers[2].numel()
         # Query outputs are intentionally ignored: DSpark only needs the
-        # context KV side effect from the stride-aware writer.
-        self._run_prolog_v3(
-            context_states,
-            cos,
-            sin,
-            kv_cache,
-            slots,
-            quantize_query=False,
-        )
+        # context KV side effect from the stride-aware writer. Context can be
+        # longer than one scheduler batch, so write it in bounded chunks.
+        for start in range(0, context_states.shape[0], capacity):
+            end = min(start + capacity, context_states.shape[0])
+            self._run_prolog_v3(
+                context_states[start:end],
+                cos[start:end],
+                sin[start:end],
+                kv_cache,
+                slots[start:end],
+                quantize_query=False,
+            )
 
     def exec_kv_prefill(
         self,
