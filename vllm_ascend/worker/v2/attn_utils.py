@@ -978,6 +978,12 @@ def _uses_single_raw_mla_cache(
             return False
         if not kv_cache_spec.requires_contiguous_page:
             return False
+        logger.info_once(
+            "[PA_NZ][kv] single raw backing: transfer=%s component_major_pd=%s contiguous=%s",
+            vllm_config.kv_transfer_config is not None,
+            supports_component_major_mla_pd(vllm_config),
+            kv_cache_spec.requires_contiguous_page,
+        )
         return bool(getattr(impl, "use_flashmla", False))
     if not supports_component_major_mla_pd(vllm_config):
         return False
@@ -1283,6 +1289,18 @@ def _allocate_kv_cache(
                     kv_cache_tensor.layer_stride != layer_size
                     or kv_cache_tensor.block_stride != layer_spec.page_size_bytes
                 ):
+                    logger.error(
+                        "Hybrid KV geometry mismatch for %s: layer_stride=%s, "
+                        "expected=%s (num_blocks=%s, reserved_pages=%s, page_size=%s), "
+                        "block_stride=%s",
+                        layer_name,
+                        kv_cache_tensor.layer_stride,
+                        layer_size,
+                        kv_cache_config.num_blocks,
+                        reserved_pages,
+                        layer_spec.page_size_bytes,
+                        kv_cache_tensor.block_stride,
+                    )
                     raise ValueError(
                         "Ascend hybrid KV cache requires contiguous per-layer "
                         f"views, but {layer_name} has layer_stride="
@@ -1822,6 +1840,16 @@ def _reshape_kv_cache_v2(
                     )
                     if reserved_pages:
                         pa_nz_cache[-reserved_pages:].zero_()
+                    logger.info(
+                        "[PA_NZ][kv] layer=%s blocks=%d reserved=%d block_size=%d fused_dim=%d dtype=%s view=%s",
+                        layer_name,
+                        kv_cache_config.num_blocks,
+                        reserved_pages,
+                        kernel_block_size,
+                        fused_dim,
+                        kv_cache_spec.dtype,
+                        tuple(pa_nz_cache.shape),
+                    )
                     kv_caches[layer_name] = pa_nz_cache
                     continue
                 if attn_impl.use_flashmla:

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+from vllm.logger import logger
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 
 from vllm_ascend.attention.utils import MLA_FLASH_SUPPORTED_Q_HEADS, get_flashmla_ops
@@ -465,6 +466,18 @@ class FlashMLAMetadataBuilder:
         self.max_num_reqs = max_num_reqs
         self.buffers: dict[tuple, FlashMLADecode] = {}
         self.attn_mask = attn_mask
+        self._logged_first_build = False
+        self._logged_async_start = False
+        logger.info(
+            "[FlashMLA] metadata builder: layout=%s heads=%d kv_lora=%d dcp=%d/%d async=%s reserved_pages=%d",
+            layout,
+            impl.num_heads,
+            getattr(impl, "kv_lora_rank", -1),
+            self.dcp_size,
+            self.dcp_rank,
+            self.enable_async,
+            self.reserved_pages,
+        )
 
     def _allocate(self, tokens: int, rows: int, columns: int, causal: bool, q_len: int = 1) -> FlashMLADecode:
         ints = {"dtype": torch.int32, "device": self.device}
@@ -574,6 +587,27 @@ class FlashMLAMetadataBuilder:
         columns = common.block_table_tensor.shape[1]
         q_len = max(1, int(getattr(common, "max_query_len", 1) or 1))
         key = tokens, rows, columns, common.causal, q_len
+        if retain_for_graph:
+            logger.info(
+                "[FlashMLA] capture buffers: tokens=%d rows=%d columns=%d causal=%s q_len=%d reserved=%d",
+                tokens,
+                rows,
+                columns,
+                common.causal,
+                q_len,
+                self.reserved_pages,
+            )
+        if not self._logged_first_build:
+            logger.info(
+                "[FlashMLA] first build: tokens=%d rows=%d columns=%d causal=%s q_len=%d async=%s",
+                tokens,
+                rows,
+                columns,
+                common.causal,
+                q_len,
+                self.enable_async,
+            )
+            self._logged_first_build = True
         if has_prefill:
             if retain_for_graph:
                 raise ValueError("FlashMLA graph buffers require a decode-only batch")
@@ -703,6 +737,23 @@ class FlashMLAMetadataBuilder:
             return
         if self.metadata_stream is None or self.metadata_start is None or self.metadata_ready is None:
             raise RuntimeError("FlashMLA async metadata was enabled without stream/event resources.")
+        capturing = torch.npu.is_current_stream_capturing()
+        if capturing:
+            logger.info(
+                "[FlashMLA] capture metadata schedule: tokens=%d rows=%d q_len=%d reserved=%d",
+                flash.query.shape[0],
+                flash.cu.numel() - 1,
+                flash.q_len,
+                self.reserved_pages,
+            )
+        elif not self._logged_async_start:
+            logger.info(
+                "[FlashMLA] async metadata start (eager): tokens=%d rows=%d q_len=%d",
+                flash.query.shape[0],
+                flash.cu.numel() - 1,
+                flash.q_len,
+            )
+            self._logged_async_start = True
         main_stream = torch.npu.current_stream()
         self.metadata_start.record(main_stream)
         self.metadata_stream.wait_event(self.metadata_start)

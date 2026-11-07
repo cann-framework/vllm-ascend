@@ -399,6 +399,17 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
                 if self.flashmla_state is None:
                     self.flashmla_state = state
             impl.flash_mla_state = state
+        self._logged_external_flashmla_build = False
+        for layout, state in self.flashmla_states.items():
+            logger.info(
+                "[MLA] flashmla state: group=%s layout=%s async=%s reserved_pages=%d",
+                layer_names[0] if layer_names else "",
+                layout,
+                state.enable_async,
+                state.reserved_pages,
+            )
+        if len(self.flashmla_states) > 1:
+            logger.info("[MLA] mixed FlashMLA layouts in one group: %s", sorted(self.flashmla_states))
 
     def _build_external_flashmla(self, common_prefix_len, common, *, retain_for_graph: bool = False):
         """Keep FIA prefill metadata, but build decode inputs from device state."""
@@ -421,6 +432,23 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
                 raise RuntimeError("FIA prefill requires the runner's CPU sequence lengths")
             self.seq_lens = self.seq_lens[: common.num_reqs]
             prefill = self.build_prefill_metadata(common_prefix_len, common)
+
+        if retain_for_graph:
+            logger.info(
+                "[MLA] capture external FlashMLA metadata: decodes=%d decode_tokens=%d layouts=%s",
+                self.num_decodes,
+                self.num_decode_tokens,
+                sorted(self.flashmla_states),
+            )
+        elif not self._logged_external_flashmla_build:
+            logger.info(
+                "[MLA] first external FlashMLA metadata: decodes=%d decode_tokens=%d prefills=%d layouts=%s",
+                self.num_decodes,
+                self.num_decode_tokens,
+                self.num_prefills,
+                sorted(self.flashmla_states),
+            )
+            self._logged_external_flashmla_build = True
 
         flash_by_layout: dict[str, FlashMLADecode] = {}
         decode = None
@@ -1103,6 +1131,24 @@ class AscendMLAImpl(MLAAttentionImpl):
             self._validate_flash_mla_pa_nz_layer()
         self.use_flashmla: bool = self._can_use_flashmla()
         self.use_flashmla_pa_nz = self.flash_mla_layout == "pa_nz"
+        self._logged_pa_nz_decode = False
+        self._logged_pa_nz_dcp = False
+        log = logger.info if (self.use_flashmla or self.flash_mla_layout == "pa_nz") else logger.debug
+        log(
+            "[MLA] layer=%s layout=%s requested_pa_nz=%s draft=%s pcp=%s dcp=%s use_flashmla=%s "
+            "heads=%d kv_heads=%d dtype=%s rope=%s",
+            self.layer_name,
+            self.flash_mla_layout,
+            self.flash_mla_pa_nz_requested,
+            self.is_draft_model,
+            self.pcp_enabled,
+            self.dcp_enabled,
+            self.use_flashmla,
+            self.num_heads,
+            self.num_kv_heads,
+            self.dtype,
+            self.use_mla_rope,
+        )
         self._flashmla_writer_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         self.flash_total_heads = 0
         self.flash_local_head_start = 0
@@ -1158,6 +1204,18 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         _get_pa_nz_flash_mla_ops()
         _get_bf16_mla_prolog_op()
+        logger.info(
+            "[PA_NZ] layer=%s validated: heads=%d kv_heads=%d kv_lora=%d rope=%d dtype=%s "
+            "spec=%s kv_transfer=%s",
+            self.layer_name,
+            self.num_heads,
+            self.num_kv_heads,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            self.dtype,
+            getattr(speculative_config, "method", None),
+            getattr(config, "kv_transfer_config", None) is not None,
+        )
 
     def _can_use_flashmla(self) -> bool:
         if self.flash_mla_layout == "pa_nz":
@@ -3355,6 +3413,25 @@ class AscendMLAImpl(MLAAttentionImpl):
         reserved_pages = flash.reserved_pages
         hidden_page = merged_cache.shape[0] - reserved_pages if reserved_pages else None
         scratch_page = merged_cache.shape[0] - 1 if reserved_pages else None
+        if not self._logged_pa_nz_decode:
+            logger.info(
+                "[PA_NZ] decode layer=%s tokens=%d actual=%d decodes=%d q_len=%d cache=%s block=%d "
+                "reserved=%d hidden_page=%s scratch_page=%s prolog_slots=%s async=%s dcp=%s",
+                self.layer_name,
+                num_decode_tokens,
+                attn_metadata.num_actual_tokens,
+                num_decodes,
+                getattr(flash, "q_len", 1),
+                tuple(merged_cache.shape),
+                block_size,
+                reserved_pages,
+                hidden_page,
+                scratch_page,
+                flash.prolog_slots is not None,
+                flash.metadata_async,
+                self.dcp_enabled,
+            )
+            self._logged_pa_nz_decode = True
         if flash.block_columns is not None:
             valid_cols = (flash.cache_lens + block_size - 1) // block_size
             last_columns = (valid_cols - 1).clamp_min(0).to(torch.long)
@@ -3410,6 +3487,15 @@ class AscendMLAImpl(MLAAttentionImpl):
         if flash.metadata_builder is not None:
             flash.metadata_builder.wait_metadata(flash)
         if self.dcp_enabled:
+            if not self._logged_pa_nz_dcp:
+                logger.info(
+                    "[PA_NZ] DCP decode layer=%s tokens=%d dcp=%d current_chunk=%s",
+                    self.layer_name,
+                    num_decode_tokens,
+                    self.vllm_config.parallel_config.decode_context_parallel_size,
+                    flash.current is not None,
+                )
+                self._logged_pa_nz_dcp = True
             split_attention = getattr(self, "_forward_decode_split_attention", None)
             if split_attention is None:
                 raise RuntimeError("PA_NZ DCP requires the DCP MLA implementation.")
@@ -3466,6 +3552,13 @@ class AscendMLAImpl(MLAAttentionImpl):
             raise RuntimeError(
                 "External FlashMLA requires the original fused BBND cache; component-major tuples are invalid"
             )
+        logger.info_once(
+            "[FlashMLA] external attention: layer=%s q=%s cache=%s schedule=%d",
+            self.layer_name,
+            tuple(flash.query.shape),
+            tuple(fused_cache.shape),
+            flash.schedule.numel(),
+        )
         # Pack the separate NoPE (512) and RoPE (64) outputs into FlashMLA's
         # TND(576) query. The backend retains this buffer for captured capacities
         # so replay reuses its address.

@@ -283,6 +283,11 @@ def _kimi_k3_reserved_pages(
             )
         )
     ):
+        logger.info_once(
+            "K3 PA_NZ planner: reserved pages fallback -> 2 (config_pa_nz=%s env=%s)",
+            _kimi_k3_pa_nz_from_config(vllm_config),
+            ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA,
+        )
         return 2
     return reserved
 
@@ -301,6 +306,27 @@ def _get_kimi_k3_physical_kv_cache_config(
     assert physical_page_bytes_per_block > 0
     num_blocks = available_memory // physical_page_bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    reserved_pages = _kimi_k3_reserved_pages(kv_cache_groups, vllm_config)
+    logger.info(
+        "K3 PA_NZ planner: num_blocks=%s reserved=%s page_bytes=%s",
+        num_blocks,
+        reserved_pages,
+        physical_page_bytes_per_block,
+    )
+    for (layout_key, page_size), bucket_layers in sorted(bucketed.items()):
+        logger.info(
+            "K3 PA_NZ planner bucket: layout=%s page_bytes=%d layers=%d tuple_count=%d",
+            layout_key,
+            page_size,
+            len(bucket_layers),
+            tuple_counts[layout_key],
+        )
+    if mtp_layer_names:
+        logger.info(
+            "K3 PA_NZ planner: mtp_layers=%d mtp_page_bytes=%d",
+            len(mtp_layer_names),
+            mtp_page_size,
+        )
 
     kv_cache_tensors: list[KVCacheTensor] = []
     layout_order = sorted(
@@ -324,7 +350,6 @@ def _get_kimi_k3_physical_kv_cache_config(
                     if tuple_idx < len(candidates):
                         shared_by.append(candidates[tuple_idx])
                 if shared_by:
-                    reserved_pages = _kimi_k3_reserved_pages(kv_cache_groups, vllm_config)
                     layer_stride = page_size * (num_blocks + reserved_pages)
                     kv_cache_tensors.append(
                         KVCacheTensor(
@@ -334,7 +359,16 @@ def _get_kimi_k3_physical_kv_cache_config(
                             block_stride=page_size,
                         )
                     )
-    reserved_pages = _kimi_k3_reserved_pages(kv_cache_groups, vllm_config)
+                    logger.info(
+                        "K3 PA_NZ tensor: layout=%s tuple=%d page_bytes=%d layers=%d "
+                        "layer_stride=%d size=%d",
+                        layout_key,
+                        tuple_idx,
+                        page_size,
+                        len(shared_by),
+                        layer_stride,
+                        layer_stride * len(shared_by),
+                    )
     for layer_name in mtp_layer_names:
         layer_stride = mtp_page_size * (num_blocks + reserved_pages)
         kv_cache_tensors.append(
@@ -344,6 +378,12 @@ def _get_kimi_k3_physical_kv_cache_config(
                 layer_stride=layer_stride,
                 block_stride=mtp_page_size,
             )
+        )
+        logger.info(
+            "K3 PA_NZ tensor: mtp layer=%s page_bytes=%d layer_stride=%d",
+            layer_name,
+            mtp_page_size,
+            layer_stride,
         )
     logger.info(
         "Using Kimi K3 layout-separated KV cache tensors: layouts=%s, tensors=%d",

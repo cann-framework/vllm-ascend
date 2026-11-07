@@ -1016,6 +1016,13 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
             ):
                 continue
             state.start_metadata(flash)
+            logger.info_once(
+                "[FlashMLA] model hook started metadata: layer=%s decode_tokens=%d async=%s layout=%s",
+                impl.layer_name,
+                layer_metadata.num_decode_tokens,
+                getattr(flash, "metadata_async", False),
+                getattr(impl, "flash_mla_layout", None),
+            )
             return
 
     def forward(
