@@ -1186,15 +1186,18 @@ def _allocate_kv_cache(
         )
         for allocation in kv_cache_config.kv_cache_tensors:
             backing = _allocate_int8_cache_tensor(allocation.size, alignment, device)
-            for layer_idx, layer_name in enumerate(get_kv_cache_tensor_layers(allocation)):
-                layer_spec = layer_kv_cache_spec[layer_name]
-                layer_size = (kv_cache_config.num_blocks + reserved_pages) * layer_spec.page_size_bytes
-                layer_stride = allocation.layer_stride or layer_size
+            layer_names = get_kv_cache_tensor_layers(allocation)
+            layer_count = max(1, len(layer_names))
+            layer_stride = allocation.layer_stride or (allocation.size // layer_count)
+            for layer_idx, layer_name in enumerate(layer_names):
                 start = allocation.offset + layer_idx * layer_stride
-                end = start + layer_size
+                end = start + layer_stride
                 if end > backing.numel():
                     raise ValueError(
-                        f"PA_NZ KV cache view for {layer_name} exceeds the backing allocation."
+                        "PA_NZ KV cache view for "
+                        f"{layer_name} exceeds backing: size={backing.numel()}, "
+                        f"start={start}, end={end}, layer_stride={layer_stride}, "
+                        f"num_blocks={kv_cache_config.num_blocks}, reserved={reserved_pages}."
                     )
                 kv_cache_raw_tensors[layer_name] = backing[start:end]
         return kv_cache_raw_tensors
