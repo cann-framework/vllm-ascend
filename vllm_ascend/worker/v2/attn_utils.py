@@ -1175,6 +1175,30 @@ def _allocate_kv_cache(
         for layer_name, start, layer_size in dsv4_regions:
             kv_cache_raw_tensors[layer_name] = dsv4_backing[start : start + layer_size]
 
+    # Kimi K3 PA_NZ uses layout-separated physical tensors. Their sizes and
+    # page strides intentionally differ between target/draft/Mamba, so they
+    # cannot share the single hybrid backing below. Materialize every
+    # descriptor independently and slice each layer by its own layer_stride.
+    if any(getattr(spec, "flash_mla_layout", None) == "pa_nz" for spec in layer_kv_cache_spec.values()):
+        reserved_pages = max(
+            (getattr(spec, "flash_mla_reserved_pages", 0) for spec in layer_kv_cache_spec.values()),
+            default=0,
+        )
+        for allocation in kv_cache_config.kv_cache_tensors:
+            backing = _allocate_int8_cache_tensor(allocation.size, alignment, device)
+            for layer_idx, layer_name in enumerate(get_kv_cache_tensor_layers(allocation)):
+                layer_spec = layer_kv_cache_spec[layer_name]
+                layer_size = (kv_cache_config.num_blocks + reserved_pages) * layer_spec.page_size_bytes
+                layer_stride = allocation.layer_stride or layer_size
+                start = allocation.offset + layer_idx * layer_stride
+                end = start + layer_size
+                if end > backing.numel():
+                    raise ValueError(
+                        f"PA_NZ KV cache view for {layer_name} exceeds the backing allocation."
+                    )
+                kv_cache_raw_tensors[layer_name] = backing[start:end]
+        return kv_cache_raw_tensors
+
     # vLLM #51718 changed every KVCacheTensor to describe a view into one
     # common backing allocation. Hybrid groups overlay that backing from byte
     # zero because a block ID belongs to only one group at a time. Allocate it
