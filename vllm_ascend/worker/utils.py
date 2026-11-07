@@ -1,3 +1,4 @@
+import math
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
@@ -114,6 +115,45 @@ def make_page_strided_cache_view(
         stride=(page_size_bytes // dtype_size, *strides[1:]),
         storage_offset=storage_offset_bytes // dtype_size,
     )
+
+
+def make_pa_nz_cache_view(
+    raw_tensor: torch.Tensor,
+    shape: Sequence[int],
+    dtype: torch.dtype,
+    page_stride_bytes: int,
+    offset_bytes: int = 0,
+) -> torch.Tensor:
+    """Expose one contiguous merged PA_NZ page per scheduler block.
+
+    The PA_NZ operator reinterprets the logical ``[blocks, block_size, 1, 576]``
+    view as ``[blocks, 1, 36, block_size, 16]``.  It therefore requires each
+    page to be dense: a padded block stride cannot be represented by the
+    operator's ``view`` and must be rejected here instead of producing a
+    silently wrong cache view.
+    """
+    dtype_size = get_dtype_size(dtype)
+    shape = tuple(shape)
+    if len(shape) != 4 or shape[2] != 1:
+        raise ValueError(f"PA_NZ cache view expects [blocks, block_size, 1, width], got {shape}.")
+    page_bytes = math.prod(shape[1:]) * dtype_size
+    if page_stride_bytes != page_bytes:
+        raise ValueError(
+            "PA_NZ requires a contiguous page: "
+            f"page_stride_bytes={page_stride_bytes}, dense_page_bytes={page_bytes}."
+        )
+    storage_offset_bytes = raw_tensor.storage_offset() * raw_tensor.element_size() + offset_bytes
+    if storage_offset_bytes % dtype_size:
+        raise ValueError("PA_NZ cache offset must be aligned to the cache dtype.")
+    view = torch.as_strided(
+        raw_tensor.view(dtype),
+        size=shape,
+        stride=row_major_strides(shape),
+        storage_offset=storage_offset_bytes // dtype_size,
+    )
+    if not view.is_contiguous():
+        raise ValueError("PA_NZ cache view must be contiguous.")
+    return view
 
 
 @contextmanager

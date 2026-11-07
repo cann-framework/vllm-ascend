@@ -19,10 +19,12 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_kv_cache_config,
@@ -140,6 +142,238 @@ def _ascend_resolve_kv_cache_block_sizes(
     return _orig_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
 
 
+def _kimi_k3_physical_layout_key(layer_name: str, spec: KVCacheSpec) -> str:
+    """Return the physical cache layout family used by a Kimi K3 layer."""
+    if isinstance(spec, MambaSpec):
+        return "mamba"
+    if layer_name.startswith(_KIMI_K3_TARGET_LAYER_PREFIX):
+        return "target_attention"
+    if layer_name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX):
+        return "draft_attention"
+    return "default"
+
+
+def _physical_page_size_bytes(spec: KVCacheSpec) -> int:
+    """Use the unpadded page size for independent physical backing tensors."""
+    return getattr(spec, "unpadded_page_size_bytes", spec.page_size_bytes)
+
+
+def _kimi_k3_pa_nz_from_config(vllm_config: VllmConfig | None) -> bool:
+    if vllm_config is None:
+        return False
+    static_forward_context = getattr(vllm_config.compilation_config, "static_forward_context", None) or {}
+    if any(
+        getattr(getattr(module, "impl", None), "flash_mla_layout", None) == "pa_nz"
+        and layer_name.startswith((_KIMI_K3_TARGET_LAYER_PREFIX, _KIMI_K3_DRAFT_LAYER_PREFIX))
+        for layer_name, module in static_forward_context.items()
+    ):
+        return True
+    # The scheduler may build KV cache groups before the worker's static
+    # forward context is populated. The environment switch is the same
+    # model-level opt-in used by AscendMLAImpl, so use it as the fallback.
+    if not ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+        return False
+    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    text_config = getattr(hf_config, "text_config", hf_config)
+    model_type = getattr(text_config, "model_type", getattr(hf_config, "model_type", None))
+    return model_type in ("kimi_k3", "kimi_linear")
+
+
+def _kv_cache_group_specs(group: KVCacheGroupSpec) -> dict[str, KVCacheSpec]:
+    group_spec = group.kv_cache_spec
+    if isinstance(group_spec, UniformTypeKVCacheSpecs):
+        return group_spec.kv_cache_specs
+    return {layer_name: group_spec for layer_name in group.layer_names}
+
+
+def _is_kimi_k3_pa_nz_groups(
+    kv_cache_groups: list[KVCacheGroupSpec],
+    vllm_config: VllmConfig | None = None,
+) -> bool:
+    """Only the opt-in PA_NZ layout needs layout-separated physical tensors."""
+    for group in kv_cache_groups:
+        if any(
+            getattr(spec, "flash_mla_layout", None) == "pa_nz"
+            or getattr(spec, "flash_mla_reserved_pages", 0) > 0
+            for spec in _kv_cache_group_specs(group).values()
+        ):
+            return True
+    if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA and any(
+        layer_name.startswith((_KIMI_K3_TARGET_LAYER_PREFIX, _KIMI_K3_DRAFT_LAYER_PREFIX))
+        for group in kv_cache_groups
+        for layer_name in group.layer_names
+    ):
+        return True
+    return _kimi_k3_pa_nz_from_config(vllm_config)
+
+
+def _kimi_k3_layer_reserved_pages(spec: KVCacheSpec) -> int:
+    """Reserved scratch pages owned by one physical layer."""
+    return max(
+        int(getattr(spec, "flash_mla_reserved_pages", 0) or 0),
+        2 if getattr(spec, "flash_mla_layout", None) == "pa_nz" else 0,
+    )
+
+
+def _kimi_k3_group_page_bytes(group: KVCacheGroupSpec) -> int:
+    """Bytes needed by one scheduler block for every layer in a group."""
+    return sum(_physical_page_size_bytes(spec) for spec in _kv_cache_group_specs(group).values())
+
+
+def _kimi_k3_group_reserved_bytes(group: KVCacheGroupSpec) -> int:
+    return sum(
+        _physical_page_size_bytes(spec) * _kimi_k3_layer_reserved_pages(spec)
+        for spec in _kv_cache_group_specs(group).values()
+    )
+
+
+def _kimi_k3_physical_page_bytes_per_block(
+    kv_cache_groups: list[KVCacheGroupSpec],
+    vllm_config: VllmConfig | None = None,
+) -> int:
+    """Return the largest cache group's bytes per block.
+
+    Hybrid groups alias the same scheduler block IDs from one shared pool. The
+    pool is sized for the largest group, not the sum of every group; the latter
+    over-allocates target/draft/Mamba layouts that can never be live for the
+    same block ID.
+    """
+    del vllm_config
+    if not kv_cache_groups:
+        return 0
+    return max(_kimi_k3_group_page_bytes(group) for group in kv_cache_groups)
+
+
+def _kimi_k3_reserved_pages(
+    kv_cache_groups: list[KVCacheGroupSpec],
+    vllm_config: VllmConfig | None = None,
+) -> int:
+    reserved = 0
+    for group in kv_cache_groups:
+        reserved = max(
+            reserved,
+            max(
+                (
+                    max(
+                        getattr(spec, "flash_mla_reserved_pages", 0),
+                        2 if getattr(spec, "flash_mla_layout", None) == "pa_nz" else 0,
+                    )
+                    for spec in _kv_cache_group_specs(group).values()
+                ),
+                default=0,
+            ),
+        )
+    if reserved == 0 and (
+        _kimi_k3_pa_nz_from_config(vllm_config)
+        or (
+            ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA
+            and any(
+                layer_name.startswith((_KIMI_K3_TARGET_LAYER_PREFIX, _KIMI_K3_DRAFT_LAYER_PREFIX))
+                for group in kv_cache_groups
+                for layer_name in group.layer_names
+            )
+        )
+    ):
+        logger.info(
+            "K3 PA_NZ planner: reserved pages fallback -> 2 (config_pa_nz=%s env=%s)",
+            _kimi_k3_pa_nz_from_config(vllm_config),
+            ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA,
+        )
+        return 2
+    return reserved
+
+
+def _get_kimi_k3_physical_kv_cache_config(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> tuple[int, list[KVCacheTensor]]:
+    """Plan Kimi K3 physical pages inside one shared hybrid pool.
+
+    The generic vLLM planner uses::
+
+        bytes_per_block = max_group(sum(group layer page sizes))
+        num_blocks      = available_memory // bytes_per_block
+
+    Every group aliases that pool from byte 0 because the block pool hands a
+    given scheduler block ID to at most one group at a time. PA_NZ keeps the
+    same budget model; only per-layer page sizes and the reserved scratch pages
+    differ.
+    """
+    group_layouts: list[tuple[KVCacheGroupSpec, list[tuple[str, KVCacheSpec, int, int]], int, int]] = []
+    for group in kv_cache_groups:
+        specs = _kv_cache_group_specs(group)
+        entries: list[tuple[str, KVCacheSpec, int, int]] = []
+        page_bytes = 0
+        reserved_bytes = 0
+        for layer_name in group.layer_names:
+            spec = specs[layer_name]
+            page_size = _physical_page_size_bytes(spec)
+            reserved_pages = _kimi_k3_layer_reserved_pages(spec)
+            entries.append((layer_name, spec, page_size, reserved_pages))
+            page_bytes += page_size
+            reserved_bytes += page_size * reserved_pages
+        group_layouts.append((group, entries, page_bytes, reserved_bytes))
+
+    physical_page_bytes_per_block = max(page_bytes for _, _, page_bytes, _ in group_layouts)
+    assert physical_page_bytes_per_block > 0
+    max_reserved_bytes = max(
+        reserved_bytes
+        for _, _, page_bytes, reserved_bytes in group_layouts
+        if page_bytes == physical_page_bytes_per_block
+    )
+    usable_memory = max(0, available_memory - max_reserved_bytes)
+    num_blocks = usable_memory // physical_page_bytes_per_block
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    pool_size = max(
+        page_bytes * num_blocks + reserved_bytes for _, _, page_bytes, reserved_bytes in group_layouts
+    )
+    logger.info(
+        "K3 PA_NZ planner: num_blocks=%s page_bytes=%s pool_bytes=%s reserved_bytes=%s",
+        num_blocks,
+        physical_page_bytes_per_block,
+        pool_size,
+        max_reserved_bytes,
+    )
+
+    kv_cache_tensors: list[KVCacheTensor] = []
+    for group, entries, page_bytes, _ in group_layouts:
+        logger.info(
+            "K3 PA_NZ planner group: layers=%d page_bytes=%d",
+            len(entries),
+            page_bytes,
+        )
+        offset = 0
+        for layer_name, spec, page_size, reserved_pages in entries:
+            layer_stride = page_size * (num_blocks + reserved_pages)
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=pool_size,
+                    layers=[layer_name],
+                    layer_stride=layer_stride,
+                    block_stride=page_size,
+                    offset=offset,
+                )
+            )
+            offset += layer_stride
+            logger.info(
+                "K3 PA_NZ tensor: layer=%s layout=%s page_bytes=%d "
+                "reserved=%d layer_stride=%d offset=%d",
+                layer_name,
+                _kimi_k3_physical_layout_key(layer_name, spec),
+                page_size,
+                reserved_pages,
+                layer_stride,
+                offset - layer_stride,
+            )
+    logger.info(
+        "Using Kimi K3 shared KV cache pool: groups=%d tensors=%d",
+        len(group_layouts),
+        len(kv_cache_tensors),
+    )
+    return num_blocks, kv_cache_tensors
+
+
 def _get_kimi_k3_dspark_mixed_kv_cache_groups(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec] | None:
@@ -157,6 +391,10 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
     relation. An unrecognized or incompatible signature falls back to vLLM's
     generic hybrid grouping.
     """
+    allow_pa_nz = bool(ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA)
+    draft_spec_types: tuple[type[KVCacheSpec], ...] = (
+        (FullAttentionSpec, SlidingWindowSpec) if allow_pa_nz else (FullAttentionSpec,)
+    )
     target_attention_specs = {
         name: spec
         for name, spec in kv_cache_spec.items()
@@ -165,7 +403,7 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
     draft_attention_specs = {
         name: spec
         for name, spec in kv_cache_spec.items()
-        if name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) and isinstance(spec, FullAttentionSpec)
+        if name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) and isinstance(spec, draft_spec_types)
     }
     mamba_specs = {
         name: spec
@@ -186,9 +424,11 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
     all_specs = [*attention_specs, *mamba_specs.values()]
     # Only attention layers share a scheduler block table. Mamba keeps its
     # own groups and may use max_model_len as block_size when cache_mode=none.
-    if (
-        len({spec.block_size for spec in attention_specs}) != 1
-        or len({spec.page_size_bytes for spec in all_specs}) != 1
+    # PA_NZ target/draft pages have different physical widths; they must still
+    # share one attention group so scheduler block IDs stay paired. The
+    # layout-separated planner below sizes their sum within one shared pool.
+    if len({spec.block_size for spec in attention_specs}) != 1 or (
+        not allow_pa_nz and len({_physical_page_size_bytes(spec) for spec in all_specs}) != 1
     ):
         return None
 
@@ -552,6 +792,8 @@ def _ascend_pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int
         return get_deepseek_v41_pool_bytes_per_block(kv_cache_groups)
     if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
         return get_glm5_next_pool_bytes_per_block(kv_cache_groups)
+    if _is_kimi_k3_pa_nz_groups(kv_cache_groups):
+        return _kimi_k3_physical_page_bytes_per_block(kv_cache_groups)
     if not _is_deepseek_v4_groups(kv_cache_groups):
         return _orig_pool_bytes_per_block(kv_cache_groups)
 
@@ -615,6 +857,18 @@ def _ascend_get_kv_cache_config_from_groups(
         kv_cache_config = get_deepseek_v41_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
     elif _get_glm5_next_cache_layout(kv_cache_groups) is not None:
         kv_cache_config = get_glm5_next_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
+    elif _is_kimi_k3_pa_nz_groups(kv_cache_groups, vllm_config):
+        num_blocks, kv_cache_tensors = _get_kimi_k3_physical_kv_cache_config(
+            vllm_config,
+            kv_cache_groups,
+            available_memory,
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=kv_cache_groups,
+            prefix_cache_retention_interval=vllm_config.cache_config.prefix_cache_retention_interval,
+        )
     elif not _is_deepseek_v4_groups(kv_cache_groups):
         kv_cache_config = _orig_get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, available_memory)
     else:
