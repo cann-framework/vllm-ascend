@@ -1919,6 +1919,22 @@ def _reshape_kv_cache_v2(
                     if kv_cache_spec.page_size_padded is not None
                     else kv_cache_spec.page_size_bytes
                 )
+                layer_specs = _get_layer_kv_cache_specs(kv_cache_config)
+                if any(getattr(spec, "flash_mla_layout", None) == "pa_nz" for spec in layer_specs.values()):
+                    reserved_pages = max(
+                        (getattr(spec, "flash_mla_reserved_pages", 0) for spec in layer_specs.values()),
+                        default=0,
+                    )
+                    physical_page_bytes = total_bytes // (
+                        kv_cache_config.num_blocks + reserved_pages
+                    )
+                    if (
+                        physical_page_bytes > 0
+                        and total_bytes
+                        % (kv_cache_config.num_blocks + reserved_pages)
+                        == 0
+                    ):
+                        page_stride_bytes = physical_page_bytes
 
             if total_bytes % page_stride_bytes:
                 raise ValueError(f"KV cache for {layer_name} is not a whole number of pages.")
