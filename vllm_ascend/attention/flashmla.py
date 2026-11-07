@@ -31,6 +31,11 @@ FLASHMLA_MASK_SIZE = 2048
 FLASHMLA_MAX_BATCH_SIZE = 65535
 
 
+def _pa_nz_mask_mode(q_len: int, configured_mask_mode: int) -> int:
+    """Decode always uses no-mask; multi-token history keeps the adapter mode."""
+    return 0 if q_len == 1 else configured_mask_mode
+
+
 def prepare_flashmla_batch_req_state(
     batch_state: "BatchReqState", uniform_token_count: int | None
 ) -> tuple["BatchReqState", int | None]:
@@ -296,14 +301,15 @@ class PaNzFlashMLAImpl:
         q_len: int = 1,
     ) -> torch.Tensor:
         _check_lengths(cache_seqlens, cu_seqlens_q, seqused_q)
+        q_len = max(1, q_len)
         return self.ops.flash_mla_metadata(
             cache_seqlens,
             num_heads_q=self.config.num_heads,
             cu_seqlens_q=cu_seqlens_q,
-            q_len=max(1, q_len),
+            q_len=q_len,
             head_dim_qk=FLASHMLA_QK_DIM,
             head_dim_v=FLASHMLA_V_DIM,
-            mask_mode=0 if q_len == 1 else 3,
+            mask_mode=_pa_nz_mask_mode(q_len, self.config.mask_mode),
             seqused_q=seqused_q,
         )
 
@@ -328,6 +334,7 @@ class PaNzFlashMLAImpl:
             raise ValueError("PA_NZ FlashMLA requires BF16 q")
         if q_len is None:
             q_len = max(1, int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())) if cu_seqlens_q.numel() > 1 else 1
+        q_len = max(1, q_len)
         output, lse = self.ops.flash_mla_with_kvcache(
             q,
             k_cache,
@@ -341,6 +348,7 @@ class PaNzFlashMLAImpl:
             metadata=metadata,
             seqused_q=seqused_q,
             return_softmax_lse=self.config.return_softmax_lse,
+            mask_mode=_pa_nz_mask_mode(q_len, self.config.mask_mode),
         )
         if self.config.return_softmax_lse:
             if lse is None:

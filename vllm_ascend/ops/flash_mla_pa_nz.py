@@ -280,9 +280,13 @@ def flash_mla_with_kvcache(
     metadata: torch.Tensor | None = None,
     seqused_q: torch.Tensor | None = None,
     return_softmax_lse: bool = False,
+    mask_mode: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """Run BF16 FlashMLA against the merged PA_NZ latent cache."""
-    mask_mode = _MASK_MODE_NONE if q_len == 1 else _MASK_MODE_CAUSAL
+    if mask_mode is None:
+        mask_mode = _MASK_MODE_NONE if q_len == 1 else _MASK_MODE_CAUSAL
+    if mask_mode == _MASK_MODE_CAUSAL and attn_mask is None:
+        raise ValueError("FlashMLA mask_mode=3 requires attn_mask")
     if metadata is None:
         metadata = flash_mla_metadata(
             cache_seqlens,
