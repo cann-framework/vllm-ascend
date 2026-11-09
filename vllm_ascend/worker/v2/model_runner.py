@@ -54,7 +54,9 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     MoECommType,
+    _is_kv_consumer_only,
     get_mc2_tokens_capacity,
+    log_kimi_v2_megamoe_config,
     override_mrv2_in_profile_run,
     select_moe_comm_method,
     set_mc2_mask,
@@ -305,6 +307,7 @@ class NPUModelRunner(GPUModelRunner):
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         aux_layers = get_pd_dspark_aux_layer_ids(self.vllm_config)
         super().load_model(load_dummy_weights, *args, **kwargs)
+        log_kimi_v2_megamoe_config(self.vllm_config)
         self.pd_dspark_aux_layer_ids = aux_layers
         # In cudagraph modes the dumper must be started before graph capture so
         # that aclgraph capture/replay is instrumented (v1 parity: v1 starts
@@ -643,8 +646,7 @@ class NPUModelRunner(GPUModelRunner):
                 is_profile=is_profile or getattr(self.input_buffers, "profile_cpp", False),
                 allow_megamoe=not self._finegrained_tp_requires_graph,
             )
-            if uses_kimi_prefill_megamoe(self.vllm_config)
-            and not getattr(self.vllm_config.kv_transfer_config, "is_kv_consumer", False)
+            if uses_kimi_prefill_megamoe(self.vllm_config) and not _is_kv_consumer_only(self.vllm_config)
             else nullcontext()
         )
         with dp_coordination_context, moe_context:

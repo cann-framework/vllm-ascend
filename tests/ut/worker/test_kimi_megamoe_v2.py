@@ -154,6 +154,8 @@ class TestKimiMegaMoEV2(unittest.TestCase):
             {
                 "MoECommType",
                 "_is_kimi_moe_model",
+                "_is_kv_consumer_only",
+                "log_kimi_v2_megamoe_config",
                 "uses_kimi_prefill_megamoe",
                 "_kimi_megamoe_weights_supported",
                 "use_cann_megamoe",
@@ -473,6 +475,67 @@ class TestKimiMegaMoEV2(unittest.TestCase):
         parent.execute_model.side_effect = execute
         runner.execute_model(NS(total_num_scheduled_tokens=1, num_scheduled_tokens={"request": 1}))
         self.collective.assert_not_called()
+
+    def test_kv_both_prefill_is_not_treated_as_a_decode_only_instance(self):
+        runner, parent = self.make_runner()
+        self.config.kv_transfer_config = NS(is_kv_consumer=True, is_kv_producer=True, kv_role="kv_both")
+        scheduled = NS(total_num_scheduled_tokens=1, num_scheduled_tokens={"request": 1})
+        methods = []
+        for prefill in (True, False):
+            parent.gather_batch_req_state.return_value = (
+                NS(num_tokens=1, is_prefilling_np=NS(all=lambda prefill=prefill: prefill)),
+                None,
+            )
+
+            def execute(*args, **kwargs):
+                runner.gather_batch_req_state(scheduled, False)
+                desc, sync = self.ns["dispatch_cg_and_sync_dp"](None, 1, 1, 1, 1, 0)
+                methods.append(self.forward_context(desc.num_tokens, sync, desc.cg_mode)["moe_comm_type"].name)
+
+            parent.execute_model.side_effect = execute
+            runner.execute_model(scheduled)
+        self.assertEqual(methods, ["FUSED_MC2", "MC2"])
+
+    def test_kv_role_classification(self):
+        for role in ("kv_producer", "kv_consumer", "kv_both"):
+            with self.subTest(role=role):
+                self.config.kv_transfer_config = NS(kv_role=role)
+                self.assertEqual(self.ns["_is_kv_consumer_only"](self.config), role == "kv_consumer")
+        self.config.kv_transfer_config = NS(is_kv_consumer=True, is_kv_producer=True)
+        self.assertFalse(self.ns["_is_kv_consumer_only"](self.config))
+
+    def test_loaded_config_diagnostic_reports_actual_quantization_and_runtime(self):
+        for layouts, available, supported in (
+            (frozenset((self.ns["QuantType"].W4A8MXFP,)), True, True),
+            (frozenset((self.ns["QuantType"].W4A8,)), True, False),
+            (None, True, False),
+            (frozenset((self.ns["QuantType"].W4A8MXFP,)), False, True),
+        ):
+            with self.subTest(layouts=layouts, available=available):
+                self.config.model_config._ascend_kimi_moe_quant_types = layouts
+                self.ns["is_mega_moe_supported"] = lambda available=available: available
+                self.ns["log_kimi_v2_megamoe_config"](self.config)
+                message, *arguments = self.ns["logger"].info.call_args.args
+                output = message % tuple(arguments)
+                self.assertIn(f"runtime_available={available}", output)
+                self.assertIn(f"weights_supported={supported}", output)
+                self.assertIn(f"capable={available and (layouts is None or supported)}", output)
+                self.assertIn(f"layouts={sorted(layout.name for layout in layouts or ())}", output)
+
+    def test_phase_diagnostic_reports_eligibility_and_padding_rejection(self):
+        for capacity, allow_megamoe, reason in ((64, False, "ineligible_rank"), (7, True, "token_capacity_or_padding")):
+            with self.subTest(reason=reason):
+                self.capacity = capacity
+                with self.state.v2_moe_batch_context(
+                    self.config, 8, dummy_run=False, is_profile=False, allow_megamoe=allow_megamoe
+                ):
+                    self.record([True], 8)
+                    state = self.ns["_sync_v2_moe_phase"](8, 1, 0, False)
+                    self.assertFalse(state.prefill_ready)
+                    self.ns["logger"].info_once.assert_called_with("Kimi V2 MegaMoE phase agreement: %s", reason)
+                    details = self.ns["logger"].debug.call_args.args
+                    self.assertEqual(details[-1], reason)
+                    self.assertEqual(details[-2], 8)
 
     def test_cpp_dummy_profiles_the_prefill_backend(self):
         runner, parent = self.make_runner()

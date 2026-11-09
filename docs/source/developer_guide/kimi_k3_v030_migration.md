@@ -221,7 +221,7 @@ considered so capture cannot accidentally select MegaMoE.
 | Pure Decode + idle dummy | Ordinary MoE | Common supported graph mode |
 | Decode graph capture | Ordinary MoE | Requested capture mode |
 | MRv2 coordinated pure prefill + idle dummy | MegaMoE if otherwise supported | NONE on all peers |
-| MRv2 uncoordinated/draft forward, or KV consumer | Ordinary MoE | Existing runner policy |
+| MRv2 uncoordinated/draft forward, or consumer-only instance | Ordinary MoE | Existing runner policy |
 
 A prefill is detected from computed versus prompt tokens, not from token
 count alone. One-token/chunked prefill therefore cannot accidentally reuse a
@@ -238,7 +238,10 @@ stages in `gather_batch_req_state`. Its existing dispatch patch exchanges
 real-work, Decode, profiling, eligibility and capacity metadata in one extra
 CPU-group all-reduce before upstream graph/DP coordination. This collective
 also runs on idle peers; it cannot be conditional on local Prefill alone.
-KV consumers retain their existing coordination without this extra collective.
+Consumer-only instances retain their existing coordination without this extra
+collective. A `kv_both` instance can produce and consume KV; its actual batch
+phase determines eligibility. Pure Prefill can use MegaMoE, while Decode and
+mixed batches continue to use ordinary MoE.
 Supported pure Prefill forces eager execution and pads the runner descriptor
 and DP token vector to the same TP-aligned count. Real token counts remain
 separate for mask construction, KV metadata and sampling. Missing phase data,
@@ -268,6 +271,33 @@ This covers real CPU collectives, unequal scheduled counts, an idle peer and
 the padded MegaMoE numerical reference; complete model accuracy, PP/DCP,
 long-running request transitions and latency still require deployment tests.
 Independent P and D instances make decisions in their own communication domains.
+
+To diagnose a missing MegaMoE call, inspect the `Kimi V2 MegaMoE config` INFO
+line emitted after model loading. It reports the normalized fused-MC2 setting,
+operator availability, hardware support, actual registered routed layouts,
+group size, EP/PCP sizes and KV role. An internal `fused_mc2=1` is expected
+after the user's `enable_fused_mc2=2` is normalized. Kimi's A5 path requires
+`W4A8MXFP`; an ordinary INT4/INT8 `W4A8` checkpoint does not meet this layout
+contract and must not be enabled by relaxing the selector.
+The `capable` flag alone does not prove execution: unknown layouts may reserve
+capacity before loading, while runtime selection also requires supported
+weights and an agreed Prefill phase.
+
+The INFO phase decision distinguishes `ready`, `decode_or_unknown_phase`,
+`ineligible_rank` and `token_capacity_or_padding`. The separate
+`Kimi V2 MoE selection` line reports the chosen backend and forward-context
+phase/graph state. Set the existing `VLLM_LOGGING_LEVEL=DEBUG` before restarting
+workers for per-batch local/peer metadata, the graph-required eligibility flag,
+microbatching, PCP and aligned token counts. Filter worker output with:
+
+```bash
+rg 'Kimi V2 MegaMoE|Kimi V2 MoE selection' worker.log
+```
+
+The initial regression suite missed the `kv_both` producer/consumer combination:
+its Prefill was incorrectly excluded at context creation, phase agreement and
+backend selection. A regression now executes the runner hooks across Prefill
+and Decode on that role and verifies `FUSED_MC2` followed by ordinary `MC2`.
 
 ## Validation
 

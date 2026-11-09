@@ -7,11 +7,13 @@ from dataclasses import replace
 import torch
 import torch.distributed as dist
 from vllm.distributed import get_dp_group
+from vllm.logger import logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as upstream
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp as _dispatch_cg_and_sync_dp
 
 from vllm_ascend.ascend_forward_context import (
+    _is_kv_consumer_only,
     _kimi_megamoe_weights_supported,
     get_mc2_tokens_capacity,
     use_cann_megamoe,
@@ -36,7 +38,7 @@ def _sync_v2_moe_phase(num_tokens, dp_size, dp_rank, allow_ubatching):
         state.allow_megamoe
         and not allow_ubatching
         and parallel.prefill_context_parallel_size == 1
-        and not getattr(getattr(vllm_config, "kv_transfer_config", None), "is_kv_consumer", False)
+        and not _is_kv_consumer_only(vllm_config)
         and use_cann_megamoe(vllm_config)
         and _kimi_megamoe_weights_supported(vllm_config)
     )
@@ -50,7 +52,29 @@ def _sync_v2_moe_phase(num_tokens, dp_size, dp_rank, allow_ubatching):
         peers = metadata.tolist()
     else:
         peers = [list(local)]
-    return agree_v2_moe_batch(peers, parallel.tensor_parallel_size)
+    agreed = agree_v2_moe_batch(peers, parallel.tensor_parallel_size)
+    if agreed.prefill_ready:
+        reason = "ready"
+    elif agreed.batch_contains_decode:
+        reason = "decode_or_unknown_phase"
+    elif not all(V2MoEPhaseMetadata(*peer).eligible for peer in peers):
+        reason = "ineligible_rank"
+    else:
+        reason = "token_capacity_or_padding"
+    logger.info_once("Kimi V2 MegaMoE phase agreement: %s", reason)
+    logger.debug(
+        "Kimi V2 MegaMoE phase: rank=%s, local=%s, peers=%s, allow_megamoe=%s, "
+        "allow_ubatching=%s, pcp_size=%s, padded_tokens=%s, decision=%s",
+        dp_rank,
+        local,
+        peers,
+        state.allow_megamoe,
+        allow_ubatching,
+        parallel.prefill_context_parallel_size,
+        agreed.padded_num_tokens,
+        reason,
+    )
+    return agreed
 
 
 # TODO: Remove once upstream GPUModelRunner dispatches sharded PCP decode with

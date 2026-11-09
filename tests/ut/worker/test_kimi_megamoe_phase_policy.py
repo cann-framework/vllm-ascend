@@ -45,6 +45,7 @@ def load_policy():
         "set_mc2_tokens_capacity",
         "register_kimi_moe_quant_type",
         "_is_kimi_moe_model",
+        "_is_kv_consumer_only",
         "_kimi_megamoe_weights_supported",
     }
     nodes += [

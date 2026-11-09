@@ -92,6 +92,14 @@ def _kimi_megamoe_weights_supported(vllm_config: VllmConfig, *, allow_unknown: b
     )
 
 
+def _is_kv_consumer_only(vllm_config: VllmConfig) -> bool:
+    kv_config = getattr(vllm_config, "kv_transfer_config", None)
+    role = getattr(kv_config, "kv_role", None)
+    if role is not None:
+        return role == "kv_consumer"
+    return bool(getattr(kv_config, "is_kv_consumer", False) and not getattr(kv_config, "is_kv_producer", False))
+
+
 def _is_decode_only_node(vllm_config: VllmConfig) -> bool:
     kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
     if kv_transfer_config is None:
@@ -162,6 +170,29 @@ def uses_kimi_prefill_megamoe(vllm_config: VllmConfig) -> bool:
         and get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP)
         and get_ascend_config().enable_fused_mc2 == 1
         and is_mega_moe_supported()
+    )
+
+
+def log_kimi_v2_megamoe_config(vllm_config: VllmConfig) -> None:
+    """Report loaded-model gates once, before profiling or real requests."""
+    if not _is_kimi_moe_model(vllm_config):
+        return
+    description = getattr(getattr(vllm_config, "quant_config", None), "quant_description", None)
+    group_size = description.get("group_size", _KIMI_MEGA_MOE_GROUP_SIZE) if isinstance(description, dict) else None
+    layouts = getattr(vllm_config.model_config, "_ascend_kimi_moe_quant_types", None) or ()
+    logger.info(
+        "Kimi V2 MegaMoE config: fused_mc2=%s, runtime_available=%s, hardware_mxfp=%s, "
+        "capable=%s, weights_supported=%s, layouts=%s, group_size=%s, ep_size=%s, pcp_size=%s, kv_role=%s",
+        get_ascend_config().enable_fused_mc2,
+        is_mega_moe_supported(),
+        get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP),
+        use_cann_megamoe(vllm_config),
+        _kimi_megamoe_weights_supported(vllm_config),
+        sorted(layout.name for layout in layouts),
+        group_size,
+        get_ep_group().world_size,
+        vllm_config.parallel_config.prefill_context_parallel_size,
+        getattr(getattr(vllm_config, "kv_transfer_config", None), "kv_role", None),
     )
 
 
@@ -497,7 +528,7 @@ def select_moe_comm_method(
             getattr(vllm_config, "use_v2_model_runner", False)
             and (not v2_prefill_ready or batch_contains_decode is None)
         )
-        or getattr(getattr(vllm_config, "kv_transfer_config", None), "is_kv_consumer", False)
+        or _is_kv_consumer_only(vllm_config)
     ):
         # Metadata=None is only for model construction/profile capacity
         # estimation. Runtime callers pass an explicit synchronized phase.
@@ -521,6 +552,14 @@ def select_moe_comm_method(
             mc2_tokens_capacity,
             is_draft_model,
             draft_moe_quant_type,
+        )
+    if getattr(vllm_config, "use_v2_model_runner", False) and _is_kimi_moe_model(vllm_config):
+        logger.info_once(
+            "Kimi V2 MoE selection: method=%s, contains_decode=%s, graph_mode=%s, prefill_ready=%s",
+            moe_comm_type,
+            batch_contains_decode,
+            aclgraph_runtime_mode,
+            v2_prefill_ready,
         )
     logger.debug(
         "MoE comm method selected: policy=%s, method=%s, num_tokens=%d, mc2_capacity=%s, "
