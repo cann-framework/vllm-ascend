@@ -877,51 +877,6 @@ class MooncakePullRecvingThread(threading.Thread):
                         f"local={local_kernel_block_size}, remote={remote_kernel_block_size}"
                     )
 
-                # A producer without DCP owns one full copy of every prompt
-                # block. Each local DCP rank needs that whole block for its
-                # replicated MLA history; using the shard formula below would
-                # advance the remote block index by local_dcp_rank and drop
-                # every rank except DCP0 (rank k asks for remote block k while
-                # the producer has only one block). Replicate the producer
-                # block sequence instead of sharding it.
-                if remote_dcp_size == 1:
-                    local_kernel_block_ids = self._expand_block_ids(
-                        local_group_block_ids,
-                        local_block_size_scale,
-                    )
-                    remote_kernel_block_ids = self._expand_block_ids(
-                        remote_group_block_ids,
-                        remote_block_size_scale,
-                    )
-                    remote_start_block_idx = num_computed_tokens // local_kernel_block_size
-                    remote_kernel_block_ids = remote_kernel_block_ids[remote_start_block_idx:]
-                    num_kernel_blocks = min(len(local_kernel_block_ids), len(remote_kernel_block_ids))
-                    if num_kernel_blocks <= 0:
-                        return []
-                    local_kernel_block_ids = local_kernel_block_ids[:num_kernel_blocks]
-                    remote_kernel_block_ids = remote_kernel_block_ids[:num_kernel_blocks]
-                    logger.info(
-                        "[MooncakeV2][dcp-replicate] req=%s local_dcp_rank=%d local_dcp=%d "
-                        "logical_local=%s logical_remote=%s local_kernel=%s remote_kernel=%s",
-                        request_id,
-                        local_dcp_rank,
-                        self.dcp_size,
-                        local_group_block_ids,
-                        remote_group_block_ids,
-                        local_kernel_block_ids,
-                        remote_kernel_block_ids,
-                    )
-                    return [
-                        (
-                            candidate_tp_ranks[0]
-                            if len(candidate_tp_ranks) == 1
-                            else self._select_remote_tp_rank(candidate_tp_ranks, selection_index),
-                            local_kernel_block_ids,
-                            remote_kernel_block_ids,
-                        )
-                        for candidate_tp_ranks in remote_tp_rank_groups
-                    ]
-
                 local_virtual_block_size = local_block_size * local_dcp_size
                 remote_virtual_block_size = remote_block_size * remote_dcp_size
                 local_start_block_idx = num_computed_tokens // local_virtual_block_size
