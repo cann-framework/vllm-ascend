@@ -355,18 +355,6 @@ class MooncakePullRecvingThread(threading.Thread):
             fixed_total_num_kv_heads = 1
         elif isinstance(spec, MLAAttentionSpec):
             local_dcp_size = self.dcp_size
-            # The producer has no DCP shard dimension for MLA. A full P cache
-            # must therefore be replicated into every local DCP rank; using the
-            # local DCP size here makes the block mapper assign only rank 0 and
-            # leaves the other ranks with an empty transfer list.
-            if local_dcp_size > 1 and remote_dcp_size == 1:
-                logger.info(
-                    "[MooncakeV2][dcp] replicate MLA layer=%s local_dcp=%d remote_dcp=%d",
-                    self.layer_names[local_layer_index],
-                    local_dcp_size,
-                    remote_dcp_size,
-                )
-                local_dcp_size = 1
             local_num_kv_heads = remote_num_kv_heads = 1
             fixed_total_num_kv_heads = 1
         # For FA or SWA with kv_heads > 1, must use HND kv_cache layout.
@@ -412,8 +400,6 @@ class MooncakePullRecvingThread(threading.Thread):
     ) -> tuple[int, int]:
         """Use TP head shards for multi-head FA when PCP is disabled."""
         if isinstance(spec, MLAAttentionSpec):
-            if self.dcp_size > 1 and remote_dcp_size == 1:
-                return 1, 1
             return self.dcp_size, remote_dcp_size
         local_heads = self.block_shapes[local_layer_index][0][0]
         remote_heads = remote_metadata.block_shapes[remote_layer_index][0][0]
