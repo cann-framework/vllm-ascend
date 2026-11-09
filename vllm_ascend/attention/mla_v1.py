@@ -3486,11 +3486,12 @@ class AscendMLAImpl(MLAAttentionImpl):
         block_size = merged_cache.shape[1]
         hidden_page = merged_cache.shape[0] - reserved_pages if reserved_pages else None
         scratch_page = merged_cache.shape[0] - 1 if reserved_pages else None
-        if not self._logged_pa_nz_decode:
+        probe_decode_layer = self.layer_name.endswith(".layers.3.self_attn.attn")
+        if not self._logged_pa_nz_decode or (probe_decode_layer and not _EXTRA_CTX.capturing):
             logger.info(
                 "[PA_NZ] decode layer=%s tokens=%d actual=%d decodes=%d q_len=%d cache=%s block=%d "
                 "reserved=%d hidden_page=%s scratch_page=%s prolog_slots=%s async=%s dcp=%s "
-                "cp_interleave=%s block_table_head=%s cache_lens_head=%s prolog_slots_head=%s",
+                "dcp_rank=%s cp_interleave=%s block_table_head=%s cache_lens_head=%s prolog_slots_head=%s",
                 self.layer_name,
                 num_decode_tokens,
                 attn_metadata.num_actual_tokens,
@@ -3504,6 +3505,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 flash.prolog_slots is not None,
                 flash.metadata_async,
                 self.dcp_enabled,
+                getattr(self, "dcp_rank", None),
                 getattr(self.vllm_config.parallel_config, "cp_kv_cache_interleave_size", None),
                 flash.block_table[:2, :8].to(torch.int64).tolist() if flash.block_table is not None else None,
                 flash.cache_lens[:4].to(torch.int64).tolist() if flash.cache_lens is not None else None,
