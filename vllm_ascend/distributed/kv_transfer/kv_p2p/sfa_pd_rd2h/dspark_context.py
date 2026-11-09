@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.distributed.kv_transfer import get_kv_transfer_group
+from vllm.logger import logger
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.spec_decode.dspark_utils import get_dspark_aux_layer_ids
@@ -352,6 +353,13 @@ class DSparkContextReceiver:
             if len(self._contexts) >= self.max_requests:
                 raise RuntimeError("DSpark context request capacity exhausted")
             self._contexts[descriptor.request_id] = _ContextProgress(descriptor)
+            logger.info(
+                "[DSpark][ctx] register req=%s generation=%s prompt=%d aux=%s",
+                descriptor.request_id,
+                descriptor.generation,
+                descriptor.prompt_tokens,
+                descriptor.aux_layer_ids,
+            )
 
     def get_descriptor(self, request_id: str) -> DSparkContextDescriptor | None:
         # The network reader may inspect request admission, but it never owns
@@ -391,6 +399,12 @@ class DSparkContextReceiver:
             if state.initialized_tokens:
                 raise ValueError("Direct DSpark KV transfer cannot overlap another initialization path")
             state.in_flight = True
+            logger.info(
+                "[DSpark][ctx] reserve req=%s generation=%s prompt=%d",
+                descriptor.request_id,
+                descriptor.generation,
+                descriptor.prompt_tokens,
+            )
             return DSparkContextSubmission.ACCEPTED, True
 
     def finish_direct_transfer(self, descriptor: DSparkContextDescriptor, *, success: bool) -> None:
@@ -404,8 +418,19 @@ class DSparkContextReceiver:
             state.in_flight = False
             if not success:
                 state.failed = True
+                logger.error(
+                    "[DSpark][ctx] finish failed req=%s generation=%s",
+                    descriptor.request_id,
+                    descriptor.generation,
+                )
                 return
             state.initialized_tokens = descriptor.prompt_tokens
+            logger.info(
+                "[DSpark][ctx] finish req=%s generation=%s tokens=%d",
+                descriptor.request_id,
+                descriptor.generation,
+                descriptor.prompt_tokens,
+            )
 
     def mark_target_kv_done(self, request_id: str, generation: str) -> None:
         self._require_owner()
@@ -418,7 +443,7 @@ class DSparkContextReceiver:
         """Local readiness only; the connector must still join all D TP ranks."""
         self._require_owner()
         with self._lock:
-            return {
+            ready = {
                 req_id
                 for req_id, state in self._contexts.items()
                 if state.target_kv_done
@@ -426,6 +451,9 @@ class DSparkContextReceiver:
                 and not state.in_flight
                 and state.initialized_tokens == state.descriptor.prompt_tokens
             }
+            if ready:
+                logger.info("[DSpark][ctx] ready reqs=%s", sorted(ready))
+            return ready
 
     def retire_ready_request(self, request_id: str, generation: str) -> None:
         """Release ingress bookkeeping after every TP rank joined readiness.
@@ -559,6 +587,13 @@ def initialize_draft_context_chunk(
         block_sizes_by_group=block_sizes_by_group,
         layer_group_ids=layer_group_ids,
         device=device,
+    )
+    logger.info(
+        "[DSpark][ctx] local chunk req=%s generation=%s offset=%d tokens=%d",
+        chunk.descriptor.request_id,
+        chunk.descriptor.generation,
+        chunk.token_offset,
+        chunk.num_tokens,
     )
     model.precompute_and_store_context_kv(context_states, context_positions, slots)
     torch.npu.current_stream(device).synchronize()

@@ -136,7 +136,7 @@ class SFAPDRD2HProducerScheduler:
         )
         self._reqs_need_send_layerwise[request.request_id] = send_req_info
 
-        logger.debug(
+        logger.info(
             "SFAPD P register remote-decode req %s: local_block_ids=%s, "
             "remote_host=%s, remote_port=%s, remote_tp_size=%s, "
             "remote_cached_tokens=%s",
@@ -193,7 +193,7 @@ class SFAPDRD2HProducerScheduler:
                 local_computed_tokens=send_req_info.local_computed_tokens,
                 local_transed_tokens=send_req_info.local_transferred_tokens,
             )
-            logger.debug(
+            logger.info(
                 "SFAPD P add transfer task req %s: local_block_ids=%s, "
                 "local_transed_tokens=%s, local_computed_tokens=%s, "
                 "remote_cache_tokens=%s, prompt_len=%s, chunk_finish=%s, "
@@ -395,6 +395,7 @@ class SFAPDRD2HScheduler:
             self._dspark_pending_recv.add(request.request_id)
         self._reqs_need_recv.add(request.request_id)
         allocator = getattr(self, "_copy_sfa_slot_allocator", None)
+        pool_slot = None
         if allocator is not None:
             kv_tokens = request.num_computed_tokens + num_external_tokens
             if kv_tokens <= 0:
@@ -411,6 +412,18 @@ class SFAPDRD2HScheduler:
                 tail_block_index,
                 kv_tokens,
                 dense,
+            )
+            logger.info(
+                "[SFA][request] D req=%s slot=%s dense=%s tail_tokens=%s kv_tokens=%s "
+                "main_blocks=%s indexer_blocks=%s dspark=%s",
+                request.request_id,
+                pool_slot,
+                dense,
+                tail_tokens,
+                kv_tokens,
+                main_block_ids,
+                indexer_block_ids,
+                dspark_context_descriptor is not None,
             )
 
         # Notify P via the metaserver rendezvous that D is ready to pull this
@@ -447,7 +460,7 @@ class SFAPDRD2HScheduler:
                 url=metaserver,
                 message=kv_transfer_params,
             )
-        logger.debug(
+        logger.info(
             "SFAPDRD2H D advertised req %s: indexer_hbm_ids=%s, "
             "main_cpu_ids=%s, remote_host=%s, remote_port=%s, metaserver=%s",
             request.request_id,
