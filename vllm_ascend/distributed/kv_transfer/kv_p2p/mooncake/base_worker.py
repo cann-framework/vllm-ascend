@@ -358,6 +358,17 @@ class MooncakeBaseConnectorWorker:
                 block_lens_per_layer.append(block_lens)
                 block_shapes_per_layer.append(block_shapes)
                 block_size_scales_per_layer.append(block_size_scales)
+                logger.info(
+                    "[MooncakeV2][register] layer=%s num_blocks=%d base=%s "
+                    "stride=%s len=%s shape=%s scale=%s",
+                    layer_name,
+                    self.num_blocks,
+                    base_addrs,
+                    block_strides,
+                    block_lens,
+                    block_shapes,
+                    block_size_scales,
+                )
 
         unexpected_layers = kv_caches.keys() - configured_layer_names
         if unexpected_layers:

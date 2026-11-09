@@ -161,6 +161,11 @@ class MooncakePullRecvingThread(threading.Thread):
             except queue.Empty:
                 return results
             results.finished_recving.add(request_id)
+            logger.info(
+                "[MooncakeV2][result] req=%s failed=%s",
+                request_id,
+                failed,
+            )
             if failed:
                 results.failed_recving.add(request_id)
 
@@ -691,6 +696,19 @@ class MooncakePullRecvingThread(threading.Thread):
                         local_dcp_size,
                     )
                     request_block_ids_by_spec[cache_key] = transfer_block_ids
+                    if local_layer_index == layer_pairs[0][0]:
+                        logger.info(
+                            "[MooncakeV2][req] req=%s spec=%s local_layer=%d remote_layer=%d "
+                            "selection=%d local_scale=%d remote_scale=%d entries=%s",
+                            request_id,
+                            type(spec).__name__,
+                            local_layer_index,
+                            remote_layer_index,
+                            selection_index,
+                            self.block_size_scales[local_layer_index][0],
+                            remote_metadata.block_size_scales[remote_layer_index][0],
+                            transfer_block_ids,
+                        )
 
                 for remote_worker_rank, local_block_ids, remote_block_ids in transfer_block_ids:
                     remote_tp_rank, remote_pcp_rank = divmod(
@@ -716,7 +734,14 @@ class MooncakePullRecvingThread(threading.Thread):
     @staticmethod
     def _select_remote_tp_rank(candidate_tp_ranks: list[int], selection_index: int) -> int:
         """Select a replicated producer TP rank using round-robin."""
-        return candidate_tp_ranks[selection_index % len(candidate_tp_ranks)]
+        selected = candidate_tp_ranks[selection_index % len(candidate_tp_ranks)]
+        logger.info(
+            "[MooncakeV2][select] candidates=%s selection=%d selected=%d",
+            candidate_tp_ranks,
+            selection_index,
+            selected,
+        )
+        return selected
 
     def _compute_group_block_ids(
         self,
