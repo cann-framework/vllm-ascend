@@ -3447,6 +3447,29 @@ class AscendMLAImpl(MLAAttentionImpl):
         return decode_q_nope, decode_q_pe
 
     @staticmethod
+    def _gather_pa_nz_rows(cache: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+        """Gather complete token rows from the physical PA_NZ tile layout."""
+        from vllm_ascend.ops.flash_mla_pa_nz import pa_nz_tile_indices  # noqa: PLC0415
+
+        tile_count = cache.shape[-1] // 16
+        tile_indices = pa_nz_tile_indices(slots.to(torch.int64), cache.shape[1], tile_count)
+        rows = cache.view(-1, 16).index_select(0, tile_indices)
+        return rows.view(slots.numel(), tile_count, 16).reshape(slots.numel(), cache.shape[-1])
+
+    @staticmethod
+    def _scatter_pa_nz_rows(cache: torch.Tensor, slots: torch.Tensor, rows: torch.Tensor) -> None:
+        """Scatter complete token rows into the physical PA_NZ tile layout."""
+        from vllm_ascend.ops.flash_mla_pa_nz import pa_nz_tile_indices  # noqa: PLC0415
+
+        tile_count = rows.shape[-1] // 16
+        tile_indices = pa_nz_tile_indices(slots.to(torch.int64), cache.shape[1], tile_count)
+        torch_npu.npu_scatter_nd_update_(
+            cache.view(-1, 16),
+            tile_indices.view(-1, 1),
+            rows.reshape(-1, 16),
+        )
+
+    @staticmethod
     def _extend_pa_nz_cache(cache: torch.Tensor, reserved_pages: int) -> torch.Tensor:
         if reserved_pages <= 0:
             return cache
@@ -3549,6 +3572,18 @@ class AscendMLAImpl(MLAAttentionImpl):
             cache_indices = flash.prolog_slots[:num_decode_tokens].to(torch.int64)
         else:
             cache_indices = flash.slots[:num_decode_tokens].to(torch.int64).clamp_min(0)
+        use_current_workspace = self.dcp_enabled and flash.current is not None
+        if use_current_workspace:
+            assert flash.current is not None
+            # The DCP current chunk is replicated on every rank and is independent
+            # of this rank's slot ownership. Writing it through the history slots
+            # would use -1 on non-owner ranks and feed the PROLOG/current read with
+            # unrelated cache rows.
+            prolog_cache = flash.current.cache
+            prolog_slots = torch.arange(num_decode_tokens, dtype=torch.int64, device=hidden_states.device)
+        else:
+            prolog_cache = merged_cache
+            prolog_slots = cache_indices
         q, *_ = mla_prolog_no_rope(
             hidden_states[:num_decode_tokens],
             self.weight_dq,
@@ -3557,8 +3592,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             self.weight_dkv_kr,
             self.flash_gamma_qa,
             self.flash_gamma_kva,
-            merged_cache,
-            cache_indices,
+            prolog_cache,
+            prolog_slots,
             self.q_a_layernorm.variance_epsilon,
         )
         q = q.view(num_decode_tokens, self.flash_total_heads, -1)
@@ -3583,15 +3618,28 @@ class AscendMLAImpl(MLAAttentionImpl):
             q_pe = q[..., self.kv_lora_rank :]
             history_q_nope, history_q_pe = self.reorg_decode_q(q_nope, q_pe)
             current_k_nope = current_k_pe = None
-            if flash.current is not None:
-                flat_cache = merged_cache.reshape(-1, merged_cache.shape[-1])
-                current_rows = flat_cache.index_select(0, cache_indices)
+            if use_current_workspace:
+                assert flash.current is not None
+                current_rows = self._gather_pa_nz_rows(prolog_cache, prolog_slots)
                 current_k_nope = current_rows[..., : self.kv_lora_rank].view(
                     num_decode_tokens, self.num_kv_heads, self.kv_lora_rank
                 )
                 current_k_pe = current_rows[..., self.kv_lora_rank :].view(
                     num_decode_tokens, self.num_kv_heads, self.qk_rope_head_dim
                 )
+                history_slots = cache_indices
+                valid_slots = (history_slots >= 0) & flash.token_live[:num_decode_tokens]
+                if scratch_page is not None:
+                    history_slots = torch.where(
+                        valid_slots,
+                        history_slots,
+                        torch.full_like(history_slots, scratch_page * block_size),
+                    )
+                else:
+                    history_slots = history_slots.clamp_min(0)
+                # The private current cache holds every row; persist only valid
+                # rank-owned rows into history for the next decode step.
+                self._scatter_pa_nz_rows(merged_cache, history_slots, current_rows)
             return split_attention(
                 history_q_nope,
                 history_q_pe,
