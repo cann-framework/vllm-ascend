@@ -693,6 +693,12 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         prompt_len = len(prompt_token_ids)
         computed_block_ids = self._get_transfer_block_ids(block_ids, prompt_len)
         num_computed_blocks = sum(len(group_block_ids) for group_block_ids in computed_block_ids)
+        logger.info(
+            "[MooncakeV2][producer] req=%s prompt_len=%d computed_blocks=%s",
+            request.request_id,
+            prompt_len,
+            computed_block_ids,
+        )
         delay_free_blocks = num_computed_blocks > 0
         if delay_free_blocks:
             logger.info(

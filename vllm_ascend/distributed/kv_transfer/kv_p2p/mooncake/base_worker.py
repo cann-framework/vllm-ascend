@@ -406,6 +406,21 @@ class MooncakeBaseConnectorWorker:
             len(register_regions.ptrs),
             sum(register_regions.lengths),
         )
+        if layer_names:
+            logger.info(
+                "[MooncakeV2][register-summary] engine=%s role=%s num_blocks=%d "
+                "layers=%d first_layer=%s base=%s stride=%s len=%s shape=%s scale=%s",
+                self.engine_id,
+                self.kv_transfer_config.kv_role,
+                self.num_blocks,
+                len(layer_names),
+                layer_names[0],
+                transfer_metadata.kv_caches_base_addr[0],
+                transfer_metadata.block_strides[0],
+                transfer_metadata.block_lens[0],
+                transfer_metadata.block_shapes[0],
+                transfer_metadata.block_size_scales[0],
+            )
 
         logger.debug(
             "Mooncake KV cache transfer metadata: metadata=%s, register_ptrs=%s, register_lengths=%s",
