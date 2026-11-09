@@ -6,7 +6,6 @@ import copy
 import sys
 import unittest
 from contextlib import ExitStack, contextmanager, nullcontext
-from contextvars import ContextVar
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
@@ -34,19 +33,13 @@ class TestKimiMoESuperkernel(unittest.TestCase):
         self.ns = load(
             "vllm_ascend/compilation/kimi_moe_superkernel.py",
             {
-                "collect_moe_superkernel_scopes",
                 "moe_superkernel_scope",
                 "moe_superkernel_options",
-                "optimize_moe_superkernel",
                 "use_kimi_moe_superkernel",
             },
             dict(
                 contextmanager=contextmanager,
                 torch=NS(npu=self.npu),
-                logger=Mock(),
-                get_forward_context=lambda: self.context,
-                get_capture_resource=lambda key, factory: factory(),
-                _CAPTURE_SCOPES_KEY="scopes",
                 _is_kimi_moe_model=lambda vc: vc.kimi,
                 get_current_hardware_profile=lambda: NS(supports=lambda cap: True),
                 HardwareCapability=NS(CANN_MEGAMOE_MXFP=1),
@@ -70,19 +63,7 @@ class TestKimiMoESuperkernel(unittest.TestCase):
             self.assertFalse(select(vc, cfg))
             setattr(obj, key, old)
 
-    def test_v2_capture_owns_scopes_after_forward_context_exits(self):
-        # Upstream V2 enters torch.cuda.graph before creating the forward
-        # context, then destroys the context before leaving the graph.
-        active_graph = ContextVar("test_kimi_graph", default=None)
-        resources = load(
-            "vllm_ascend/compilation/updatable_graph.py",
-            {"get_capture_resource"},
-            {"_ACTIVE_GRAPH": active_graph},
-        )["get_capture_resource"]
-        graph_resource = load(
-            "vllm_ascend/compilation/updatable_graph.py", {"get_capture_resource"}, {}, "UpdatableGraph"
-        )["get_capture_resource"]
-        self.ns["get_capture_resource"] = resources
+    def test_v2_kimi_capture_does_not_run_extra_post_capture_optimization(self):
         cfg = NS(ascend_compilation_config=NS(enable_super_kernel=True), multistream_overlap_shared_expert=True)
         vc = NS(kimi=True, use_v2_model_runner=True)
         order = []
@@ -90,12 +71,8 @@ class TestKimiMoESuperkernel(unittest.TestCase):
         @contextmanager
         def capture(graph, *args, **kwargs):
             order.append("capture_begin")
-            token = active_graph.set(graph)
-            try:
-                yield
-            finally:
-                active_graph.reset(token)
-                order.append("capture_end")
+            yield
+            order.append("capture_end")
 
         @contextmanager
         def whole_model(name, enabled):
@@ -111,7 +88,6 @@ class TestKimiMoESuperkernel(unittest.TestCase):
                 get_ascend_config=lambda: cfg,
                 get_current_vllm_config_or_none=lambda: vc,
                 use_kimi_moe_superkernel=self.ns["use_kimi_moe_superkernel"],
-                optimize_moe_superkernel=self.ns["optimize_moe_superkernel"],
                 super_kernel_scope=whole_model,
                 weak_ref_workspaces=Mock(),
                 get_graph_params=lambda: "target",
@@ -119,45 +95,16 @@ class TestKimiMoESuperkernel(unittest.TestCase):
             ),
         )
 
-        class Graph:
-            get_capture_resource = graph_resource
-
-            def __init__(self):
-                self.capture_resources = {}
-                self.super_kernel_optimize = Mock(side_effect=lambda **kw: order.append("optimize"))
-
+        graph = NS(super_kernel_optimize=Mock())
         scope = self.ns["moe_superkernel_scope"]
-        # Warmup has no owning graph and must not leak names into capture.
         with scope("warmup", True):
             pass
-        for name, draft in (("layer.0", False), ("layer.1", False), (None, False), ("draft", True)):
-            graph = Graph()
-            order.clear()
-            with wrapper_ns["torch_npu_graph_wrapper"](graph):
-                self.context = NS(additional_kwargs={})
-                with scope(name, name is not None and not draft):
-                    order.append("forward")
-                self.context = None  # Context no longer exists at optimize.
-            self.assertEqual(order[:3], ["capture_begin", "forward", "capture_end"])
-            if name is not None and not draft:
-                self.assertEqual(graph.capture_resources["scopes"], {name})
-                graph.super_kernel_optimize.assert_called_once_with(
-                    optimize_options=self.ns["moe_superkernel_options"]()
-                )
-                self.assertEqual(order[-1], "optimize")
-            else:
-                graph.super_kernel_optimize.assert_not_called()
-        self.assertEqual(wrapper_ns["weak_ref_workspaces"].call_count, 8)
-
-        graph = Graph()
-        with self.assertRaisesRegex(RuntimeError, "capture failed"), wrapper_ns["torch_npu_graph_wrapper"](graph):
-            self.context = NS(additional_kwargs={})
-            with scope("failed", True):
-                raise RuntimeError("capture failed")
+        with wrapper_ns["torch_npu_graph_wrapper"](graph):
+            with scope("layer.0", True):
+                order.append("forward")
+        self.assertEqual(order, ["capture_begin", "forward", "capture_end"])
         graph.super_kernel_optimize.assert_not_called()
-        self.assertIsNone(active_graph.get())
-        self.assertEqual(self.context.additional_kwargs, {})
-        self.assertEqual(wrapper_ns["weak_ref_workspaces"].call_count, 10)
+        self.assertEqual(wrapper_ns["weak_ref_workspaces"].call_count, 2)
 
     def test_v2_other_models_keep_whole_model_policy_and_cleanup(self):
         for enabled in (False, True):
@@ -174,7 +121,6 @@ class TestKimiMoESuperkernel(unittest.TestCase):
                     ),
                     get_current_vllm_config_or_none=lambda: NS(kimi=False),
                     use_kimi_moe_superkernel=lambda *a: False,
-                    optimize_moe_superkernel=Mock(),
                     super_kernel_scope=whole_model,
                     weak_ref_workspaces=Mock(),
                     get_graph_params=lambda: "target",
@@ -185,7 +131,6 @@ class TestKimiMoESuperkernel(unittest.TestCase):
             with ns["torch_npu_graph_wrapper"](cuda_graph=graph):
                 pass
             whole_model.assert_called_once_with("full_model", enabled)
-            ns["optimize_moe_superkernel"].assert_not_called()
             self.assertEqual(ns["weak_ref_workspaces"].call_count, 2)
             if enabled:
                 graph.super_kernel_optimize.assert_called_once_with(optimize_options={"dcci_after_kernel_end": [".*"]})
@@ -193,10 +138,9 @@ class TestKimiMoESuperkernel(unittest.TestCase):
                 graph.super_kernel_optimize.assert_not_called()
 
     def test_nested_scope_and_failure_cleanup(self):
-        collect, scope = self.ns["collect_moe_superkernel_scopes"], self.ns["moe_superkernel_scope"]
-        with collect(self.context, True) as outer, scope("outer", True):
+        scope = self.ns["moe_superkernel_scope"]
+        with scope("outer", True):
             with (
-                collect(self.context, True) as inner,
                 self.assertRaisesRegex(RuntimeError, "kernel"),
                 scope("inner", True),
                 scope(None, True),
@@ -204,8 +148,6 @@ class TestKimiMoESuperkernel(unittest.TestCase):
                 raise RuntimeError("kernel")
             with scope("restored", True):
                 pass
-        self.assertEqual(outer, {"outer", "restored"})
-        self.assertEqual(inner, {"inner"})
         self.assertEqual(self.context.additional_kwargs, {})
         self.assertEqual(self.npu.super_kernel_scope_begin.call_count, self.npu.super_kernel_scope_end.call_count)
 
@@ -290,14 +232,12 @@ class TestKimiMoESuperkernel(unittest.TestCase):
                         _EXTRA_CTX=NS(is_draft_model=False),
                     ),
                 )
-                with self.ns["collect_moe_superkernel_scopes"](self.context, True) as scopes:
-                    for name in layer_names:
-                        encoded = "from_forward_context" if encoding == "context" else NS(value=name)
-                        if encoding == "string":
-                            encoded = name
-                        self.assertIs(ns["_ascend_kimi_moe"](x, None, encoded), x)
+                for name in layer_names:
+                    encoded = "from_forward_context" if encoding == "context" else NS(value=name)
+                    if encoding == "string":
+                        encoded = name
+                    self.assertIs(ns["_ascend_kimi_moe"](x, None, encoded), x)
                 expected_names = [f"{name}_1.moe" for name in layer_names]
-                self.assertEqual(scopes, set(expected_names))
                 self.assertEqual(
                     [call.args[0] for call in self.npu.super_kernel_scope_begin.call_args_list], expected_names
                 )
@@ -352,7 +292,7 @@ class TestKimiMoESuperkernel(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "legacy"):
             ns["_configure_backend"](object(), cfg, vc)
 
-    def test_acl_capture_optimizes_once_and_skips_draft_or_unmarked(self):
+    def test_acl_capture_does_not_run_extra_post_capture_optimization(self):
         for enabled, marked, draft in (
             (True, True, False),
             (True, False, False),
@@ -364,7 +304,6 @@ class TestKimiMoESuperkernel(unittest.TestCase):
                 self.context.batch_descriptor = "batch"
                 self.context.cudagraph_runtime_mode = "full"
                 graph = Mock()
-                graph.super_kernel_optimize.side_effect = lambda order=order, **kw: order.append("optimize")
                 graph.replay.side_effect = lambda order=order: order.append("replay")
 
                 @contextmanager
@@ -417,15 +356,8 @@ class TestKimiMoESuperkernel(unittest.TestCase):
                 with patch.dict(sys.modules, {"vllm.model_executor.offloader.base": NS(get_offloader=lambda: Mock())}):
                     self.assertEqual(ns["__call__"](wrapper), "result")
                     self.assertEqual(ns["__call__"](wrapper), "result")
-                expected = ["begin", "forward", "end"]
-                if enabled and marked and not draft:
-                    expected.append("optimize")
-                    graph.super_kernel_optimize.assert_called_once_with(
-                        optimize_options=self.ns["moe_superkernel_options"]()
-                    )
-                else:
-                    graph.super_kernel_optimize.assert_not_called()
-                self.assertEqual(order, expected + ["replay"])
+                graph.super_kernel_optimize.assert_not_called()
+                self.assertEqual(order, ["begin", "forward", "end", "replay"])
                 self.assertEqual(self.context.additional_kwargs, {})
 
     def test_draft_config_marks_returned_copy_without_changing_upstream_context(self):

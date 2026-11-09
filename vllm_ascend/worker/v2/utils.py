@@ -16,7 +16,7 @@ from vllm_ascend.compilation.acl_graph import (
     get_graph_params,
     weak_ref_workspaces,
 )
-from vllm_ascend.compilation.kimi_moe_superkernel import optimize_moe_superkernel, use_kimi_moe_superkernel
+from vllm_ascend.compilation.kimi_moe_superkernel import use_kimi_moe_superkernel
 from vllm_ascend.compilation.updatable_graph import UpdatableGraph
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.utils import super_kernel_scope, weak_ref_tensor, weak_ref_tensors
@@ -209,9 +209,7 @@ def torch_npu_graph_wrapper(*args, **kwargs):
     try:
         with torch.npu.graph(*args, **kwargs), super_kernel_scope("full_model", enable_super_kernel):
             yield
-        if enable_moe_superkernel and graph is not None:
-            optimize_moe_superkernel(graph)
-        elif enable_super_kernel and graph is not None:
+        if enable_super_kernel and graph is not None:
             graph.super_kernel_optimize(
                 optimize_options={
                     "dcci_after_kernel_end": [".*"],

@@ -22,11 +22,7 @@ from vllm.platforms import current_platform
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.compilation.kimi_moe_superkernel import (
-    collect_moe_superkernel_scopes,
-    optimize_moe_superkernel,
-    use_kimi_moe_superkernel,
-)
+from vllm_ascend.compilation.kimi_moe_superkernel import use_kimi_moe_superkernel
 
 from ..utils import super_kernel_scope, use_updatable_graph, weak_ref_tensors
 from .updatable_graph import (
@@ -216,11 +212,6 @@ class ACLGraphWrapper:
                 get_offloader().sync_prev_onload()
                 forward_context.capturing = True
                 try:
-                    scopes = stack.enter_context(
-                        collect_moe_superkernel_scopes(
-                            forward_context, self.enable_moe_superkernel and not _EXTRA_CTX.is_draft_model
-                        )
-                    )
                     with torch.npu.graph(aclgraph, pool=self.graph_pool):
                         # `output` is managed by pytorch's aclgraph pool
                         with super_kernel_scope("full_model", self.enable_super_kernel):
@@ -257,7 +248,6 @@ class ACLGraphWrapper:
                         ) from exc
                     raise
 
-            optimize_moe_superkernel(aclgraph, scopes)
             if self.enable_super_kernel:
                 aclgraph.super_kernel_optimize(
                     optimize_options={
