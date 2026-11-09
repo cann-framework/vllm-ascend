@@ -59,6 +59,7 @@ from vllm_ascend.ascend_forward_context import (
     select_moe_comm_method,
     set_mc2_mask,
     set_mc2_tokens_capacity,
+    uses_kimi_prefill_megamoe,
 )
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
@@ -113,6 +114,7 @@ from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.kv_connector import MambaCopyKVConnector
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
+from vllm_ascend.worker.v2.moe_utils import clear_v2_moe_padding, record_v2_moe_batch_phase, v2_moe_batch_context
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.pp_transport import (
     bypass_upstream_spec_pp_guard,
@@ -633,7 +635,19 @@ class NPUModelRunner(GPUModelRunner):
             skip_dp_coordination() if should_skip_allreduce_across_dp_group(self.vllm_config) else nullcontext()
         )
         forward_failed = True
-        with dp_coordination_context:
+        moe_context = (
+            v2_moe_batch_context(
+                self.vllm_config,
+                scheduler_output.total_num_scheduled_tokens,
+                dummy_run=dummy_run,
+                is_profile=is_profile or getattr(self.input_buffers, "profile_cpp", False),
+                allow_megamoe=not self._finegrained_tp_requires_graph,
+            )
+            if uses_kimi_prefill_megamoe(self.vllm_config)
+            and not getattr(self.vllm_config.kv_transfer_config, "is_kv_consumer", False)
+            else nullcontext()
+        )
+        with dp_coordination_context, moe_context:
             try:
                 output = super().execute_model(
                     scheduler_output,
@@ -740,7 +754,9 @@ class NPUModelRunner(GPUModelRunner):
             if (
                 mc2_tokens_capacity is not None
                 and self.max_num_tokens > mc2_tokens_capacity
-                and select_moe_comm_method(mc2_tokens_capacity, self.vllm_config)
+                and select_moe_comm_method(
+                    mc2_tokens_capacity, self.vllm_config, batch_contains_decode=False, v2_prefill_ready=True
+                )
                 in {MoECommType.MC2, MoECommType.FUSED_MC2}
             ):
                 # Use a call-scoped bypass because skip_compiled would require runner-specific ForwardContext plumbing.
@@ -774,6 +790,7 @@ class NPUModelRunner(GPUModelRunner):
         if self._uses_flashmla and batch_state is not None:
             # The backend order must precede derived inputs and graph dispatch.
             batch_state, uniform_token_count = prepare_flashmla_batch_req_state(batch_state, uniform_token_count)
+        record_v2_moe_batch_phase(batch_state)
         return batch_state, uniform_token_count
 
     def _check_finegrained_tp_graph_step(self, cg_mode: CUDAGraphMode) -> None:
@@ -994,6 +1011,7 @@ class NPUModelRunner(GPUModelRunner):
             # prompt_lens is only used in R-SWA case.
             prompt_lens = self.req_states.prompt_len.gpu[idx_mapping]
 
+        clear_v2_moe_padding(self.input_buffers, num_tokens, num_tokens_after_padding)
         input_batch = AscendInputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,

@@ -217,10 +217,11 @@ considered so capture cannot accidentally select MegaMoE.
 | Active workload in the communication domain | Kimi MoE | ACLGraph |
 | --- | --- | --- |
 | Pure prefill + idle dummy | MegaMoE if otherwise supported | NONE on all peers |
-| Prefill + real Decode, or a local mixed batch | Ordinary MoE | NONE on all peers |
+| Prefill + real Decode, or a local mixed batch | Ordinary MoE | NONE on v1; existing V2 policy |
 | Pure Decode + idle dummy | Ordinary MoE | Common supported graph mode |
 | Decode graph capture | Ordinary MoE | Requested capture mode |
-| MRv2 or KV consumer | Ordinary MoE | Existing runner policy |
+| MRv2 coordinated pure prefill + idle dummy | MegaMoE if otherwise supported | NONE on all peers |
+| MRv2 uncoordinated/draft forward, or KV consumer | Ordinary MoE | Existing runner policy |
 
 A prefill is detected from computed versus prompt tokens, not from token
 count alone. One-token/chunked prefill therefore cannot accidentally reuse a
@@ -231,6 +232,41 @@ Keep 0.30's uniform input padding when its selected backend or fine-grained
 TP requires it. Unlike the old PR20 code, 0.30 already preserves the agreed
 `num_tokens_across_dp` vector inside dummy execution; this fix is retained.
 The policy assumes matching configuration across participating ranks.
+
+MRv2 scopes target phase metadata to `execute_model` and records real request
+stages in `gather_batch_req_state`. Its existing dispatch patch exchanges
+real-work, Decode, profiling, eligibility and capacity metadata in one extra
+CPU-group all-reduce before upstream graph/DP coordination. This collective
+also runs on idle peers; it cannot be conditional on local Prefill alone.
+KV consumers retain their existing coordination without this extra collective.
+Supported pure Prefill forces eager execution and pads the runner descriptor
+and DP token vector to the same TP-aligned count. Real token counts remain
+separate for mask construction, KV metadata and sampling. Missing phase data,
+graph capture/replay and all-dummy non-profile runs cannot select MegaMoE.
+
+The first MRv2 integration falls back to ordinary MoE for PCP, microbatching
+and cross-DP o_proj/MLP TP that requires graph execution. DCP alone keeps the
+same query-token layout and does not trigger this fallback. Existing weight,
+activation, LoRA, EPLB and capacity checks still apply. Explicit profile runs
+warm MegaMoE before KV cache sizing, including the extra capacity-sized dummy
+when the scheduler token limit exceeds the MegaMoE limit. Explicit CPP
+Prefill timing dummies use the same backend; unrelated graph warmups remain
+ordinary MoE. Real forwards clear padded input IDs and positions so a previous
+batch cannot supply stale input values to the new physical rows.
+
+A5 MegaMoE requires `x_active_mask=None`. Although the runner preserves valid
+token metadata, padded and idle rows still participate in the fused operator.
+Their outputs are discarded, but their routes consume receive-buffer capacity.
+Tune `mega_moe_max_tokens` using the physical padded workload and expert-load
+skew; a valid-token mask does not prevent A5 receive overflow.
+
+The dependency-free regression suite is
+`python3 tests/ut/worker/test_kimi_megamoe_v2.py`. On A5, additionally run the
+existing operator integration with
+`torchrun --nproc_per_node=8 tests/e2e/nightly/single_node/ops/test_mega_moe.py --tokens 1 32 256 --v2-prefill`.
+This covers real CPU collectives, unequal scheduled counts, an idle peer and
+the padded MegaMoE numerical reference; complete model accuracy, PP/DCP,
+long-running request transitions and latency still require deployment tests.
 Independent P and D instances make decisions in their own communication domains.
 
 ## Validation

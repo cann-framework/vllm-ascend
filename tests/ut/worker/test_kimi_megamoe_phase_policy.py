@@ -270,7 +270,7 @@ class TestKimiMegaMoEPhase(unittest.TestCase):
         self.config.model_config._ascend_kimi_moe_quant_types = frozenset((self.ns["QuantType"].NONE,))
         self.assertEqual(select(2048, self.config, batch_contains_decode=False).name, "ALLTOALL")
 
-    def test_capture_v2_and_kv_consumer_reject_megamoe(self):
+    def test_capture_uncoordinated_v2_and_kv_consumer_reject_megamoe(self):
         select = self.ns["select_moe_comm_method"]
         for mode in (GraphMode.FULL, GraphMode.PIECEWISE):
             self.assertEqual(
@@ -280,6 +280,12 @@ class TestKimiMegaMoEPhase(unittest.TestCase):
             c = NS(**(vars(self.config) | kwargs))
             self.assertEqual(select(8, c, batch_contains_decode=False).name, "MC2")
         self.batch(["I", "I"], [8, 8], "MC2")
+
+    def test_v2_requires_explicit_prefill_agreement(self):
+        self.config.use_v2_model_runner = True
+        select = self.ns["select_moe_comm_method"]
+        self.assertEqual(select(8, self.config, batch_contains_decode=False, v2_prefill_ready=True).name, "FUSED_MC2")
+        self.assertEqual(select(8, self.config, batch_contains_decode=True, v2_prefill_ready=True).name, "MC2")
 
     def test_non_kimi_and_dense_draft_keep_030_policy(self):
         self.config.model_config.architectures = ["OtherMoE"]

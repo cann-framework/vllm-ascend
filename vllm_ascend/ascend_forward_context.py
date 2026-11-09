@@ -153,15 +153,15 @@ def use_cann_megamoe(vllm_config: VllmConfig) -> bool:
 
 def uses_kimi_prefill_megamoe(vllm_config: VllmConfig) -> bool:
     """Whether Kimi's A5 MegaMoE phase agreement is needed for this model."""
-    architectures = getattr(vllm_config.model_config, "architectures", None) or []
+    architectures = getattr(getattr(vllm_config, "model_config", None), "architectures", None) or []
     return (
-        get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP)
-        and get_ascend_config().enable_fused_mc2 == 1
-        and is_mega_moe_supported()
-        and any(
+        any(
             name in ("KimiK3ForCausalLM", "KimiLinearForCausalLM", "KimiK3ForConditionalGeneration")
             for name in architectures
         )
+        and get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP)
+        and get_ascend_config().enable_fused_mc2 == 1
+        and is_mega_moe_supported()
     )
 
 
@@ -451,6 +451,7 @@ def select_moe_comm_method(
     *,
     batch_contains_decode: bool | None = None,
     aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    v2_prefill_ready: bool = False,
 ) -> MoECommType | None:
     """Select the MoE communication method from the active hardware policy,
     parallel settings, and token count.
@@ -466,6 +467,8 @@ def select_moe_comm_method(
             contexts default to True until the v1 runner supplies the phase.
         aclgraph_runtime_mode (CUDAGraphMode): Agreed execution mode. Kimi
             MegaMoE is restricted to prefill outside graph capture/replay.
+        v2_prefill_ready (bool): Whether V2 completed target-only phase,
+            capacity and uniform-input agreement for this forward.
     Returns:
         MoECommType | None: The selected MoE communication method.
     """
@@ -490,7 +493,10 @@ def select_moe_comm_method(
         or (num_tokens is not None and num_tokens > mc2_tokens_capacity)
         or aclgraph_runtime_mode != CUDAGraphMode.NONE
         or is_draft_model
-        or getattr(vllm_config, "use_v2_model_runner", False)
+        or (
+            getattr(vllm_config, "use_v2_model_runner", False)
+            and (not v2_prefill_ready or batch_contains_decode is None)
+        )
         or getattr(getattr(vllm_config, "kv_transfer_config", None), "is_kv_consumer", False)
     ):
         # Metadata=None is only for model construction/profile capacity
@@ -518,13 +524,16 @@ def select_moe_comm_method(
         )
     logger.debug(
         "MoE comm method selected: policy=%s, method=%s, num_tokens=%d, mc2_capacity=%s, "
-        "is_draft_model=%s, draft_moe_quant_type=%r",
+        "is_draft_model=%s, draft_moe_quant_type=%r, batch_contains_decode=%s, graph_mode=%s, v2_prefill_ready=%s",
         moe_comm_policy,
         moe_comm_type,
         num_tokens,
         mc2_tokens_capacity,
         is_draft_model,
         draft_moe_quant_type,
+        batch_contains_decode,
+        aclgraph_runtime_mode,
+        v2_prefill_ready,
     )
     return moe_comm_type
 
