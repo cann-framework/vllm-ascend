@@ -454,6 +454,7 @@ class FlashMLAMetadataBuilder:
         # speculative causal queries need the replicated current chunk.
         self.use_spec_decode = impl.vllm_config.speculative_config is not None
         self.cp_interleave = impl.vllm_config.parallel_config.cp_kv_cache_interleave_size if self.dcp_size > 1 else 1
+        self.layer_name = getattr(impl, "layer_name", "")
         layout = "PA_NZ" if getattr(impl, "flash_mla_layout", "pa_bbnd") == "pa_nz" else "PA_BBND"
         adapter = create_flash_mla_adapter(
             FlashMLAConfig(
@@ -737,6 +738,28 @@ class FlashMLAMetadataBuilder:
         refresh()
         if not flash.metadata_async:
             self.start_metadata(flash, force_sync=True)
+        if (
+            not retain_for_graph
+            and self.layer_name.endswith(".layers.3.self_attn.attn")
+            and flash.current is not None
+        ):
+            logger.info(
+                "[PA_NZ][meta] layer=%s tokens=%d decodes=%d rows=%d q_len=%d dcp=%d/%d "
+                "cp_interleave=%d slots_head=%s prolog_slots_head=%s "
+                "cache_lens_head=%s block_table_head=%s",
+                self.layer_name,
+                tokens,
+                num_decodes,
+                rows,
+                flash.q_len,
+                self.dcp_size,
+                self.dcp_rank,
+                self.cp_interleave,
+                flash.slots[:8].to(torch.int64).tolist(),
+                flash.prolog_slots[:8].to(torch.int64).tolist() if flash.prolog_slots is not None else None,
+                flash.cache_lens[:4].to(torch.int64).tolist(),
+                flash.block_table[:2, :8].to(torch.int64).tolist(),
+            )
         return flash
 
     def start_metadata(self, flash: FlashMLADecode, *, force_sync: bool = False) -> None:
