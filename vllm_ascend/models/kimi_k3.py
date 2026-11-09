@@ -576,6 +576,9 @@ class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
         attention_layer.impl.rotary_emb = rotary_emb
         attention_layer.impl.use_mla_rope = use_rope
 
+    def forward_compute_sp(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.mla_attn.forward_kimi_sequence_parallel(positions, hidden_states)
+
     @property
     def _attention_layer(self):
         return self.mla_attn.mla_attn
@@ -595,6 +598,10 @@ class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
     @property
     def kv_cache(self):
         return self._attention_layer.kv_cache
+
+    @kv_cache.setter
+    def kv_cache(self, value):
+        self._attention_layer.kv_cache = value
 
     @property
     def kv_cache_dtype(self):
@@ -729,6 +736,12 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
             self.self_attn.o_proj.reduce_results = False
 
         self.fuse_o_proj_mm_reduce_scatter = self._enable_o_proj_mm_reduce_scatter(vllm_config)
+        if (
+            isinstance(self.self_attn, AscendKimiMLAAttention)
+            and getattr(self.self_attn.impl, "kimi_compute_enabled", False)
+            and not self.use_sequence_parallel
+        ):
+            raise ValueError("Kimi MLA compute requires the model sequence-parallel input path")
 
     def _enable_o_proj_mm_reduce_scatter(self, vllm_config: VllmConfig) -> bool:
         if not self.use_sequence_parallel or not self.use_attn_residuals:
@@ -830,13 +843,17 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
         if self.is_block_write_layer:
             prefix_sum = None
 
-        if self.use_sequence_parallel:
-            hidden_states = sp_all_gather(hidden_states)
-            hidden_states = hidden_states[: positions.shape[0]]
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            positions=positions,
+        compute_sp = (
+            self.use_sequence_parallel
+            and isinstance(self.self_attn, AscendKimiMLAAttention)
+            and getattr(self.self_attn.impl, "kimi_compute_enabled", False)
         )
+        if self.use_sequence_parallel and not compute_sp:
+            hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
+        if compute_sp:
+            hidden_states = self.self_attn.forward_compute_sp(positions, hidden_states)
+        else:
+            hidden_states = self.self_attn(hidden_states=hidden_states, positions=positions)
         if self.use_sequence_parallel and not self.fuse_o_proj_mm_reduce_scatter:
             hidden_states = sp_reduce_scatter(hidden_states)
 

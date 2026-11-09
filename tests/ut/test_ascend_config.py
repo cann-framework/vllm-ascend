@@ -47,6 +47,7 @@ from vllm_ascend.ascend_config import (
     SchedulerConfig,
     ShortRequestFirstConfig,
     SparseKVOffloadConfig,
+    _validate_kimi_mla_decode_dp,
     clear_ascend_config,
     get_ascend_config,
     init_ascend_config,
@@ -112,6 +113,43 @@ class TestRlConfig(TestBase):
         self.assertFalse(config.sleep_mode_extra_cleanup)
         with self.assertRaises(ValueError):
             RlConfig(refresh=False)  # type: ignore[call-arg]
+
+
+class TestKimiMlaDecodeDP(TestBase):
+    def test_kimi_sp_uses_expert_parallel_without_moe_sp_flag(self):
+        vc = SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["KimiK3ForCausalLM"],
+                is_hybrid=True,
+                runner_type="generate",
+                hf_text_config=SimpleNamespace(attn_res_block_size=4),
+            ),
+            kv_transfer_config=SimpleNamespace(is_kv_consumer=True, is_kv_producer=False),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=4,
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                enable_expert_parallel=True,
+                use_sequence_parallel_moe=False,
+                enable_dbo=False,
+            ),
+            use_v2_model_runner=True,
+            lora_config=None,
+            quant_config=None,
+            cache_config=SimpleNamespace(cache_dtype="auto"),
+            speculative_config=None,
+            compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY),
+        )
+        _validate_kimi_mla_decode_dp(vc, enabled=True, enable_kv_nz=False)
+        vc.parallel_config.enable_expert_parallel = False
+        vc.parallel_config.use_sequence_parallel_moe = True
+        with self.assertRaisesRegex(ValueError, "expert parallel"):
+            _validate_kimi_mla_decode_dp(vc, enabled=True, enable_kv_nz=False)
+        vc.parallel_config.enable_expert_parallel = True
+        vc.model_config.is_hybrid = False
+        with self.assertRaisesRegex(ValueError, "hybrid model state"):
+            _validate_kimi_mla_decode_dp(vc, enabled=True, enable_kv_nz=False)
 
 
 class TestAscendConfig(TestBase):

@@ -353,5 +353,11 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             attn_state=input_batch.attn_state,
             model_specific_attn_metadata=model_specific_metadata,
             for_cudagraph_capture=for_capture,
+            graph_pad_size=(
+                input_batch.num_tokens_after_padding if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL else -1
+            ),
+            decode_token_per_req=self.vllm_config.num_speculative_tokens + 1,
+            kimi_mla_full_graph=cudagraph_mode.decode_mode() == CUDAGraphMode.FULL,
+            kimi_mla_dummy=getattr(input_batch, "is_dummy", False),
         )
         return self.attn_metadata

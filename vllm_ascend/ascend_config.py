@@ -23,7 +23,7 @@ import os
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import ConfigDict, TypeAdapter, field_validator, model_validator
+from pydantic import ConfigDict, StrictBool, TypeAdapter, field_validator, model_validator
 from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -406,6 +406,69 @@ class RlConfig:
         os.environ["VLLM_SERVER_DEV_MODE"] = "1"
 
 
+def _validate_kimi_mla_decode_dp(vllm_config: VllmConfig, *, enabled: bool, enable_kv_nz: bool) -> None:
+    if not enabled:
+        return
+    vc = vllm_config
+    model = vc.model_config
+    transfer = vc.kv_transfer_config
+    # The shared deployment config may also reach the producer and draft.
+    # Their backends retain the native path; the switch is not rewritten.
+    if model.runner_type == "draft" or (transfer is not None and transfer.is_kv_producer):
+        return
+    if transfer is None or not transfer.is_kv_consumer:
+        raise ValueError("enable_kimi_mla_decode_dp requires a PD KV consumer")
+    kimi_architectures = {"KimiK3ForCausalLM", "KimiLinearForCausalLM", "KimiK3ForConditionalGeneration"}
+    if not kimi_architectures.intersection(model.architectures or []):
+        raise ValueError("enable_kimi_mla_decode_dp requires a Kimi target model")
+    if not model.is_hybrid:
+        raise ValueError("enable_kimi_mla_decode_dp requires the Kimi hybrid model state")
+    if getattr(getattr(model, "hf_text_config", None), "attn_res_block_size", None) is None:
+        raise ValueError("enable_kimi_mla_decode_dp requires AttnRes with attn_res_block_size configured")
+    parallel = vc.parallel_config
+    if (
+        parallel.pipeline_parallel_size != 1
+        or parallel.prefill_context_parallel_size != 1
+        or parallel.decode_context_parallel_size != 1
+    ):
+        raise ValueError("enable_kimi_mla_decode_dp requires PP=1 and PCP=DCP=1")
+    if parallel.tensor_parallel_size not in (2, 4, 8) or not parallel.enable_expert_parallel:
+        raise ValueError("enable_kimi_mla_decode_dp requires TP=2/4/8 with expert parallelism enabled")
+    if not vc.use_v2_model_runner or getattr(parallel, "enable_dbo", False):
+        raise ValueError("enable_kimi_mla_decode_dp requires Model Runner V2 with DBO disabled")
+    if vc.lora_config is not None:
+        raise ValueError("enable_kimi_mla_decode_dp does not support LoRA")
+    if enable_kv_nz or getattr(vc.quant_config, "enable_fa_quant", False):
+        raise ValueError("enable_kimi_mla_decode_dp requires unquantized ND attention caches")
+    if vc.cache_config.cache_dtype not in ("auto", "bfloat16", "float16"):
+        raise ValueError("enable_kimi_mla_decode_dp requires BF16/FP16 attention caches")
+    spec = vc.speculative_config
+    if spec is not None and spec.method != "dspark":
+        raise ValueError("enable_kimi_mla_decode_dp supports only fixed DSpark speculative queries")
+    if spec is not None and (
+        getattr(spec, "num_speculative_tokens_per_batch_size", None) is not None
+        or getattr(spec, "enable_adaptive_verification", False)
+    ):
+        raise ValueError("enable_kimi_mla_decode_dp does not support dynamic speculation or varlen decode")
+    query_len = spec.num_speculative_tokens + 1 if spec is not None else 1
+    if not 1 <= query_len <= 16:
+        raise ValueError(
+            f"enable_kimi_mla_decode_dp requires q in [1,16]; TP={parallel.tensor_parallel_size}, q={query_len}"
+        )
+    # Core may resolve the actual capture sizes later. Validate every bucket
+    # already supplied here without deleting, rounding or rewriting it.
+    for total in getattr(vc.compilation_config, "cudagraph_capture_sizes", None) or ():
+        if total <= 0 or total % (parallel.tensor_parallel_size * query_len):
+            raise ValueError(
+                f"enable_kimi_mla_decode_dp capture bucket unsupported: TP={parallel.tensor_parallel_size}, "
+                f"q={query_len}, T={total}; require positive T divisible by TP*q"
+            )
+    from vllm.config.compilation import CUDAGraphMode
+
+    if vc.compilation_config.cudagraph_mode not in (CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.NONE):
+        raise ValueError("enable_kimi_mla_decode_dp requires FULL_DECODE_ONLY graphs or explicit NONE debugging")
+
+
 @config
 class AscendConfig:
     """Configuration Object for additional_config from vllm.configs.
@@ -634,6 +697,7 @@ class AscendConfig:
     eplb_config: EplbConfig = dataclasses.field(default_factory=EplbConfig)
     rejection_sampler_config: RejectionSamplerConfig = dataclasses.field(default_factory=RejectionSamplerConfig)
     rl_config: RlConfig = dataclasses.field(default_factory=RlConfig)
+    enable_kimi_mla_decode_dp: StrictBool = False
 
     # ---- sub-configs declared later in this module ----
     # Lambdas defer class lookup until construction, after module initialization.
@@ -985,6 +1049,7 @@ class AscendConfig:
 
         # sparse KV offload vs packed SFA main cache mutex
         self._validate_sparse_packed_kv_offload_compatibility()
+        _validate_kimi_mla_decode_dp(vc, enabled=self.enable_kimi_mla_decode_dp, enable_kv_nz=self.enable_kv_nz)
         return self
 
     @property

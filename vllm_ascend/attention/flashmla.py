@@ -379,8 +379,45 @@ class FlashMLAMetadataBuilder:
             )
         return flash
 
+    def build_partition(self, common, partition, *, retain_for_graph: bool = False):
+        """Refresh stable FlashMLA buffers for an existing whole-request SP shard."""
+        from copy import copy
+
+        local = copy(common)
+        request_capacity = partition.capacity // partition.query_len
+        start = partition.rank * request_capacity
+        stop = start + request_capacity
+        token_start = partition.rank * partition.capacity
+        token_stop = token_start + partition.capacity
+        if common.block_table_tensor.shape[0] < stop:
+            raise ValueError("FlashMLA partition exceeds the runner block-table capacity")
+        local.num_reqs = request_capacity
+        local.num_input_tokens = partition.capacity
+        local.num_actual_tokens = partition.valid_tokens
+        local.query_start_loc = common.query_start_loc[start : stop + 1] - partition.token_start
+        local.query_start_loc_cpu = common.query_start_loc_cpu[start : stop + 1] - partition.token_start
+        local.block_table_tensor = common.block_table_tensor[start:stop]
+        local.seq_lens = common.seq_lens[start:stop]
+        local.slot_mapping = common.slot_mapping[token_start:token_stop]
+        local.positions = common.positions[token_start:token_stop]
+        return self.build(
+            local,
+            num_decodes=partition.valid_tokens // partition.query_len,
+            num_decode_tokens=partition.valid_tokens,
+            has_prefill=False,
+            retain_for_graph=retain_for_graph,
+            request_capacity=request_capacity,
+        )
+
     def build(
-        self, common, num_decodes: int, num_decode_tokens: int, has_prefill: bool, *, retain_for_graph: bool = False
+        self,
+        common,
+        num_decodes: int,
+        num_decode_tokens: int,
+        has_prefill: bool,
+        *,
+        retain_for_graph: bool = False,
+        request_capacity: int | None = None,
     ) -> FlashMLADecode:
         # Mixed batches run outside FULL graph. Do not retain every prefill
         # shape. Retain only explicitly captured decode capacities: retaining
@@ -388,6 +425,10 @@ class FlashMLAMetadataBuilder:
         # Replay (and eager with that capacity) reuses the captured addresses.
         tokens = num_decode_tokens if has_prefill else max(common.num_actual_tokens, common.num_input_tokens)
         rows = num_decodes + 1 if has_prefill else max(num_decodes, min(tokens, self.max_num_reqs)) + 1
+        if request_capacity is not None:
+            if has_prefill or not 0 <= num_decodes <= request_capacity or request_capacity < 1:
+                raise ValueError("FlashMLA fixed request capacity must cover a decode-only partition")
+            rows = request_capacity
         columns = common.block_table_tensor.shape[1]
         key = tokens, rows, columns, common.causal
         if has_prefill:

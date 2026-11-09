@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed.parallel_state import get_pcp_group
+from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttention,
@@ -44,6 +44,15 @@ from vllm_ascend.attention.flashmla import (
     FlashMLAMetadataBuilder,
     get_flashmla_ops,
     split_flashmla_requests,
+)
+from vllm_ascend.attention.kimi_mla_dp import build_compute_decode
+from vllm_ascend.attention.kimi_mla_dp_backend import (
+    compute_enabled,
+    forward_compute,
+    prepare_compute_kv,
+    prepare_compute_prolog,
+    prepare_compute_weights,
+    profile_compute,
 )
 from vllm_ascend.attention.utils import (
     ATTENTION_UPDATE_MAX_INPUTS,
@@ -250,6 +259,7 @@ class AscendMLAMetadata:
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
 
+    compute_decode: Any = None
     query_lens: list[int] | None = None
     # The dimension of the attention heads
     head_dim: int | None = None
@@ -278,6 +288,10 @@ class AscendMLAMetadata:
 
 
 M = TypeVar("M", bound=AscendMLAMetadata)
+
+
+class AscendKimiComputeMLABackend(AscendMLABackend):
+    pass
 
 
 class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
@@ -328,6 +342,20 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
                 got {self.decode_threshold}"
             )
 
+        compute_flags = {
+            compute_enabled(vllm_config.compilation_config.static_forward_context[name].impl) for name in layer_names
+        }
+        if len(compute_flags) > 1:
+            raise ValueError("Kimi target and draft MLA layers must use separate metadata groups")
+        self.kimi_compute_enabled = compute_flags == {True}
+        if self.kimi_compute_enabled:
+            divisor = vllm_config.parallel_config.tensor_parallel_size * self.decode_threshold
+            for total in vllm_config.compilation_config.cudagraph_capture_sizes or ():
+                if total <= 0 or total % divisor:
+                    raise ValueError(
+                        f"compute capture bucket unsupported: T={total}, TP*q={divisor}; "
+                        "provide complete-request aligned capture sizes"
+                    )
         self.reorder_batch_threshold = self.decode_threshold
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
         # mla_nope_zero_rope_cache: MLA-NoPE models (qk_rope_head_dim == 0) feed
@@ -372,6 +400,17 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             impl = static_forward_context[layer_names[0]].impl
             self.flashmla_state = FlashMLAMetadataBuilder(
                 impl, device, scheduler_config.max_num_seqs, self.attn_mask_builder.get_splitfuse_attn_mask()
+            )
+
+        self.compute_flashmla_state = None
+        if self.kimi_compute_enabled and self.flashmla_state is not None:
+            compute_impl = copy(static_forward_context[layer_names[0]].impl)
+            compute_impl.num_heads *= vllm_config.parallel_config.tensor_parallel_size
+            self.compute_flashmla_state = FlashMLAMetadataBuilder(
+                compute_impl,
+                device,
+                scheduler_config.max_num_seqs,
+                self.attn_mask_builder.get_splitfuse_attn_mask(),
             )
 
     def _build_external_flashmla(self, common_prefix_len, common, *, retain_for_graph: bool = False):
@@ -595,7 +634,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
     ) -> AscendMLAMetadata:
         self._pcp_context = pcp_context
         self._pcp_cache_group_idx = pcp_cache_group_idx
-        if self.flashmla_state is not None:
+        if self.flashmla_state is not None and not self.kimi_compute_enabled:
             return self._build_external_flashmla(common_prefix_len, common_attn_metadata)
         expanded_slot_mapping = common_attn_metadata.slot_mapping if self.pcp_enabled else None
         num_reqs = common_attn_metadata.num_reqs
@@ -662,6 +701,43 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             seq_lens=self.seq_lens,
             seq_lens_cpu=self.seq_lens,
         )
+        if self.kimi_compute_enabled:
+            is_prefilling = common_attn_metadata.is_prefilling
+            has_prefill = self.num_prefills > 0
+            if is_prefilling is not None:
+                if is_prefilling.device.type != "cpu":
+                    raise ValueError("Kimi compute phase metadata must remain on CPU")
+                real_reqs = common_attn_metadata.kimi_mla_num_actual_reqs
+                has_prefill = has_prefill or bool(is_prefilling[:real_reqs].any())
+            actual_reqs = common_attn_metadata.kimi_mla_num_actual_reqs or 0
+            padded_reqs = common_attn_metadata.num_reqs
+            full_graph = common_attn_metadata.kimi_mla_full_graph or (
+                common_attn_metadata.graph_pad_size > 0 and padded_reqs > actual_reqs
+            )
+            ordinary_dummy = common_attn_metadata.kimi_mla_dummy and not full_graph
+            small_eager_batch = not full_graph and (
+                (common_attn_metadata.kimi_mla_num_actual_reqs or 0) < get_tp_group().world_size
+            )
+            graph_compatible = full_graph or self.vllm_config.compilation_config.cudagraph_mode.name == "NONE"
+            if not has_prefill and not ordinary_dummy and not small_eager_batch and graph_compatible:
+                group = get_tp_group()
+                expected_q = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
+                count = actual_reqs
+                prefix = common_attn_metadata.query_start_loc_cpu[: count + 1]
+                lengths = prefix[1:] - prefix[:-1]
+                if bool((lengths == expected_q).all()):
+                    metadata.compute_decode = build_compute_decode(
+                        metadata, common_attn_metadata, group.world_size, group.rank_in_group
+                    )
+                    if self.compute_flashmla_state is not None:
+                        local = metadata.compute_decode.local_metadata
+                        local.external_flashmla = self.compute_flashmla_state.build_partition(
+                            common_attn_metadata,
+                            metadata.compute_decode.partition,
+                            retain_for_graph=full_graph,
+                        )
+            if metadata.compute_decode is None and self.flashmla_state is not None:
+                return self._build_external_flashmla(common_prefix_len, common_attn_metadata)
         if self.pcp_enabled:
             assert expanded_slot_mapping is not None
             self._finalize_pcp_metadata(metadata, expanded_slot_mapping)
@@ -914,7 +990,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             capture_metadata.attn_state = AscendAttentionState.ChunkedPrefill
         if (self.dcp_enabled or self.flashmla_state is not None) and capture_metadata.is_prefilling is None:
             capture_metadata.is_prefilling = torch.zeros(capture_metadata.num_reqs, dtype=torch.bool)
-        if self.flashmla_state is not None:
+        if self.flashmla_state is not None and not self.kimi_compute_enabled:
             assert capture_metadata.num_reqs <= capture_metadata.num_actual_tokens * self.reorder_batch_threshold
             assert capture_metadata.max_query_len <= self.reorder_batch_threshold
             return self._build_external_flashmla(0, capture_metadata, retain_for_graph=True)
@@ -1055,6 +1131,17 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.mlapo_num_heads = self.num_heads
         self.mlapo_weight_quant_mode = 3
         self._mlapo_uses_native_weights = False
+        self.kimi_compute_enabled = compute_enabled(self)
+        if self.kimi_compute_enabled and (
+            self.fa_quant_layer
+            or self.enable_kv_nz
+            or self.num_kv_heads != 1
+            or self.q_lora_rank is None
+            or self.fused_qkv_a_proj is None
+        ):
+            raise ValueError(
+                "Kimi MLA compute requires one latent KV head, source A projection and unquantized ND cache"
+            )
         self.use_flashmla: bool = self._can_use_flashmla()
         self._flashmla_writer_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
@@ -1157,13 +1244,25 @@ class AscendMLAImpl(MLAAttentionImpl):
                     attn_metadata_current = attn_metadata
 
                 layer_metadata = attn_metadata_current[key]
-                seq_lens_list = layer_metadata.decode.seq_lens_list
-                if speculative_config and speculative_config.use_eagle() and not _EXTRA_CTX.is_draft_model:
+                compute = getattr(layer_metadata, "compute_decode", None)
+                if compute is not None:
+                    local_decode = compute.local_metadata.decode
+                    block_table = local_decode.block_table
+                    seq_lens_list = local_decode.seq_lens_list
+                    actual_seq_lengths = local_decode.actual_seq_lengths_q if compute.partition.query_len > 1 else None
+                else:
+                    seq_lens_list = layer_metadata.decode.seq_lens_list
+                if (
+                    compute is None
+                    and speculative_config
+                    and speculative_config.use_eagle()
+                    and not _EXTRA_CTX.is_draft_model
+                ):
                     actual_seq_lengths = layer_metadata.decode.actual_seq_lengths_q
                     spec_multiple = speculative_config.num_speculative_tokens + 1
                     seq_lens_list = seq_lens_list + [0] * (num_tokens // spec_multiple - len(seq_lens_list))
                     actual_seq_lengths = [spec_multiple * (i + 1) for i in range(num_tokens // spec_multiple)]
-                elif _EXTRA_CTX.is_draft_model:
+                elif compute is None and _EXTRA_CTX.is_draft_model:
                     actual_seq_lengths = layer_metadata.decode.actual_seq_lengths_q
                     block_table = layer_metadata.decode.block_table
                     # TODO: This is a hack and should be fixed in the future.
@@ -1209,10 +1308,14 @@ class AscendMLAImpl(MLAAttentionImpl):
 
                 event.record(update_stream)
 
-    def _v_up_proj(self, x):
+    def _v_up_proj(self, x, output_partitions=1):
         # Convert from (N, B, L)/(N, B, 1, L) to (N, B, L)
         x = x.view(self.num_heads, -1, self.kv_lora_rank)
         # Multiply (N, B, L) x (N, L, V) -> (B, N, V)
+        if output_partitions > 1:
+            return torch_npu.npu_transpose_batchmatmul(
+                x, self.W_UV, perm_y=(1, 0, 2), batch_split_factor=output_partitions
+            )
         x = torch_npu.npu_transpose_batchmatmul(x, self.W_UV, perm_y=(1, 0, 2))
         # Convert from (B, N, V) to (B, N * V)
         x = x.reshape(-1, self.num_heads * self.v_head_dim)
@@ -1312,6 +1415,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             W_UK.permute(1, 2, 0).contiguous(),  # (L, N, P) -> (N, P, L)
             prefer_copy=True,
         )
+        prepare_compute_weights(self)
         if self.enable_mlapo:
             layer_quant_method = None if self.fused_qkv_a_proj is None else self.fused_qkv_a_proj.quant_method
             if layer_quant_method is None or isinstance(layer_quant_method, UnquantizedLinearMethod):
@@ -1363,6 +1467,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             self.supports_prolog_v3_writer() or (self._supports_flashmla_mlapo() and not self.dcp_enabled)
         ):
             self._prepare_flashmla_writer_buffers()
+
+        prepare_compute_prolog(self, act_dtype)
+        prepare_compute_kv(self)
 
     def _prepare_flashmla_writer_buffers(self) -> None:
         """Keep a bounded dense PROLOG workspace alive across graph replay."""
@@ -1512,6 +1619,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             and self.vllm_config.kv_transfer_config is not None
             and self.vllm_config.kv_transfer_config.is_kv_consumer
             and self.vllm_config.scheduler_config.max_num_batched_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
+            and not self.kimi_compute_enabled
             and not ascend_config.mlapo_keep_prefill_weights
         ):
             self.fused_qkv_a_proj.weight = None  # type: ignore[union-attr]
@@ -2805,6 +2913,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         decode_preprocess_res: DecodeMLAPreprocessResult,
         block_size: int,
         attn_metadata: AscendMLAMetadata,
+        *,
+        graph_num_tokens: int | None = None,
+        defer_kv_ready_fence: bool = False,
     ) -> torch.Tensor:
         q_nope = decode_preprocess_res.ql_nope
         q_pe = decode_preprocess_res.q_pe
@@ -2992,16 +3103,18 @@ class AscendMLAImpl(MLAAttentionImpl):
             graph_params = get_graph_params()
         # Release subsequent layer prefetches at the decode attention boundary,
         # just as prefill and external FlashMLA do.
-        record_attention_compute_start()
+        if not defer_kv_ready_fence:
+            record_attention_compute_start()
+        graph_key = num_tokens if graph_num_tokens is None else graph_num_tokens
         if _EXTRA_CTX.capturing:
             stream = torch_npu.npu.current_stream()
 
             event = torch.npu.ExternalEvent()
             event.wait(stream)
             event.reset(stream)
-            graph_params.events[num_tokens].append(event)
+            graph_params.events[graph_key].append(event)
 
-            workspace = graph_params.workspaces.get(num_tokens)
+            workspace = graph_params.workspaces.get(graph_key)
             attn_output = torch.empty(attn_output_shape, dtype=q_pe.dtype, device=q_pe.device)
             softmax_lse = torch.empty(num_tokens, dtype=q_pe.dtype, device=q_pe.device)
             attn_params = (
@@ -3035,18 +3148,18 @@ class AscendMLAImpl(MLAAttentionImpl):
                     q_nope, k_nope, k_nope, **common_kwargs
                 )
                 if _EXTRA_CTX.is_draft_model:
-                    update_draft_graph_params_workspaces(num_tokens, workspace)
+                    update_draft_graph_params_workspaces(graph_key, workspace)
                 else:
-                    update_graph_params_workspaces(num_tokens, workspace)
+                    update_graph_params_workspaces(graph_key, workspace)
 
-            graph_params.attn_params[num_tokens].append(attn_params)
+            graph_params.attn_params[graph_key].append(attn_params)
 
             torch.npu.graph_task_group_begin(stream)
             torch_npu.npu_fused_infer_attention_score_v2.out(
                 q_nope, k_nope, k_nope, **common_kwargs, workspace=workspace, out=[attn_output, softmax_lse]
             )
             handle = torch.npu.graph_task_group_end(stream)
-            graph_params.handles[num_tokens].append(handle)
+            graph_params.handles[graph_key].append(handle)
         else:
             attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(q_nope, k_nope, k_nope, **common_kwargs)
 
@@ -3062,7 +3175,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             decode_q_pe = decode_q_pe[:, : self.num_heads]
         return decode_q_nope, decode_q_pe
 
-    def _forward_external_flashmla(self, preprocessed, fused_cache, metadata):
+    def _forward_external_flashmla(
+        self, preprocessed, fused_cache, metadata, *, defer_kv_ready_fence=False, output_partitions=1
+    ):
         flash = metadata.external_flashmla
         assert flash is not None
         if not isinstance(fused_cache, torch.Tensor):
@@ -3074,7 +3189,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         # so replay reuses its address.
         flash.query[..., : self.kv_lora_rank].copy_(preprocessed.ql_nope)
         flash.query[..., self.kv_lora_rank :].copy_(preprocessed.q_pe)
-        record_attention_compute_start()
+        if not defer_kv_ready_fence:
+            record_attention_compute_start()
         latent, _ = flash.adapter.attention(
             flash.query,
             fused_cache,
@@ -3085,6 +3201,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             metadata=flash.schedule,
             attn_mask=flash.attn_mask,
         )
+        if output_partitions > 1:
+            return self._v_up_proj(latent, output_partitions=output_partitions)
         return self._v_up_proj(latent)
 
     def mla_preprocess_only_decode(self, hidden_states, kv_cache, attn_metadata):
@@ -3430,12 +3548,27 @@ class AscendMLAImpl(MLAAttentionImpl):
         kv_cache: torch.Tensor | tuple[torch.Tensor, ...],
         attn_metadata: M,
         output: torch.Tensor | None = None,
+        *,
+        input_is_sequence_parallel: bool = False,
+        num_input_tokens: int = 0,
+        output_scale: float = 1.0,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
         if attn_metadata is None:
-            # Profiling run.
+            if input_is_sequence_parallel and self.kimi_compute_enabled:
+                profile_compute(self, hidden_states, num_input_tokens)
             return output.fill_(0)
 
+        if input_is_sequence_parallel:
+            if not self.kimi_compute_enabled or output_scale != 1.0:
+                raise ValueError("Unsupported Kimi compute SP configuration")
+            if attn_metadata.compute_decode is not None:
+                return forward_compute(
+                    self, layer_name, hidden_states, kv_cache, attn_metadata, output, num_input_tokens
+                )
+            from vllm.models.common.ops.sequence_parallel import sp_all_gather
+
+            hidden_states = sp_all_gather(hidden_states)[:num_input_tokens]
         num_actual_tokens = self.get_num_actual_tokens(attn_metadata)
         assert (
             attn_metadata.num_decodes is not None
