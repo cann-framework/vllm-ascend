@@ -1132,6 +1132,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.use_flashmla: bool = self._can_use_flashmla()
         self.use_flashmla_pa_nz = self.flash_mla_layout == "pa_nz"
         self._logged_pa_nz_decode = False
+        self._logged_pa_nz_prefill_write = False
         self._logged_pa_nz_dcp = False
         log = logger.info if (self.use_flashmla or self.flash_mla_layout == "pa_nz") else logger.debug
         log(
@@ -2083,6 +2084,29 @@ class AscendMLAImpl(MLAAttentionImpl):
             merged = torch.cat((kv_c_normed, k_pe), dim=-1).contiguous()
             tile_count = merged.shape[-1] // 16
             tile_indices = pa_nz_tile_indices(slots, merged_cache.shape[1], tile_count)
+            if not self._logged_pa_nz_prefill_write:
+                cache_block_size = merged_cache.shape[1]
+                slot_count = slots.numel()
+                slot_head = slots[:8].to(torch.int64).tolist()
+                slot_tail = slots[-8:].to(torch.int64).tolist()
+                kernel_blocks = torch.div(slots[:16], cache_block_size, rounding_mode="floor").tolist()
+                logger.info(
+                    "[PA_NZ][prefill-write] layer=%s tokens=%d slots=%d slot_min=%d slot_max=%d "
+                    "slot_head=%s slot_tail=%s kernel_blocks_head=%s cache_block_size=%d "
+                    "cache_shape=%s tile_count=%d",
+                    self.layer_name,
+                    num_tokens,
+                    slot_count,
+                    int(slots.min().item()),
+                    int(slots.max().item()),
+                    slot_head,
+                    slot_tail,
+                    kernel_blocks,
+                    cache_block_size,
+                    tuple(merged_cache.shape),
+                    tile_count,
+                )
+                self._logged_pa_nz_prefill_write = True
             torch_npu.npu_scatter_nd_update_(
                 merged_cache.view(-1, 16),
                 tile_indices.view(-1, 1),

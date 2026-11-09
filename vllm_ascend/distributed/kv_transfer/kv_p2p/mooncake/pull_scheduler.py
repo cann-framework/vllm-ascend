@@ -533,6 +533,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         self._reqs_recv_info: dict[str, tuple[str, int, str]] = {}
         self._sending_thread: MooncakeSchedulerSendingThread | None = None
         self._recving_thread: MooncakeSchedulerRecvingThread | None = None
+        self._logged_producer_group_layout = False
 
         if self.kv_transfer_config.is_kv_consumer:
             recving_ready_event = threading.Event()
@@ -669,6 +670,25 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         self._reqs_in_batch = set()
         return meta
 
+    def _log_producer_group_layout(self) -> None:
+        if self._logged_producer_group_layout:
+            return
+        self._logged_producer_group_layout = True
+        for group_index, (group, unique_specs, block_size) in enumerate(
+            zip(self.kv_cache_groups, self.group_unique_specs, self.group_block_size)
+        ):
+            layer_names = group.layer_names
+            logger.info(
+                "[MooncakeV2][producer-group] group=%d block_size=%d layers=%d "
+                "first_layer=%s last_layer=%s specs=%s",
+                group_index,
+                block_size,
+                len(layer_names),
+                layer_names[0] if layer_names else None,
+                layer_names[-1] if layer_names else None,
+                [type(spec).__name__ for spec in unique_specs],
+            )
+
     def request_finished(
         self,
         request: "Request",
@@ -691,6 +711,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
 
         prompt_token_ids = request.prompt_token_ids or []
         prompt_len = len(prompt_token_ids)
+        self._log_producer_group_layout()
         computed_block_ids = self._get_transfer_block_ids(block_ids, prompt_len)
         num_computed_blocks = sum(len(group_block_ids) for group_block_ids in computed_block_ids)
         logger.info(

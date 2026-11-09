@@ -699,7 +699,9 @@ class MooncakePullRecvingThread(threading.Thread):
                     if local_layer_index == layer_pairs[0][0]:
                         logger.info(
                             "[MooncakeV2][req] req=%s spec=%s local_layer=%d remote_layer=%d "
-                            "selection=%d local_scale=%d remote_scale=%d entries=%s",
+                            "selection=%d local_scale=%d remote_scale=%d "
+                            "prompt_tokens=%d/%d computed_tokens=%d "
+                            "logical_local=%s logical_remote=%s entries=%s",
                             request_id,
                             type(spec).__name__,
                             local_layer_index,
@@ -707,6 +709,11 @@ class MooncakePullRecvingThread(threading.Thread):
                             selection_index,
                             self.block_size_scales[local_layer_index][0],
                             remote_metadata.block_size_scales[remote_layer_index][0],
+                            request_metadata.local_num_prompt_tokens,
+                            request_metadata.remote_num_prompt_tokens,
+                            request_metadata.num_computed_tokens,
+                            request_metadata.local_block_ids[group_index],
+                            request_metadata.remote_block_ids[group_index],
                             transfer_block_ids,
                         )
 
