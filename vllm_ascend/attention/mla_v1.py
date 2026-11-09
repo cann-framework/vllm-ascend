@@ -2084,7 +2084,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             merged = torch.cat((kv_c_normed, k_pe), dim=-1).contiguous()
             tile_count = merged.shape[-1] // 16
             tile_indices = pa_nz_tile_indices(slots, merged_cache.shape[1], tile_count)
-            if not self._logged_pa_nz_prefill_write:
+            probe_layer = self.layer_name.endswith(".layers.3.self_attn.attn")
+            if probe_layer or not self._logged_pa_nz_prefill_write:
                 cache_block_size = merged_cache.shape[1]
                 slot_count = slots.numel()
                 slot_head = slots[:8].to(torch.int64).tolist()
@@ -2106,12 +2107,27 @@ class AscendMLAImpl(MLAAttentionImpl):
                     tuple(merged_cache.shape),
                     tile_count,
                 )
-                self._logged_pa_nz_prefill_write = True
+                if not probe_layer:
+                    self._logged_pa_nz_prefill_write = True
             torch_npu.npu_scatter_nd_update_(
                 merged_cache.view(-1, 16),
                 tile_indices.view(-1, 1),
                 merged.view(-1, 16),
             )
+            if probe_layer:
+                cache_block_size = merged_cache.shape[1]
+                probe_block = int((slots[0] // cache_block_size).item())
+                probe = merged_cache[probe_block].to(torch.float32)
+                logger.info(
+                    "[PA_NZ][prefill-checksum] layer=%s block=%d shape=%s "
+                    "abs_sum=%.6f row0_sum=%.6f row_last_sum=%.6f",
+                    self.layer_name,
+                    probe_block,
+                    tuple(merged_cache.shape),
+                    probe.abs().sum().item(),
+                    probe[0].sum().item(),
+                    probe[probe.shape[0] - 1].sum().item(),
+                )
         kv_c_normed = kv_c_normed.view(num_tokens, self.num_kv_heads, self.kv_lora_rank)
         k_pe = k_pe.reshape(num_tokens, self.num_kv_heads, self.qk_rope_head_dim)
         return k_pe, kv_c_normed
@@ -3473,7 +3489,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         if not self._logged_pa_nz_decode:
             logger.info(
                 "[PA_NZ] decode layer=%s tokens=%d actual=%d decodes=%d q_len=%d cache=%s block=%d "
-                "reserved=%d hidden_page=%s scratch_page=%s prolog_slots=%s async=%s dcp=%s",
+                "reserved=%d hidden_page=%s scratch_page=%s prolog_slots=%s async=%s dcp=%s "
+                "cp_interleave=%s block_table_head=%s cache_lens_head=%s prolog_slots_head=%s",
                 self.layer_name,
                 num_decode_tokens,
                 attn_metadata.num_actual_tokens,
@@ -3487,6 +3504,10 @@ class AscendMLAImpl(MLAAttentionImpl):
                 flash.prolog_slots is not None,
                 flash.metadata_async,
                 self.dcp_enabled,
+                getattr(self.vllm_config.parallel_config, "cp_kv_cache_interleave_size", None),
+                flash.block_table[:2, :8].to(torch.int64).tolist() if flash.block_table is not None else None,
+                flash.cache_lens[:4].to(torch.int64).tolist() if flash.cache_lens is not None else None,
+                flash.prolog_slots[:8].to(torch.int64).tolist() if flash.prolog_slots is not None else None,
             )
             self._logged_pa_nz_decode = True
         if flash.block_columns is not None:

@@ -66,6 +66,7 @@ class MooncakePullRecvingThread(threading.Thread):
         layer_name_to_group_index: dict[str, int],
         layer_name_to_spec_index: dict[str, int],
         local_metadata: MooncakeTransferMetadata,
+        kv_caches: dict[str, torch.Tensor | list[torch.Tensor]],
         tp_rank: int,
         tp_size: int,
         pp_rank: int,
@@ -88,6 +89,7 @@ class MooncakePullRecvingThread(threading.Thread):
         self.layer_name_to_group_index = layer_name_to_group_index
         self.layer_name_to_spec_index = layer_name_to_spec_index
         self.local_metadata = local_metadata
+        self.kv_caches = kv_caches
 
         self.block_size = local_metadata.block_size
         self.layer_names = local_metadata.layer_names
@@ -217,6 +219,61 @@ class MooncakePullRecvingThread(threading.Thread):
         with self.invalid_block_ids_lock:
             for group_block_ids in request_metadata.local_block_ids:
                 self.invalid_block_ids.update(group_block_ids)
+
+    def _log_local_cache_checksum(
+        self,
+        local_layer_index: int,
+        local_block_ids: list[int],
+        request_id: str,
+    ) -> None:
+        """Probe one destination block after a pull to verify DMA contents."""
+        layer_name = self.layer_names[local_layer_index]
+        cache = self.kv_caches.get(layer_name)
+        if isinstance(cache, (tuple, list)):
+            cache = cache[0] if cache else None
+        if not torch.is_tensor(cache) or cache.ndim < 2 or not local_block_ids:
+            return
+        block_id = int(local_block_ids[0])
+        if block_id < 0 or block_id >= cache.shape[0]:
+            logger.info(
+                "[KV-CHECKSUM][D] req=%s layer=%s block=%d out_of_range shape=%s",
+                request_id,
+                layer_name,
+                block_id,
+                tuple(cache.shape),
+            )
+            return
+        block = cache[block_id].to(torch.float32)
+        row_count = block.shape[0]
+        logger.info(
+            "[KV-CHECKSUM][D] req=%s layer=%s block=%d shape=%s "
+            "abs_sum=%.6f row0_sum=%.6f row_last_sum=%.6f",
+            request_id,
+            layer_name,
+            block_id,
+            tuple(cache.shape),
+            block.abs().sum().item(),
+            block[0].sum().item(),
+            block[row_count - 1].sum().item(),
+        )
+
+    def _log_dst_checksums(
+        self,
+        transfer_entries_by_spec: dict[
+            int,
+            dict[tuple[int, int], list[tuple[str, list[int], list[int]]]],
+        ],
+    ) -> None:
+        seen_requests: set[str] = set()
+        for spec_index, transfer_entries_by_layer in transfer_entries_by_spec.items():
+            if not isinstance(self.kv_cache_specs[spec_index], MLAAttentionSpec):
+                continue
+            for (local_layer_index, _), entries in transfer_entries_by_layer.items():
+                for request_id, local_block_ids, _ in entries:
+                    if request_id in seen_requests or not local_block_ids:
+                        continue
+                    seen_requests.add(request_id)
+                    self._log_local_cache_checksum(local_layer_index, local_block_ids, request_id)
 
     @staticmethod
     def _get_remote_endpoint(
@@ -1507,6 +1564,7 @@ class MooncakePullRecvingThread(threading.Thread):
             self.tp_rank,
             session_id,
         )
+        self._log_dst_checksums(transfer_entries_by_spec)
 
     @staticmethod
     def _validate_remote_metadata(
@@ -1643,6 +1701,7 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
                 layer_name_to_group_index=self.layer_name_to_group_index,
                 layer_name_to_spec_index=self.layer_name_to_spec_index,
                 local_metadata=self.xfer_handshake_metadata,
+                kv_caches=kv_caches,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 pp_rank=self.pp_rank,
