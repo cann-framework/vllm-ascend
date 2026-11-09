@@ -386,6 +386,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # Total number of tokens including padding, used for padding operations.
     num_input_tokens: int = 0
 
+    # FULL replay pads common.num_reqs and query prefixes to the graph bucket.
+    # Keep the real request count and graph/capture phase for strict MLA checks.
+    kimi_mla_num_actual_reqs: int | None = None
+    kimi_mla_full_graph: bool = False
+    kimi_mla_dummy: bool = False
+
     # Metadata for Decode Context Parallelism (DCP) operations.
     context_parallel_metadata: AscendDCPMetadata | None = None
     # Per-request / per-token request identity used by the Sparse KV offload
@@ -463,6 +469,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             req_topk_buffer_active=_slice_reqs(self.req_topk_buffer_active),
             copy_sfa_draft_index=self.copy_sfa_draft_index,
             offload_dummy=self.offload_dummy,
+            kimi_mla_dummy=self.kimi_mla_dummy,
             req_ids_tensor=_slice_reqs(self.req_ids_tensor),
             token_to_req=(self.token_to_req[:num_actual_tokens] if self.token_to_req is not None else None),
         )

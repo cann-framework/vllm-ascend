@@ -32,7 +32,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
-from vllm_ascend.attention.mla_v1 import AscendMLAAttention
+from vllm_ascend.attention.mla_v1 import AscendKimiComputeMLABackend, AscendMLAAttention
 from vllm_ascend.attention.utils import mark_fused_preprocess_weights
 
 
@@ -256,6 +256,8 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         # Fused preprocess (mlapo/prolog_v3) owns transpose+NZ for these
         # layers, so quant methods must skip their own NZ conversion.
         # Mark before VLLM calls process_weights_after_loading on submodules.
+        if getattr(self.mla_attn.impl, "kimi_compute_enabled", False):
+            self.mla_attn.attn_backend = AscendKimiComputeMLABackend
         mark_fused_preprocess_weights(self.mla_attn.impl)
 
         original_process_weights = self.mla_attn.process_weights_after_loading
@@ -293,6 +295,12 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         output = output.view(-1, hidden_dim)
         return output
 
+    def forward_kimi_sequence_parallel(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        tokens = (positions.shape[0] + self.output_token_shard_size - 1) // self.output_token_shard_size
+        output = hidden_states.new_empty((tokens, self.hidden_size))
+        torch.ops.vllm.mla_forward(hidden_states, output, self.prefix, True, positions.shape[0])
+        return output
+
     def forward_sequence_parallel(
         self,
         positions: torch.Tensor,
@@ -323,6 +331,19 @@ def mla_forward(
     else:
         attn_metadata = forward_context.attn_metadata
     kv_cache = self.mla_attn.kv_cache
+    if input_is_sequence_parallel and getattr(self.mla_attn.impl, "kimi_compute_enabled", False):
+        if attn_metadata is not None and num_input_tokens != attn_metadata.num_input_tokens:
+            raise ValueError("Kimi compute model/metadata global token capacity mismatch")
+        self.mla_attn.impl.forward(
+            self.mla_attn.layer_name,
+            hidden_states,
+            kv_cache,
+            attn_metadata,
+            output,
+            input_is_sequence_parallel=True,
+            num_input_tokens=num_input_tokens,
+        )
+        return
     if input_is_sequence_parallel:
         # Metadata-free SFA fills zeros for DP dummy and profiling batches.
         # Keep that output local while preserving backend initialization.

@@ -189,6 +189,25 @@ def test_kimi_disabling_mlapo_refreshes_projection_nz_management():
         assert cast.call_count == (0 if fa_quant_layer else 2)
 
 
+def test_kimi_mla_cache_clear_assignment_reaches_leaf():
+    attention = kimi_k3.AscendKimiMLAAttention.__new__(kimi_k3.AscendKimiMLAAttention)
+    nn.Module.__init__(attention)
+    attention.mla_attn = nn.Module()
+    leaf = nn.Module()
+    original_cache = torch.arange(12).reshape(3, 4).T
+    leaf.kv_cache = original_cache
+    attention.mla_attn.mla_attn = leaf
+    cleared_cache = torch.empty(0)
+
+    assert attention.kv_cache is original_cache
+    attention.kv_cache = cleared_cache
+
+    assert attention.kv_cache is cleared_cache
+    assert leaf.kv_cache is cleared_cache
+    assert "kv_cache" not in attention.__dict__
+    assert original_cache.shape == (4, 3) and original_cache.stride() == (1, 4)
+
+
 def test_kimi_moe_leaves_routed_input_transform_to_runner():
     moe = kimi_k3.AscendKimiMoE.__new__(kimi_k3.AscendKimiMoE)
     nn.Module.__init__(moe)
@@ -414,6 +433,7 @@ def test_kimi_mixed_kda_gate_weights_use_upstream_packed_loader(monkeypatch):
         q_lora_rank=None,
         num_hidden_layers=1,
         num_nextn_predict_layers=0,
+        attn_res_block_size=None,
     )
     model.n_redundant_experts = 0
     loaded_calls = []
