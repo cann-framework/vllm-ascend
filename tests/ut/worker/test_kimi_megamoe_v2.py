@@ -11,6 +11,7 @@ import math
 import sys
 import unittest
 from contextlib import nullcontext
+from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from enum import Enum, IntEnum
 from pathlib import Path
@@ -155,6 +156,7 @@ class TestKimiMegaMoEV2(unittest.TestCase):
                 "MoECommType",
                 "_is_kimi_moe_model",
                 "_is_kv_consumer_only",
+                "register_kimi_moe_quant_type",
                 "log_kimi_v2_megamoe_config",
                 "uses_kimi_prefill_megamoe",
                 "_kimi_megamoe_weights_supported",
@@ -463,6 +465,71 @@ class TestKimiMegaMoEV2(unittest.TestCase):
             runner.execute_model(NS(total_num_scheduled_tokens=1, num_scheduled_tokens={"request": 1}))
         self.assertIsNone(self.state.get_v2_moe_batch_state())
         runner.model_state.finish_execution.assert_called_once_with(failed=True)
+
+    def test_multimodal_producer_uses_loaded_language_model_quantization(self):
+        quant_type = self.ns["QuantType"]
+        for layouts, expected in (
+            ((quant_type.W4A8MXFP,), "FUSED_MC2"),
+            ((quant_type.W4A8MXFP, quant_type.NONE), "MC2"),
+            ((quant_type.NONE,), "MC2"),
+        ):
+            with self.subTest(layouts=layouts):
+                self.config.model_config.architectures = ["KimiK3ForConditionalGeneration"]
+                if hasattr(self.config.model_config, "_ascend_kimi_moe_quant_types"):
+                    del self.config.model_config._ascend_kimi_moe_quant_types
+                self.config.kv_transfer_config = NS(kv_role="kv_producer")
+                self.config.model_config.multimodal_config = NS()
+                self.config.model_config.hf_text_config.hidden_size = 7168
+                self.config.model_config.hf_config = NS(
+                    text_config=self.config.model_config.hf_text_config,
+                    vision_config=NS(num_attention_heads=1),
+                    media_placeholder_token_id=0,
+                )
+
+                def init_language_model(vllm_config, hf_config, prefix, architectures, loaded_layouts=layouts):
+                    language_config = copy(vllm_config)
+                    language_config.model_config = deepcopy(vllm_config.model_config)
+                    language_config.model_config.architectures = architectures
+                    for layout in loaded_layouts:
+                        self.ns["register_kimi_moe_quant_type"](language_config, layout)
+                    return NS(model_config=language_config.model_config, make_empty_intermediate_tensors=Mock())
+
+                vision_module = Mock()
+                vision_module.to.return_value = vision_module
+                namespace = dict(
+                    self.ns,
+                    nn=NS(Module=object),
+                    current_platform=NS(current_device=lambda: "npu"),
+                    is_vit_use_data_parallel=lambda heads: True,
+                    MoonViT3dPretrainedModel=Mock(return_value=vision_module),
+                    AscendKimiK3MultiModalProjector=Mock(return_value=vision_module),
+                    get_rotation_path=lambda config: None,
+                    maybe_prefix=lambda prefix, suffix: prefix + "." + suffix,
+                    init_vllm_registered_model=init_language_model,
+                )
+                load_functions(
+                    "vllm_ascend/models/kimi_k3.py",
+                    {"__init__"},
+                    namespace,
+                    class_name="AscendKimiK3ForConditionalGeneration",
+                )
+                wrapper = type(
+                    "MultimodalKimi",
+                    (),
+                    {
+                        "__init__": namespace["__init__"],
+                        "_maybe_ignore_quant_config": lambda self, config: config,
+                        "_mark_tower_model": lambda *args: nullcontext(),
+                        "_mark_language_model": lambda *args: nullcontext(),
+                    },
+                )(self.config)
+                self.assertIsNot(wrapper.language_model.model_config, self.config.model_config)
+                self.assertEqual(self.config.model_config._ascend_kimi_moe_quant_types, frozenset(layouts))
+                with self.state.v2_moe_batch_context(self.config, 8, dummy_run=False, is_profile=False):
+                    self.record([True], 8)
+                    desc, sync = self.ns["dispatch_cg_and_sync_dp"](None, 1, 8, None, 1, 0)
+                    context = self.forward_context(desc.num_tokens, sync, desc.cg_mode)
+                    self.assertEqual(context["moe_comm_type"].name, expected)
 
     def test_kv_consumer_does_not_enter_the_new_phase_collective(self):
         runner, parent = self.make_runner()

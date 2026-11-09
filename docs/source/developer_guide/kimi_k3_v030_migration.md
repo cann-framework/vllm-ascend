@@ -272,6 +272,15 @@ the padded MegaMoE numerical reference; complete model accuracy, PP/DCP,
 long-running request transitions and latency still require deployment tests.
 Independent P and D instances make decisions in their own communication domains.
 
+The multimodal K3 wrapper constructs its language model through
+`init_vllm_registered_model`, which deep-copies `model_config` in
+`with_hf_config`. Routed-layer quantization records belong to that inner
+configuration. The wrapper propagates those records to the outer configuration
+before weight processing, so the V2 runner can validate the loaded layouts.
+Without this propagation, even a pure Prefill batch on a `kv_producer` sees
+unknown layouts and falls back to ordinary MoE. Mixed and unsupported layouts
+remain ineligible after propagation.
+
 To diagnose a missing MegaMoE call, inspect the `Kimi V2 MegaMoE config` INFO
 line emitted after model loading. It reports the normalized fused-MC2 setting,
 operator availability, hardware support, actual registered routed layouts,
