@@ -1,0 +1,42 @@
+name: Approval access CPU probe
+run-name: approval-access-cpu-probe-${{ github.run_id }}
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    environment: committer-approval
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+      statuses: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify actual workflow token read access
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/.github/scripts:${{ github.workspace }}/.github/scripts/lite_actions
+        run: python3 -B .github/scripts/codex_approval_access_probe.py read
+      - name: Create repository-scoped checks token
+        id: checks
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.APPROVAL_APP_ID }}
+          private-key: ${{ secrets.APPROVAL_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-checks: write
+      - name: Publish a check on this test branch only
+        env:
+          GH_TOKEN: ${{ steps.checks.outputs.token }}
+          PYTHONPATH: ${{ github.workspace }}/.github/scripts
+        run: python3 -B .github/scripts/codex_approval_access_probe.py check
