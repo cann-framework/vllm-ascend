@@ -412,11 +412,7 @@ class FlashMLADecode:
     current: FlashMLACurrent | None = None
     layout: str = "PA_BBND"
     q_len: int = 1
-    tail_metadata: tuple[torch.Tensor, torch.Tensor] | None = None
     block_table_prepared: bool = False
-    tail_last_block_ids: torch.Tensor | None = None
-    tail_invalid: torch.Tensor | None = None
-    tail_offsets: torch.Tensor | None = None
     prolog_slots: torch.Tensor | None = None
     block_columns: torch.Tensor | None = None
     metadata_builder: Any = None
@@ -508,11 +504,6 @@ class FlashMLAMetadataBuilder:
             )
             schedule = torch.empty_like(schedule_meta, device=self.device)
         rope_shape = (tokens, 1, 1, FLASHMLA_QK_DIM - FLASHMLA_V_DIM)
-        tail_offsets = torch.arange(FLASHMLA_BLOCK_SIZE, dtype=torch.int64, device=self.device)
-        tail_last_block_ids = torch.zeros(rows, dtype=torch.int64, device=self.device)
-        tail_invalid = torch.zeros(
-            (rows, FLASHMLA_BLOCK_SIZE), dtype=torch.bool, device=self.device
-        )
         flash = FlashMLADecode(
             adapter=adapter,
             query=torch.empty(
@@ -536,10 +527,6 @@ class FlashMLAMetadataBuilder:
             sin=torch.empty(rope_shape, dtype=self.dtype, device=self.device) if self.use_rope else None,
             layout=adapter.config.layout_kv,
             q_len=q_len,
-            tail_metadata=(tail_last_block_ids, tail_invalid),
-            tail_last_block_ids=tail_last_block_ids,
-            tail_invalid=tail_invalid,
-            tail_offsets=tail_offsets,
             prolog_slots=torch.full((tokens,), -1, dtype=torch.int64, device=self.device),
             block_columns=torch.arange(columns, dtype=torch.int64, device=self.device),
         )
@@ -645,33 +632,6 @@ class FlashMLAMetadataBuilder:
                 flash.sin.copy_(sin)
             if flash.prolog_slots is not None:
                 flash.prolog_slots.copy_(flash.slots)
-            if (
-                num_decodes > 0
-                and flash.tail_last_block_ids is not None
-                and flash.tail_invalid is not None
-                and flash.tail_offsets is not None
-            ):
-                tail_lengths = flash.cache_lens[:num_decodes].to(torch.long)
-                last_columns = torch.div(
-                    torch.clamp_min(tail_lengths, 1) - 1,
-                    FLASHMLA_BLOCK_SIZE,
-                    rounding_mode="floor",
-                ).clamp_max(flash.block_table.shape[1] - 1)
-                last_block_ids = torch.gather(
-                    flash.block_table[:num_decodes].to(torch.long),
-                    1,
-                    last_columns[:, None],
-                ).squeeze(1)
-                flash.tail_last_block_ids[:num_decodes].copy_(last_block_ids)
-                valid_tail = torch.remainder(tail_lengths, FLASHMLA_BLOCK_SIZE)
-                valid_tail = torch.where(
-                    valid_tail == 0,
-                    torch.full_like(valid_tail, FLASHMLA_BLOCK_SIZE),
-                    valid_tail,
-                )
-                flash.tail_invalid[:num_decodes].copy_(
-                    flash.tail_offsets[None, :] >= valid_tail[:, None]
-                )
             flash.metadata_started = False
             flash.metadata_generated = False
             if flash.current is not None:

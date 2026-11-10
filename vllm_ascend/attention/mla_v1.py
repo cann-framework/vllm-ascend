@@ -3353,10 +3353,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_metadata: M,
     ) -> torch.Tensor:
         """Decode through the BF16 PA_NZ prolog + 0.27 FlashMLA operator."""
-        from vllm_ascend.ops.flash_mla_pa_nz import (  # noqa: PLC0415
-            clear_partial_block_tail,
-            mla_prolog_no_rope,
-        )
+        from vllm_ascend.ops.flash_mla_pa_nz import mla_prolog_no_rope  # noqa: PLC0415
 
         flash = attn_metadata.get_external_flashmla(self.flash_mla_layout)
         assert flash is not None
@@ -3367,7 +3364,6 @@ class AscendMLAImpl(MLAAttentionImpl):
         assert self.flash_gamma_qa is not None
         assert self.flash_gamma_kva is not None
         num_decode_tokens = attn_metadata.num_decode_tokens
-        num_decodes = attn_metadata.num_decodes
         merged_cache = kv_cache if isinstance(kv_cache, torch.Tensor) else kv_cache[0]
         block_size = merged_cache.shape[1]
         if flash.block_columns is not None:
@@ -3381,17 +3377,6 @@ class AscendMLAImpl(MLAAttentionImpl):
             stale = flash.block_columns[None, :] >= valid_cols[:, None]
             flash.block_table.copy_(
                 torch.where(stale, last_blocks[:, None], flash.block_table)
-            )
-        if num_decodes > 0 and flash.tail_last_block_ids is not None and flash.tail_invalid is not None:
-            clear_partial_block_tail(
-                merged_cache,
-                flash.block_table,
-                flash.cache_lens,
-                num_requests=num_decodes,
-                tail_metadata=(
-                    flash.tail_last_block_ids[:num_decodes],
-                    flash.tail_invalid[:num_decodes],
-                ),
             )
         if flash.metadata_async and flash.metadata_builder is not None and not flash.metadata_started:
             flash.metadata_builder.start_metadata(flash)
