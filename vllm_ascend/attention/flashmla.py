@@ -431,10 +431,10 @@ class FlashMLAMetadataBuilder:
     ):
         self.dcp_size = getattr(impl, "dcp_size", 1)
         self.dcp_rank = getattr(impl, "dcp_rank", 0)
-        # DCP splits the schedule between history and current adapters on the
-        # attention stream, so keep it synchronous until that split supports
-        # the same fork/join contract.
-        self.enable_async = bool(enable_async) and self.dcp_size == 1
+        # DCP builds both history and current schedules on the same side
+        # stream. The attention path waits once before entering the split
+        # history/current execution, so both schedules are visible there.
+        self.enable_async = bool(enable_async)
         self.metadata_stream = torch.npu.Stream() if self.enable_async else None
         # Re-record per step so each captured graph owns its own fork/join.
         self.metadata_start = None
