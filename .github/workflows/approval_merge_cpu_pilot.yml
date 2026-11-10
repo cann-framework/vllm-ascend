@@ -1,0 +1,54 @@
+name: Approval merge CPU pilot
+run-name: approval-merge-cpu-pilot-${{ github.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Isolated test PR number'
+        required: true
+      comment_id:
+        description: 'Test PR approval comment ID'
+        required: false
+      mode:
+        type: choice
+        options: [initialize, record, no_smoke, withdrawn, simulated_merge]
+        required: true
+
+permissions: {}
+
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    environment: committer-approval
+    timeout-minutes: 8
+    permissions:
+      contents: write
+      actions: read
+      issues: read
+      pull-requests: write
+      statuses: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Create repository-scoped checks token
+        id: checks
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.APPROVAL_APP_ID }}
+          private-key: ${{ secrets.APPROVAL_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-checks: write
+      - name: Run isolated approval scenario
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CHECKS_TOKEN: ${{ steps.checks.outputs.token }}
+          APPROVAL_SIGNING_KEY: ${{ secrets.APPROVAL_APP_PRIVATE_KEY }}
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/.github/scripts:${{ github.workspace }}/.github/scripts/lite_actions
+          PILOT_PR: ${{ inputs.pr_number }}
+          PILOT_COMMENT: ${{ inputs.comment_id }}
+          PILOT_MODE: ${{ inputs.mode }}
+        run: python3 -B .github/scripts/codex_approval_merge_pilot.py
