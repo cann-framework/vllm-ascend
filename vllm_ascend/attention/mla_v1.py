@@ -434,6 +434,8 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
                     device,
                     scheduler_config.max_num_seqs,
                     self.attn_mask_builder.get_splitfuse_attn_mask(),
+                    # FlashMLA owns a private stream. Do not reuse the
+                    # router/shared-expert streams used by Kimi MoE overlap.
                     enable_async=enable_metadata_stream,
                     cache_block_size=MLA_KERNEL_BLOCK_SIZE
                     if getattr(impl, "is_draft_cache", False)
