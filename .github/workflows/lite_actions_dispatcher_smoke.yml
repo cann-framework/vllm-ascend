@@ -1,154 +1,54 @@
-name: Dispatcher-Smoke
-run-name: >-
-  ${{ github.event_name == 'pull_request_target' && format('lite-vllm-pr-{0}-{1}-{2}', github.event.pull_request.number, github.event.pull_request.head.sha, github.workflow_sha) || (inputs.source_pr && format('lite-vllm-recheck-{0}-{1}-{2}', inputs.source_pr, github.workflow_sha, inputs.bridge_nonce)) || format('lite-vllm-manual-{0}', github.workflow_sha) }}
+name: Approval merge CPU pilot
+run-name: approval-merge-cpu-pilot-${{ github.run_id }}
 
 on:
-  pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review, edited]
   workflow_dispatch:
     inputs:
-      test_cases:
-        description: 'JSON test_id selectors; empty runs the shared Blue Smoke suite'
+      pr_number:
+        description: 'Isolated test PR number'
+        required: true
+      comment_id:
+        description: 'Test PR approval comment ID'
         required: false
-        type: string
-      source_pr:
-        description: 'Trusted Blue reconciler PR number; leave empty for a commit smoke'
-        required: false
-        type: string
-      expected_head_sha:
-        description: 'Exact expected Head for a Blue PR recheck'
-        required: false
-        type: string
-      expected_base_sha:
-        description: 'Exact expected Base for a Blue PR recheck'
-        required: false
-        type: string
-      bridge_nonce:
-        description: '32-character trusted recheck intent digest'
-        required: false
-        type: string
+      mode:
+        type: choice
+        options: [initialize, record, no_smoke, withdrawn, simulated_merge]
+        required: true
 
-permissions:
-  contents: read
-  actions: read
-  pull-requests: read
-  statuses: write
-
-concurrency:
-  group: >-
-    ${{ github.event_name == 'pull_request_target' && github.event.action == 'edited' && !github.event.changes.base.ref.from && format('lite-vllm-ignored-{0}', github.run_id) || format('lite-vllm-{0}', github.event.pull_request.number || inputs.source_pr || github.run_id) }}
-  cancel-in-progress: true
+permissions: {}
 
 jobs:
-  prepare:
-    if: >-
-      github.repository == 'cann-framework/vllm-ascend' &&
-      (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request_target') &&
-      (github.event_name != 'pull_request_target' || github.event.action != 'edited' || github.event.changes.base.ref.from)
+  pilot:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
-      sha: ${{ steps.plan.outputs.sha }}
-      plan_digest: ${{ steps.plan.outputs.plan_digest }}
-      native_source: ${{ steps.plan.outputs.native_source }}
+    environment: committer-approval
+    timeout-minutes: 8
+    permissions:
+      contents: write
+      actions: read
+      issues: read
+      pull-requests: write
+      statuses: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: cann-framework/vllm-ascend
-          ref: ${{ github.workflow_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Invalidate the previous target result
-        if: github.event_name == 'pull_request_target' && github.event.action == 'edited' && github.event.changes.base.ref.from
+      - name: Create repository-scoped checks token
+        id: checks
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.APPROVAL_APP_ID }}
+          private-key: ${{ secrets.APPROVAL_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-checks: write
+      - name: Run isolated approval scenario
         env:
-          GH_TOKEN: ${{ github.token }}
-          CI_PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/native_result.py --pending-pr "$CI_PR_NUMBER" --state pending
-      - name: Create trusted smoke plan and immutable Blue merge source
-        id: plan
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CI_TEST_CASES: ${{ inputs.test_cases }}
-          CI_SOURCE_PR: ${{ inputs.source_pr }}
-          CI_EXPECTED_HEAD: ${{ inputs.expected_head_sha }}
-          CI_EXPECTED_BASE: ${{ inputs.expected_base_sha }}
-        run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/prepare_request.py
-      - name: Publish versioned Blue pending status
-        if: steps.plan.outputs.native_source == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/native_result.py --source .ci-request/source.json --state pending
-      - uses: actions/upload-artifact@v4
-        if: steps.plan.outputs.native_source == 'true'
-        with:
-          name: lite-ci-source-${{ github.run_attempt }}
-          path: .ci-request/source.json
-          if-no-files-found: error
-          retention-days: 7
-      - uses: actions/upload-artifact@v4
-        with:
-          name: lite-ci-request-${{ github.run_attempt }}
-          path: .ci-request/ci-request.json
-          if-no-files-found: error
-          retention-days: 7
-
-  smoke:
-    needs: prepare
-    runs-on: ubuntu-latest
-    name: ${{ matrix.case_id }}
-    timeout-minutes: 300
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: cann-framework/vllm-ascend
-          ref: ${{ github.workflow_sha }}
-          persist-credentials: false
-      - uses: actions/download-artifact@v4
-        if: needs.prepare.outputs.native_source == 'true'
-        with:
-          name: lite-ci-source-${{ github.run_attempt }}
-          path: .ci-source
-      - name: Wait for assigned Lite Actions worker
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CI_SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
-          CI_RESULT_AUTHOR: ${{ vars.LITE_CI_RESULT_ACTOR || 'depeng1994' }}
-          CI_PLAN_DIGEST: ${{ needs.prepare.outputs.plan_digest }}
-          CI_CASE: ${{ toJSON(matrix) }}
-          CI_WORKFLOW: lite_actions_dispatcher_smoke.yml
-          CI_NATIVE_SOURCE: ${{ needs.prepare.outputs.native_source == 'true' && '.ci-source/source.json' || '' }}
-        run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/wait_result.py
-
-  result:
-    if: always() && needs.prepare.result != 'skipped'
-    needs: [prepare, smoke]
-    runs-on: ubuntu-latest
-    name: Lite-Actions-Smoke
-    steps:
-      - uses: actions/checkout@v4
-        if: needs.prepare.outputs.native_source == 'true'
-        with:
-          repository: cann-framework/vllm-ascend
-          ref: ${{ github.workflow_sha }}
-          persist-credentials: false
-      - uses: actions/download-artifact@v4
-        if: needs.prepare.outputs.native_source == 'true'
-        with:
-          name: lite-ci-source-${{ github.run_attempt }}
-          path: .ci-source
-      - name: Publish versioned Blue result without granting atomic merge permission
-        if: needs.prepare.outputs.native_source == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SMOKE: ${{ needs.smoke.result }}
-        run: |
-          state=failure
-          if test "$SMOKE" = success; then state=success; fi
-          PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/native_result.py --source .ci-source/source.json --state "$state"
-      - env:
-          PREPARE: ${{ needs.prepare.result }}
-          SMOKE: ${{ needs.smoke.result }}
-        run: test "$PREPARE" = success && test "$SMOKE" = success
+          GITHUB_TOKEN: ${{ github.token }}
+          CHECKS_TOKEN: ${{ steps.checks.outputs.token }}
+          APPROVAL_SIGNING_KEY: ${{ secrets.APPROVAL_APP_PRIVATE_KEY }}
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/.github/scripts:${{ github.workspace }}/.github/scripts/lite_actions
+          PILOT_PR: ${{ inputs.pr_number }}
+          PILOT_COMMENT: ${{ inputs.comment_id }}
+          PILOT_MODE: ${{ inputs.mode }}
+        run: python3 -B .github/scripts/codex_approval_merge_pilot.py
