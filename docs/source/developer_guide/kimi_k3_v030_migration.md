@@ -233,6 +233,23 @@ TP requires it. Unlike the old PR20 code, 0.30 already preserves the agreed
 `num_tokens_across_dp` vector inside dummy execution; this fix is retained.
 The policy assumes matching configuration across participating ranks.
 
+V1 and V2 both report Kimi eligibility and backend selection at INFO level.
+V1 emits `Kimi V1 MegaMoE config` from backend selection; V2 emits
+`Kimi V2 MegaMoE config` after loading. Configuration messages are deduplicated
+per configuration in each worker process, while selection messages use the
+logger's default local-first-rank scope and are deduplicated by decision.
+The configuration includes actual layouts, activation, KV role, upstream EPLB
+and legacy Ascend dynamic EPLB/redundancy/mix-placement flags. Selection
+includes the agreed Decode flag, graph mode, capacity overflow and draft flag.
+
+PD colocation (`kv_both` or no KV transfer) does not itself exclude V1
+MegaMoE. Pure Prefill across the participating ranks may use it; real Decode
+or a Prefill/Decode mixture in that communication domain selects ordinary
+MoE. The separate `mix_placement` expert-placement feature and legacy Ascend
+dynamic EPLB/redundancy remain excluded by the shared weight guard. Upstream
+`--enable-eplb` is accepted only with V2 by platform validation; the V2 EPLB
+support below does not enable that flag on V1.
+
 MRv2 scopes target phase metadata to `execute_model` and records real request
 stages in `gather_batch_req_state`. Its existing dispatch patch exchanges
 real-work, Decode, profiling, eligibility and capacity metadata in one extra
@@ -320,7 +337,7 @@ workers for per-batch local/peer metadata, the graph-required eligibility flag,
 microbatching, PCP and aligned token counts. Filter worker output with:
 
 ```bash
-rg 'Kimi V2 MegaMoE|Kimi V2 MoE selection' worker.log
+rg 'Kimi V[12] MegaMoE|Kimi V[12] MoE selection' worker.log
 ```
 
 The initial regression suite missed the `kv_both` producer/consumer combination:

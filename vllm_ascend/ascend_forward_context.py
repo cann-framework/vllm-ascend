@@ -177,30 +177,39 @@ def uses_kimi_prefill_megamoe(vllm_config: VllmConfig) -> bool:
     )
 
 
-def log_kimi_v2_megamoe_config(vllm_config: VllmConfig) -> None:
-    """Report loaded-model gates once, before profiling or real requests."""
+def log_kimi_megamoe_config(vllm_config: VllmConfig) -> None:
+    """Report model gates once per configuration in each worker process."""
     if not _is_kimi_moe_model(vllm_config):
         return
     description = getattr(getattr(vllm_config, "quant_config", None), "quant_description", None)
     group_size = description.get("group_size", _KIMI_MEGA_MOE_GROUP_SIZE) if isinstance(description, dict) else None
     layouts = getattr(vllm_config.model_config, "_ascend_kimi_moe_quant_types", None) or ()
     parallel_eplb = getattr(vllm_config.parallel_config, "eplb_config", None)
-    logger.info(
-        "Kimi V2 MegaMoE config: fused_mc2=%s, runtime_available=%s, hardware_mxfp=%s, "
+    config = get_ascend_config()
+    ascend_eplb = getattr(config, "eplb_config", None)
+    logger.info_once(
+        "Kimi %s MegaMoE config: fused_mc2=%s, runtime_available=%s, hardware_mxfp=%s, "
         "capable=%s, weights_supported=%s, layouts=%s, group_size=%s, ep_size=%s, pcp_size=%s, kv_role=%s, "
-        "eplb_enabled=%s, redundant_experts=%s",
-        get_ascend_config().enable_fused_mc2,
+        "eplb_enabled=%s, redundant_experts=%s, dynamic_eplb=%s, ascend_redundant_experts=%s, "
+        "mix_placement=%s, activation=%s",
+        "V2" if getattr(vllm_config, "use_v2_model_runner", False) else "V1",
+        config.enable_fused_mc2,
         is_mega_moe_supported(),
         get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP),
         use_cann_megamoe(vllm_config),
         _kimi_megamoe_weights_supported(vllm_config),
-        sorted(layout.name for layout in layouts),
+        str(sorted(layout.name for layout in layouts)),
         group_size,
         get_ep_group().world_size,
-        vllm_config.parallel_config.prefill_context_parallel_size,
+        getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1),
         getattr(getattr(vllm_config, "kv_transfer_config", None), "kv_role", None),
         getattr(vllm_config.parallel_config, "enable_eplb", False),
         getattr(parallel_eplb, "num_redundant_experts", 0),
+        getattr(ascend_eplb, "dynamic_eplb", False),
+        getattr(ascend_eplb, "num_redundant_experts", 0),
+        getattr(config, "mix_placement", False),
+        getattr(vllm_config.model_config.hf_text_config, "hidden_act", None),
+        scope="process",
     )
 
 
@@ -561,13 +570,20 @@ def select_moe_comm_method(
             is_draft_model,
             draft_moe_quant_type,
         )
-    if getattr(vllm_config, "use_v2_model_runner", False) and _is_kimi_moe_model(vllm_config):
+    if _is_kimi_moe_model(vllm_config):
+        use_v2 = getattr(vllm_config, "use_v2_model_runner", False)
+        if not use_v2:
+            log_kimi_megamoe_config(vllm_config)
         logger.info_once(
-            "Kimi V2 MoE selection: method=%s, contains_decode=%s, graph_mode=%s, prefill_ready=%s",
+            "Kimi %s MoE selection: method=%s, contains_decode=%s, graph_mode=%s, "
+            "v2_prefill_ready=%s, over_capacity=%s, is_draft=%s",
+            "V2" if use_v2 else "V1",
             moe_comm_type,
             batch_contains_decode,
             aclgraph_runtime_mode,
             v2_prefill_ready,
+            num_tokens > mc2_tokens_capacity if num_tokens is not None and mc2_tokens_capacity is not None else None,
+            is_draft_model,
         )
     logger.debug(
         "MoE comm method selected: policy=%s, method=%s, num_tokens=%d, mc2_capacity=%s, "

@@ -157,7 +157,7 @@ class TestKimiMegaMoEV2(unittest.TestCase):
                 "_is_kimi_moe_model",
                 "_is_kv_consumer_only",
                 "register_kimi_moe_quant_type",
-                "log_kimi_v2_megamoe_config",
+                "log_kimi_megamoe_config",
                 "uses_kimi_prefill_megamoe",
                 "_kimi_megamoe_weights_supported",
                 "use_cann_megamoe",
@@ -615,8 +615,8 @@ class TestKimiMegaMoEV2(unittest.TestCase):
             with self.subTest(layouts=layouts, available=available):
                 self.config.model_config._ascend_kimi_moe_quant_types = layouts
                 self.ns["is_mega_moe_supported"] = lambda available=available: available
-                self.ns["log_kimi_v2_megamoe_config"](self.config)
-                message, *arguments = self.ns["logger"].info.call_args.args
+                self.ns["log_kimi_megamoe_config"](self.config)
+                message, *arguments = self.ns["logger"].info_once.call_args.args
                 output = message % tuple(arguments)
                 self.assertIn(f"runtime_available={available}", output)
                 self.assertIn(f"weights_supported={supported}", output)
