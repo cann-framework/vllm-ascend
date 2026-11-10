@@ -228,6 +228,28 @@ class KDAStateCopyPlan:
         self._launch(state, packed, indices, flags, to_cache=False)
         return packed
 
+    def gather_into(
+        self, state: torch.Tensor, packed: torch.Tensor, indices: torch.Tensor, flags: torch.Tensor | None = None
+    ) -> None:
+        """Gather into a caller-owned buffer at an opaque runtime boundary."""
+        indices = self._indices(state, indices)
+        if (
+            tuple(packed.shape) != (indices.numel(), *state.shape[1:])
+            or packed.device != state.device
+            or packed.dtype != state.dtype
+            or not packed.is_contiguous()
+        ):
+            raise RuntimeError("KDA gather buffer must match selected count, cache payload, dtype and device")
+        if flags is None:
+            flags = torch.ones(indices.numel(), dtype=torch.bool, device=state.device)
+        else:
+            if flags.ndim != 1:
+                flags = flags.reshape(-1)
+            if flags.numel() != indices.numel():
+                raise RuntimeError("KDA flags must match the selected count")
+            flags = _canonical(flags, torch.bool, state.device, vector=True)
+        self._launch(state, packed, indices, flags, to_cache=False)
+
     def scatter(self, state: torch.Tensor, packed: torch.Tensor, indices: torch.Tensor) -> None:
         """Scatter final states, casting to cache dtype as the old path did.
 
@@ -349,6 +371,18 @@ class StridedKDAFallbackPlan:
             packed.masked_fill_(~flags[:, None, None, None], 0)
         return packed
 
+    def gather_into(self, state, packed, indices, flags=None):
+        """Reuse a persistent Mega workspace without canonicalizing the cache."""
+        if packed.dtype != state.dtype or not packed.is_contiguous():
+            raise ValueError("KDA gather buffer must have the cache dtype and contiguous payload")
+        if flags is not None:
+            flags = flags.to(device=state.device, dtype=torch.bool).reshape(-1)
+            if flags.numel() != indices.numel():
+                raise ValueError("KDA fallback flags must match selected count")
+        self._copy(state, packed, indices, to_cache=False)
+        if flags is not None:
+            packed.masked_fill_(~flags[:, None, None, None], 0)
+
     def scatter(self, state, packed, indices):
         """Cast/contiguize final states and preserve untouched cache pages."""
         if torch.compiler.is_compiling():
@@ -379,8 +413,10 @@ def initialize_kda_state_copy(static_forward_context: dict, max_selected: int) -
     plan_type: type[KDAStateCopyPlan] | type[StridedKDAFallbackPlan]
     for _, layer in bindings:
         kv_cache = getattr(layer, "kv_cache", None)
-        if not isinstance(kv_cache, (tuple, list)) or len(kv_cache) != 2:
+        if not isinstance(kv_cache, (tuple, list)):
             raise RuntimeError("Kimi KDA cache must be bound before strict state-copy preparation")
+        if len(kv_cache) not in (2, 5):
+            raise RuntimeError("Kimi KDA cache must contain two states unless ReplaySSM is enabled")
         state = kv_cache[1]
         if not isinstance(state, torch.Tensor):
             raise RuntimeError("Kimi KDA cache state must be a torch.Tensor")
