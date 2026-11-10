@@ -98,7 +98,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # PA_BBND external FlashMLA path. When enabled, only the 0.27 PA_NZ BF16
     # operators are imported; the C8/FP8 path is not included.
     # Valid values: 0 or 1. Not sensitive.
-    "VLLM_ASCEND_ENABLE_FLASH_MLA": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_FLASH_MLA", "0"))),
+    "VLLM_ASCEND_ENABLE_PA_NZ": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_PA_NZ", "0"))),
 }
 
 # end-env-vars-definition

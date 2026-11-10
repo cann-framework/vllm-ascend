@@ -3,7 +3,7 @@
 """BF16 Kimi K3 MLA decode operators over the merged PA_NZ latent cache.
 
 This module mirrors the v0.27 ``ops/flash_mla.py`` BF16 subset.  It is only
-imported when ``VLLM_ASCEND_ENABLE_FLASH_MLA`` is enabled, so installations
+imported when ``VLLM_ASCEND_ENABLE_PA_NZ`` is enabled, so installations
 without the optional ``cann_ops_transformer`` / ``cannbot-dsl`` operators keep
 working on the native PA_BBND path.
 
@@ -48,7 +48,7 @@ def _get_pa_nz_flash_mla_ops() -> tuple[Callable, Callable]:
         )
     except (ImportError, AttributeError) as exc:
         raise RuntimeError(
-            "VLLM_ASCEND_ENABLE_FLASH_MLA=1 requires the 0.27 PA_NZ "
+            "VLLM_ASCEND_ENABLE_PA_NZ=1 requires the 0.27 PA_NZ "
             "flash_mla + flash_mla_metadata operators from a matching "
             "cann_ops_transformer install."
         ) from exc
@@ -62,7 +62,7 @@ def _get_bf16_mla_prolog_op() -> Callable:
         return module.mla_prolog_bf16
     except ImportError as exc:
         raise RuntimeError(
-            "VLLM_ASCEND_ENABLE_FLASH_MLA=1 requires mla_prolog_bf16 from "
+            "VLLM_ASCEND_ENABLE_PA_NZ=1 requires mla_prolog_bf16 from "
             "the cannbot-dsl package."
         ) from exc
 
