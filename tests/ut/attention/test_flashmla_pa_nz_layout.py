@@ -1,4 +1,4 @@
-"""CPU checks for the PA_NZ cache layout used by VLLM_ASCEND_ENABLE_FLASH_MLA."""
+"""CPU checks for the PA_NZ cache layout used by VLLM_ASCEND_ENABLE_PA_NZ."""
 
 from vllm_ascend.attention.flashmla import FlashMLAConfig
 

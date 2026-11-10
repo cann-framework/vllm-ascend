@@ -1077,7 +1077,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.mlapo_num_heads = self.num_heads
         self.mlapo_weight_quant_mode = 3
         self._mlapo_uses_native_weights = False
-        self.flash_mla_pa_nz_requested = bool(envs_ascend.VLLM_ASCEND_ENABLE_FLASH_MLA)
+        self.flash_mla_pa_nz_requested = bool(envs_ascend.VLLM_ASCEND_ENABLE_PA_NZ)
         self.flash_mla_feature_mode = self.pcp_enabled
         self.flash_mla_layout = (
             "pa_nz"
@@ -1100,45 +1100,45 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.flash_gamma_kva: torch.Tensor | None = None
 
     def _validate_flash_mla_pa_nz_layer(self) -> None:
-        """Fail fast when VLLM_ASCEND_ENABLE_FLASH_MLA cannot be honoured."""
+        """Fail fast when VLLM_ASCEND_ENABLE_PA_NZ cannot be honoured."""
         config = self.vllm_config
         if not getattr(config, "use_v2_model_runner", False):
-            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 requires Model Runner V2.")
+            raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 requires Model Runner V2.")
         if not get_current_hardware_profile().supports(HardwareCapability.MLA_FLASH):
-            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 requires Ascend 950 (A5).")
+            raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 requires Ascend 950 (A5).")
         if self.is_draft_model:
-            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 is not supported for draft models.")
+            raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 is not supported for draft models.")
         if self.use_mla_rope:
-            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 requires a no-RoPE MLA layer.")
+            raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 requires a no-RoPE MLA layer.")
         if self.fa_quant_layer or self.enable_kv_nz:
-            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 does not support FA-quant or KV NZ caches.")
+            raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 does not support FA-quant or KV NZ caches.")
         if self.q_lora_rank is None or self.fused_qkv_a_proj is None or self.q_proj is None:
             raise RuntimeError(
-                "VLLM_ASCEND_ENABLE_FLASH_MLA=1 requires q_lora_rank, fused_qkv_a_proj and q_proj."
+                "VLLM_ASCEND_ENABLE_PA_NZ=1 requires q_lora_rank, fused_qkv_a_proj and q_proj."
             )
         if self.kv_lora_rank != FLASHMLA_V_DIM or self.qk_rope_head_dim != FLASHMLA_QK_DIM - FLASHMLA_V_DIM:
             raise RuntimeError(
-                f"VLLM_ASCEND_ENABLE_FLASH_MLA=1 requires kv_lora_rank={FLASHMLA_V_DIM} and "
+                f"VLLM_ASCEND_ENABLE_PA_NZ=1 requires kv_lora_rank={FLASHMLA_V_DIM} and "
                 f"qk_rope_head_dim={FLASHMLA_QK_DIM - FLASHMLA_V_DIM}."
             )
         if self.num_kv_heads != 1:
-            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 requires one KV head.")
+            raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 requires one KV head.")
         if self.dtype != torch.bfloat16:
-            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 supports BF16 only.")
+            raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 supports BF16 only.")
         if self.pcp_enabled:
-            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 does not support PCP yet.")
+            raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 does not support PCP yet.")
         speculative_config = getattr(config, "speculative_config", None)
         if speculative_config is not None and speculative_config.method != "dspark":
-            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 supports only DSpark speculative decoding.")
+            raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 supports only DSpark speculative decoding.")
         if self.is_draft_model:
-            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 is not supported for draft models.")
+            raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 is not supported for draft models.")
         if enable_sfa(config):
-            raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 does not support SFA.")
+            raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 does not support SFA.")
         for projection in (self.fused_qkv_a_proj, self.q_proj):
             quant_method = getattr(projection, "quant_method", None)
             inner = getattr(quant_method, "quant_method", quant_method)
             if inner is not None and not isinstance(inner, UnquantizedLinearMethod):
-                raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 requires native BF16 MLA projections.")
+                raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 requires native BF16 MLA projections.")
         from vllm_ascend.ops.flash_mla_pa_nz import (  # noqa: PLC0415
             _get_bf16_mla_prolog_op,
             _get_pa_nz_flash_mla_ops,
@@ -3026,7 +3026,7 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         if self.use_flashmla_pa_nz:
             if pcp_local_range is not None:
-                raise RuntimeError("VLLM_ASCEND_ENABLE_FLASH_MLA=1 does not support PCP.")
+                raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 does not support PCP.")
             return self._exec_kv_no_rope_merged(kv_no_split, kv_cache, slots)
         if not self.use_mla_rope:
             k_pe, k_nope = self._exec_kv_no_rope(kv_no_split, kv_cache, slots)
