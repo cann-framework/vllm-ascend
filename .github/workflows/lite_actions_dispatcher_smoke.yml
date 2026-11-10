@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       test_cases:
-        description: 'JSON test_id selectors; Blue suite: vllm_worker_os_blue, dispatch_smoke_a3_8p, dispatch_smoke_a3_16p; empty preserves A5 8P'
+        description: 'JSON test_id selectors; empty runs the shared Blue Smoke suite'
         required: false
         type: string
       source_pr:
@@ -42,11 +42,7 @@ jobs:
   prepare:
     if: >-
       github.repository == 'cann-framework/vllm-ascend' &&
-      (github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'pull_request_target' &&
-        github.event.pull_request.head.repo.full_name == 'depeng1994/vllm-ascend' &&
-        github.event.pull_request.user.login == 'depeng1994' &&
-        !github.event.pull_request.draft))
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request_target')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -68,12 +64,12 @@ jobs:
           CI_SOURCE_PR: ${{ inputs.source_pr }}
           CI_EXPECTED_HEAD: ${{ inputs.expected_head_sha }}
           CI_EXPECTED_BASE: ${{ inputs.expected_base_sha }}
-        run: python3 .github/scripts/lite_actions/prepare_request.py
+        run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/prepare_request.py
       - name: Publish versioned Blue pending status
         if: steps.plan.outputs.native_source == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/lite_actions/native_result.py --source .ci-request/source.json --state pending
+        run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/native_result.py --source .ci-request/source.json --state pending
       - uses: actions/upload-artifact@v4
         if: steps.plan.outputs.native_source == 'true'
         with:
@@ -91,7 +87,7 @@ jobs:
   smoke:
     needs: prepare
     runs-on: ubuntu-latest
-    name: ${{ matrix.test_id }}
+    name: ${{ matrix.case_id }}
     timeout-minutes: 300
     strategy:
       fail-fast: false
@@ -143,7 +139,7 @@ jobs:
         run: |
           state=failure
           if test "$SMOKE" = success; then state=success; fi
-          python3 .github/scripts/lite_actions/native_result.py --source .ci-source/source.json --state "$state"
+          PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/native_result.py --source .ci-source/source.json --state "$state"
       - env:
           PREPARE: ${{ needs.prepare.result }}
           SMOKE: ${{ needs.smoke.result }}

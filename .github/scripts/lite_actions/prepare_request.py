@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Trusted schema-3 plan builder. Never run or import fork Python in control jobs."""
+"""Build the versioned plan without importing fork Python in control jobs."""
 
 import hashlib
 import json
@@ -20,34 +20,24 @@ def selectors(event, payload, value):
     if event == "pull_request_target":
         pr = payload["pull_request"]
         base, head = pr["base"], pr["head"]
-        target = base["ref"]
         if (
             base["repo"]["full_name"] != REPO
-            or not (target == "main" or target.startswith("releases/") or target.endswith("-dev"))
-            or head["repo"]["full_name"] != "depeng1994/vllm-ascend"
-            or pr["user"]["login"] != "depeng1994"
-            or pr.get("draft")
+            or not base.get("ref")
+            or not head.get("repo", {}).get("full_name")
             or pr["state"] != "open"
         ):
-            raise ValueError("PR is not on the trusted admission allowlist")
+            raise ValueError("invalid PR source or target repository")
         sha = head["sha"]
-        ids = ["dispatch_smoke_a5_8p"]
-        labels = {x["name"] for x in pr.get("labels", [])}
-        if "lite-a3-blue" in labels:
-            if target != "main":
-                raise ValueError("Blue merge tests only target main")
-            ids = list(BLUE_SMOKE_SUITE)
-        elif "lite-a5-32p" in labels:
-            ids.append("dispatch_smoke_a5_32p")
+        ids = list(BLUE_SMOKE_SUITE)
     elif event == "workflow_dispatch":
-        if os.environ.get("GITHUB_REF") != "refs/heads/main":
-            raise ValueError("manual run only supported from main")
+        if not os.environ.get("GITHUB_REF", "").startswith("refs/heads/"):
+            raise ValueError("manual run requires a branch")
         sha = os.environ["GITHUB_SHA"]
         if not value:
-            ids = ["dispatch_smoke_a5_8p"]
+            ids = list(BLUE_SMOKE_SUITE)
         else:
             values = json.loads(value)
-            if not isinstance(values, list) or not 1 <= len(values) <= 3:
+            if not isinstance(values, list) or not 1 <= len(values) <= 256:
                 raise ValueError("invalid smoke test selection")
             if any(not isinstance(x, dict) or set(x) != {"test_id"} for x in values):
                 raise ValueError("only fixed test_id selectors supported")
@@ -56,8 +46,10 @@ def selectors(event, payload, value):
         raise ValueError("unsupported GitHub event")
     if not isinstance(sha, str) or not re.fullmatch("[0-9a-f]{40}", sha):
         raise ValueError("invalid source SHA")
-    if not ids or len(ids) != len(set(ids)) or any(x not in CASES for x in ids):
-        raise ValueError("unknown/duplicate smoke case")
+    if not ids or len(ids) > 256 or any(x not in CASES for x in ids):
+        raise ValueError("unknown smoke case")
+    if any(ids.count(x) > 1 and (x not in BLUE_CASES or BLUE_CASES[x].ci_kind != "npu_smoke") for x in set(ids)):
+        raise ValueError("duplicate non-smoke case")
     if any(x in BLUE_CASES for x in ids) and any(x in A5_CASES for x in ids):
         raise ValueError("Blue and Yellow cases cannot share a native source plan")
     return sha, ids
@@ -68,17 +60,22 @@ def create_plan(event, payload, value, run_id, attempt):
     defaults = BLUE_DEFAULTS if ids[0] in BLUE_CASES else DEFAULTS
     items = []
     for i, test_id in enumerate(ids):
-        nodes, ngpu, timeout = CASES[test_id]
+        if test_id in BLUE_CASES:
+            test = BLUE_CASES[test_id]
+            nodes, ngpu, timeout = test.nnodes, test.ngpu, test.timeout
+            label, kind = test.test_descr, test.ci_kind
+            worker = test.ci_overrides.get("worker", defaults["worker"])
+        else:
+            nodes, ngpu, timeout = CASES[test_id]
+            label, kind, worker = f"A5 HCCL distributed smoke {nodes * ngpu}P", "npu_smoke", defaults["worker"]
         items.append(
             {
                 "case_id": f"case_{i:03d}_{test_id}",
                 "order": i,
                 "test_id": test_id,
-                "label": "vLLM Blue worker OS probe"
-                if nodes == 0
-                else f"{'A3' if test_id in BLUE_CASES else 'A5'} HCCL distributed smoke {nodes * ngpu}P",
-                "kind": "worker_probe" if nodes == 0 else "npu_smoke",
-                "worker": defaults["worker"],
+                "label": label,
+                "kind": kind,
+                "worker": worker,
                 "target_pool": defaults["target_pool"] if nodes else None,
                 "resources": {"nodes": nodes, "devices_per_node": ngpu},
                 "docker": defaults["docker"] if nodes else None,
@@ -118,8 +115,6 @@ def main():
             os.environ.get("CI_EXPECTED_BASE"),
         ):
             raise ValueError("STALE_RECHECK_INTENT")
-        if not any(x["name"] == "lite-a3-blue" for x in pr.get("labels", [])):
-            raise ValueError("Blue recheck requires opt-in label")
         payload = {"pull_request": pr}
         effective_event = "pull_request_target"
     plan = create_plan(

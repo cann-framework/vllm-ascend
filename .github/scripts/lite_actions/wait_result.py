@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Consume only identity-matched schema-3 results; never upload training logs."""
+"""Consume only identity-matched results; never upload training logs."""
 
 import datetime as dt
 import json
@@ -26,6 +26,10 @@ STATUS = {
 }
 
 
+def same_json_value(left, right):
+    return json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
+
+
 def find_result(
     comments,
     *,
@@ -39,6 +43,8 @@ def find_result(
     native_source=None,
 ):
     prefix = f"Lite-CI-V3 {run_id}:{attempt}:{item['case_id']}\n"
+    accepted = None
+    invalid = False
     for c in reversed(comments):
         if (
             not author
@@ -49,8 +55,10 @@ def find_result(
         try:
             r = json.loads(c["body"].split("\n", 1)[1])
         except ValueError:
+            invalid = True
             continue
         if not isinstance(r, dict):
+            invalid = True
             continue
         expected = dict(
             schema=3,
@@ -67,9 +75,11 @@ def find_result(
             docker=item["docker"],
             resources=item["resources"],
         )
-        if any(r.get(k) != v for k, v in expected.items()):
+        if any(k not in r or not same_json_value(r[k], v) for k, v in expected.items()):
+            invalid = True
             continue
-        if native_source is not None and r.get("native_source") != native_source:
+        if native_source is not None and not same_json_value(r.get("native_source"), native_source):
+            invalid = True
             continue
         lines = r.get("last_20_lines")
         if (
@@ -82,21 +92,28 @@ def find_result(
                 for s in lines
             )
         ):
+            invalid = True
             continue
         if r["status"] == "PASS" and (
             type(r.get("exit_code")) is not int
             or r["exit_code"] != 0
             or r.get("cleanup_verified") is not True
         ):
+            invalid = True
             continue
         if (
             len(c["body"].encode()) > 6100
             or len(json.dumps({"body": c["body"]}, separators=(",", ":")).encode())
             > 7000
         ):
+            invalid = True
             continue
-        return r
-    return None
+        if accepted is not None and not same_json_value(accepted, r):
+            raise ValueError("conflicting case results")
+        accepted = r
+    if invalid and accepted is not None:
+        raise ValueError("invalid case result alongside a matching result")
+    return accepted
 
 
 def find_progress(comments, run_id, attempt, item, digest, author):

@@ -97,27 +97,23 @@ class RepositoryIdentityTests(unittest.TestCase):
         self.assertEqual(workflow.count("repository: " + REPO + "\n"), 3)
         self.assertNotIn("repository: depeng1994/vllm-ascend", workflow)
 
-    def test_canonical_personal_fork_pr_keeps_a5_contract(self):
+    def test_canonical_personal_fork_pr_uses_default_smoke(self):
         plan = prepare.create_plan("pull_request_target", self.payload, "", 100, 2)
         self.assertEqual((plan["schema"], plan["repo"], plan["sha"]), (3, REPO, SHA))
-        self.assertEqual(len(plan["cases"]), 1)
-        for key, value in self.item.items():
-            self.assertEqual(plan["cases"][0][key], value)
+        self.assertEqual(len(plan["cases"]), 4)
 
     def test_obsolete_target_repository_is_rejected_without_alias(self):
         self.payload["pull_request"]["base"]["repo"]["full_name"] = OLD_REPO
-        with self.assertRaisesRegex(ValueError, "allowlist"):
+        with self.assertRaisesRegex(ValueError, "target repository"):
             prepare.create_plan("pull_request_target", self.payload, "", 100, 2)
 
-    def test_other_source_fork_is_rejected(self):
+    def test_other_source_fork_is_accepted(self):
         self.payload["pull_request"]["head"]["repo"]["full_name"] = "other/vllm-ascend"
-        with self.assertRaisesRegex(ValueError, "allowlist"):
-            prepare.create_plan("pull_request_target", self.payload, "", 100, 2)
+        self.assertEqual(len(prepare.create_plan("pull_request_target", self.payload, "", 100, 2)["cases"]), 4)
 
-    def test_other_actor_is_rejected(self):
+    def test_other_actor_is_accepted(self):
         self.payload["pull_request"]["user"]["login"] = "other"
-        with self.assertRaisesRegex(ValueError, "allowlist"):
-            prepare.create_plan("pull_request_target", self.payload, "", 100, 2)
+        self.assertEqual(len(prepare.create_plan("pull_request_target", self.payload, "", 100, 2)["cases"]), 4)
 
     def test_manual_8p_and_32p_topologies_are_preserved(self):
         selections = json.dumps([{"test_id": key} for key in prepare.A5_CASES])
@@ -132,22 +128,20 @@ class RepositoryIdentityTests(unittest.TestCase):
             all(case["docker"] == "vllm-kimi-wangjinyin" for case in plan["cases"])
         )
 
-    def test_manual_non_default_ref_is_rejected(self):
+    def test_manual_tag_is_rejected(self):
         with patch.dict(
             os.environ,
-            {"GITHUB_REF": "refs/heads/untrusted", "GITHUB_SHA": SHA},
+            {"GITHUB_REF": "refs/tags/untrusted", "GITHUB_SHA": SHA},
             clear=True,
-        ):
-            with self.assertRaisesRegex(ValueError, "only supported from main"):
-                prepare.create_plan("workflow_dispatch", {}, "", 100, 2)
+        ), self.assertRaisesRegex(ValueError, "requires a branch"):
+            prepare.create_plan("workflow_dispatch", {}, "", 100, 2)
 
     def test_duplicate_selector_is_rejected(self):
         selection = json.dumps([{"test_id": "dispatch_smoke_a5_8p"}] * 2)
         with patch.dict(
             os.environ, {"GITHUB_REF": "refs/heads/main", "GITHUB_SHA": SHA}, clear=True
-        ):
-            with self.assertRaisesRegex(ValueError, "duplicate"):
-                prepare.create_plan("workflow_dispatch", {}, selection, 100, 2)
+        ), self.assertRaisesRegex(ValueError, "duplicate"):
+            prepare.create_plan("workflow_dispatch", {}, selection, 100, 2)
 
     def test_prepare_entrypoint_accepts_current_github_repository(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -163,6 +157,7 @@ class RepositoryIdentityTests(unittest.TestCase):
                 "GITHUB_RUN_ID": "100",
                 "GITHUB_RUN_ATTEMPT": "2",
                 "GITHUB_OUTPUT": str(root / "outputs.txt"),
+                "CI_TEST_CASES": '[{"test_id":"dispatch_smoke_a5_8p"}]',
             }
             previous = Path.cwd()
             try:
@@ -178,12 +173,10 @@ class RepositoryIdentityTests(unittest.TestCase):
     def test_control_entrypoints_reject_other_repositories_before_io(self):
         for module in (prepare, waiter):
             for repository in (OLD_REPO, "depeng1994/vllm-ascend", "other/repo"):
-                with self.subTest(module=module.__name__, repository=repository):
-                    with patch.dict(
-                        os.environ, {"GITHUB_REPOSITORY": repository}, clear=True
-                    ):
-                        with self.assertRaisesRegex(ValueError, "untrusted repository"):
-                            module.main()
+                with self.subTest(module=module.__name__, repository=repository), patch.dict(
+                    os.environ, {"GITHUB_REPOSITORY": repository}, clear=True
+                ), self.assertRaisesRegex(ValueError, "untrusted repository"):
+                    module.main()
 
     def test_waiter_accepts_matching_canonical_result(self):
         self.assertEqual(self.find(self.result), self.result)

@@ -8,6 +8,7 @@ This deliberately favors no duplicate hardware execution over guessing success.
 import hashlib
 import json
 import os
+import urllib.error
 
 from blue_catalog import BLUE_SMOKE_SUITE
 from native_result import CONTEXT, description, post
@@ -20,28 +21,49 @@ def reconcile(get=api, send=post):
     control = os.environ["GITHUB_WORKFLOW_SHA"]
     if get("/branches/main")["commit"]["sha"] != control:
         raise ValueError("reconciler control is no longer main")
-    pulls = get("/pulls?state=open&per_page=100")
-    if not isinstance(pulls, list) or len(pulls) >= 100:
+    pulls = []
+    for page in range(1, 11):
+        rows = get(f"/pulls?state=open&per_page=100&page={page}")
+        if not isinstance(rows, list):
+            raise ValueError("invalid open PR response")
+        pulls.extend(rows)
+        if len(rows) < 100:
+            break
+    else:
         raise ValueError("open PR visibility budget incomplete")
     results = []
     for item in pulls:
-        labels = {x["name"] for x in item.get("labels", [])}
-        if (
-            item.get("draft")
-            or "lite-a3-blue" not in labels
-            or item.get("user", {}).get("login") != "depeng1994"
-            or item.get("head", {}).get("repo", {}).get("full_name") != "depeng1994/vllm-ascend"
-        ):
-            continue
         number = item["number"]
-        pr, head, base = current_pr(number, get)
-        labels = {x["name"] for x in pr.get("labels", [])}
-        if "lite-a3-blue" not in labels:
+        head = item.get("head", {}).get("sha")
+        if not isinstance(head, str) or len(head) != 40:
+            continue
+        try:
+            pr, current_head, base = current_pr(number, get)
+        except ValueError as exc:
+            if str(exc) != "unauthorized Blue PR source":
+                raise
+            continue
+        if head != current_head:
+            continue
+        try:
+            statuses = get("/commits/" + head + "/status?per_page=100").get("statuses", [])
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise
+            try:
+                current_pr(number, get)
+            except ValueError as changed:
+                if str(changed) == "unauthorized Blue PR source":
+                    continue
+                raise
+            raise
+        prior = next((x for x in statuses if x.get("context") == CONTEXT), None)
+        # Existing versions may need a Base-only recheck; do not start every
+        # historical open PR when the workflow is enabled for more forks.
+        if not prior:
             continue
         tests = list(BLUE_SMOKE_SUITE)
-        desc = description(base, tests)
-        statuses = get("/commits/" + head + "/status?per_page=100").get("statuses", [])
-        prior = next((x for x in statuses if x.get("context") == CONTEXT), None)
+        desc = description(base, tests, pr["base"]["ref"])
         if prior and prior.get("description") == desc:
             results.append({"pr": number, "state": "EXISTING_VERSION_OR_DISPATCH_UNKNOWN"})
             continue

@@ -12,9 +12,9 @@ from native_source import REPO, api, assert_current
 CONTEXT = "Lite-Actions-Blue-Merge"
 
 
-def description(base_sha, test_ids):
+def description(base_sha, test_ids, base_ref):
     spec = hashlib.sha256(
-        json.dumps(test_ids, separators=(",", ":")).encode()
+        json.dumps([base_ref, test_ids], separators=(",", ":")).encode()
     ).hexdigest()[:12]
     return f"Versioned test B={base_sha} S={spec}; not atomic merge permission"
 
@@ -66,7 +66,7 @@ def publish(source, state):
         {
             "state": state,
             "context": CONTEXT,
-            "description": description(source["base_sha"], source["test_ids"]),
+            "description": description(source["base_sha"], source["test_ids"], source["base_ref"]),
             "target_url": f"https://github.com/{REPO}/actions/runs/{source['run_id']}/attempts/{source['attempt']}",
         },
     )

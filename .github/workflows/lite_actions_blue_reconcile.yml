@@ -27,4 +27,4 @@ jobs:
       - name: Invalidate stale Blue merge tests and dispatch exact new Head/Base
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/lite_actions/native_reconcile.py
+        run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/native_reconcile.py
