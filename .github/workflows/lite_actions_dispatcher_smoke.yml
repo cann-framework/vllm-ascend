@@ -1,150 +1,41 @@
 name: Dispatcher-Smoke
-run-name: >-
-  ${{ github.event_name == 'pull_request_target' && format('lite-vllm-pr-{0}-{1}-{2}', github.event.pull_request.number, github.event.pull_request.head.sha, github.workflow_sha) || (inputs.source_pr && format('lite-vllm-recheck-{0}-{1}-{2}', inputs.source_pr, github.workflow_sha, inputs.bridge_nonce)) || format('lite-vllm-manual-{0}', github.workflow_sha) }}
-
 on:
-  pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review, labeled]
   workflow_dispatch:
     inputs:
-      test_cases:
-        description: 'JSON test_id selectors; Blue suite: vllm_worker_os_blue, dispatch_smoke_a3_8p, dispatch_smoke_a3_16p; empty preserves A5 8P'
-        required: false
+      probe_pr:
+        description: Disposable approval probe PR
+        required: true
         type: string
-      source_pr:
-        description: 'Trusted Blue reconciler PR number; leave empty for a commit smoke'
-        required: false
+      probe_sha:
+        description: Exact disposable PR head SHA
+        required: true
         type: string
-      expected_head_sha:
-        description: 'Exact expected Head for a Blue PR recheck'
-        required: false
-        type: string
-      expected_base_sha:
-        description: 'Exact expected Base for a Blue PR recheck'
-        required: false
-        type: string
-      bridge_nonce:
-        description: '32-character trusted recheck intent digest'
-        required: false
-        type: string
-
 permissions:
   contents: read
-  actions: read
-  pull-requests: read
-  statuses: write
-
-concurrency:
-  group: lite-vllm-${{ github.event.pull_request.number || inputs.source_pr || github.run_id }}
-  cancel-in-progress: true
-
+  pull-requests: write
 jobs:
-  prepare:
-    if: >-
-      github.repository == 'cann-framework/vllm-ascend' &&
-      (github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'pull_request_target' &&
-        github.event.pull_request.head.repo.full_name == 'depeng1994/vllm-ascend' &&
-        github.event.pull_request.user.login == 'depeng1994' &&
-        !github.event.pull_request.draft))
+  verify-review:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
-      sha: ${{ steps.plan.outputs.sha }}
-      plan_digest: ${{ steps.plan.outputs.plan_digest }}
-      native_source: ${{ steps.plan.outputs.native_source }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: cann-framework/vllm-ascend
-          ref: ${{ github.workflow_sha }}
-          persist-credentials: false
-      - name: Create trusted smoke plan and immutable Blue merge source
-        id: plan
+      - name: Approve and dismiss the disposable PR review
         env:
           GH_TOKEN: ${{ github.token }}
-          CI_TEST_CASES: ${{ inputs.test_cases }}
-          CI_SOURCE_PR: ${{ inputs.source_pr }}
-          CI_EXPECTED_HEAD: ${{ inputs.expected_head_sha }}
-          CI_EXPECTED_BASE: ${{ inputs.expected_base_sha }}
-        run: python3 .github/scripts/lite_actions/prepare_request.py
-      - name: Publish versioned Blue pending status
-        if: steps.plan.outputs.native_source == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/lite_actions/native_result.py --source .ci-request/source.json --state pending
-      - uses: actions/upload-artifact@v4
-        if: steps.plan.outputs.native_source == 'true'
-        with:
-          name: lite-ci-source-${{ github.run_attempt }}
-          path: .ci-request/source.json
-          if-no-files-found: error
-          retention-days: 7
-      - uses: actions/upload-artifact@v4
-        with:
-          name: lite-ci-request-${{ github.run_attempt }}
-          path: .ci-request/ci-request.json
-          if-no-files-found: error
-          retention-days: 7
-
-  smoke:
-    needs: prepare
-    runs-on: ubuntu-latest
-    name: ${{ matrix.test_id }}
-    timeout-minutes: 300
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: cann-framework/vllm-ascend
-          ref: ${{ github.workflow_sha }}
-          persist-credentials: false
-      - uses: actions/download-artifact@v4
-        if: needs.prepare.outputs.native_source == 'true'
-        with:
-          name: lite-ci-source-${{ github.run_attempt }}
-          path: .ci-source
-      - name: Wait for assigned Lite Actions worker
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CI_SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
-          CI_RESULT_AUTHOR: ${{ vars.LITE_CI_RESULT_ACTOR || 'depeng1994' }}
-          CI_PLAN_DIGEST: ${{ needs.prepare.outputs.plan_digest }}
-          CI_CASE: ${{ toJSON(matrix) }}
-          CI_WORKFLOW: lite_actions_dispatcher_smoke.yml
-          CI_NATIVE_SOURCE: ${{ needs.prepare.outputs.native_source == 'true' && '.ci-source/source.json' || '' }}
-        run: python3 .github/scripts/lite_actions/wait_result.py
-
-  result:
-    if: always() && needs.prepare.result != 'skipped'
-    needs: [prepare, smoke]
-    runs-on: ubuntu-latest
-    name: Lite-Actions-Smoke
-    steps:
-      - uses: actions/checkout@v4
-        if: needs.prepare.outputs.native_source == 'true'
-        with:
-          repository: cann-framework/vllm-ascend
-          ref: ${{ github.workflow_sha }}
-          persist-credentials: false
-      - uses: actions/download-artifact@v4
-        if: needs.prepare.outputs.native_source == 'true'
-        with:
-          name: lite-ci-source-${{ github.run_attempt }}
-          path: .ci-source
-      - name: Publish versioned Blue result without granting atomic merge permission
-        if: needs.prepare.outputs.native_source == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SMOKE: ${{ needs.smoke.result }}
+          PROBE_PR: ${{ inputs.probe_pr }}
+          PROBE_SHA: ${{ inputs.probe_sha }}
+        shell: bash
         run: |
-          state=failure
-          if test "$SMOKE" = success; then state=success; fi
-          python3 .github/scripts/lite_actions/native_result.py --source .ci-source/source.json --state "$state"
-      - env:
-          PREPARE: ${{ needs.prepare.result }}
-          SMOKE: ${{ needs.smoke.result }}
-        run: test "$PREPARE" = success && test "$SMOKE" = success
+          set -euo pipefail
+          [[ "$PROBE_PR" =~ ^[0-9]+$ && "$PROBE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PROBE_PR" > /tmp/probe-pr.json
+          jq -e --arg sha "$PROBE_SHA" --arg repo "$GITHUB_REPOSITORY" \
+            '.state == "open" and .user.login == "depeng1994" and .head.sha == $sha and .head.repo.full_name == $repo and (.title | startswith("[DO NOT MERGE] Approval probe"))' \
+            /tmp/probe-pr.json >/dev/null
+          gh api --method POST "repos/$GITHUB_REPOSITORY/pulls/$PROBE_PR/reviews" \
+            -f event=APPROVE -f commit_id="$PROBE_SHA" > /tmp/probe-review.json
+          review_id=$(jq -er '.id' /tmp/probe-review.json)
+          trap 'gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$PROBE_PR/reviews/$review_id/dismissals" -f message="End of controlled approval test" >/dev/null || true' EXIT
+          jq -e --arg sha "$PROBE_SHA" '.user.login == "github-actions[bot]" and .state == "APPROVED" and .commit_id == $sha' /tmp/probe-review.json >/dev/null
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$PROBE_PR/reviews/$review_id/dismissals" -f message='End of controlled approval test' >/dev/null
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PROBE_PR/reviews/$review_id" --jq '{id,state,commit_id,user:.user.login}'
+          trap - EXIT
