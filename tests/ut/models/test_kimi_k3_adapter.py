@@ -40,11 +40,11 @@ def test_kimi_starts_each_flash_metadata_once_per_forward(module, model_cls, mon
         )
         metadata[name] = layer_metadata
         impl = SimpleNamespace(
-            layer_name=name,
+            layer_name=None,
             flash_mla_layout="pa_nz",
             start_flash_mla_metadata=lambda value, name=name: calls.append(name),
         )
-        layers.append(SimpleNamespace(self_attn=SimpleNamespace(impl=impl)))
+        layers.append(SimpleNamespace(self_attn=SimpleNamespace(impl=impl, layer_name=name)))
     monkeypatch.setattr(module, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(module, "get_forward_context", lambda: SimpleNamespace(attn_metadata=metadata))
     model_cls._start_flash_mla_metadata(SimpleNamespace(layers=layers))
