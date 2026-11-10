@@ -395,6 +395,7 @@ class SFAPDRD2HScheduler:
             self._dspark_pending_recv.add(request.request_id)
         self._reqs_need_recv.add(request.request_id)
         allocator = getattr(self, "_copy_sfa_slot_allocator", None)
+        pool_slot = None
         if allocator is not None:
             kv_tokens = request.num_computed_tokens + num_external_tokens
             if kv_tokens <= 0:
@@ -412,9 +413,8 @@ class SFAPDRD2HScheduler:
                 kv_tokens,
                 dense,
             )
-
         # Notify P via the metaserver rendezvous that D is ready to pull this
-        # request. D does NOT send its block ids to P — D keeps them (passed to
+        # request. D does NOT send its block ids to P �?D keeps them (passed to
         # the D worker via connector_meta) and looks
         # them up by req_id when P's READ_READY arrives. Only contact info +
         # the do_remote_decode "go" flag go to P. (Sending block ids to P was a
