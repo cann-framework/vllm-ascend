@@ -60,7 +60,7 @@ def run_dispatch_smoke(test: OverrideDefinitions) -> None:
     else:
         env["MASTER_ADDR"] = node_ips[0] if node_ips else "127.0.0.1"
         cmd.extend(["--master-addr", env["MASTER_ADDR"], "--master-port", port])
-    cmd.extend(["-m", "tests.integration_tests.tools.lite_actions.dispatch_smoke_worker"])
+    cmd.extend(["-m", "tests.integration_tests.training_cases.dispatch_smoke"])
     print("[DISPATCH_SMOKE_LAUNCH] " + " ".join(cmd), flush=True)
     try:
         subprocess.run(cmd, env=env, check=True, timeout=timeout)
