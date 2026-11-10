@@ -42,6 +42,8 @@ from vllm_ascend.attention.flashmla import (
     FLASHMLA_MASK_SIZE,
     FLASHMLA_QK_DIM,
     FLASHMLA_V_DIM,
+    PA_NZ_TILE_COUNT,
+    PA_NZ_TILE_WIDTH,
     FlashMLADecode,
     FlashMLAMetadataBuilder,
     get_flashmla_ops,
@@ -3352,18 +3354,13 @@ class AscendMLAImpl(MLAAttentionImpl):
     def _copy_pa_nz_rows(
         src_cache: torch.Tensor,
         dst_cache: torch.Tensor,
-        src_slots: torch.Tensor,
-        dst_slots: torch.Tensor,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
     ) -> None:
-        """Copy complete token tiles between two PA_NZ caches without a token-major rebuild."""
-        from vllm_ascend.ops.flash_mla_pa_nz import pa_nz_tile_indices  # noqa: PLC0415
-
-        tile_count = src_cache.shape[-1] // 16
-        src_indices = pa_nz_tile_indices(src_slots.to(torch.int64), src_cache.shape[1], tile_count)
-        dst_indices = pa_nz_tile_indices(dst_slots.to(torch.int64), dst_cache.shape[1], tile_count)
-        rows = src_cache.view(-1, 16).index_select(0, src_indices)
+        """Copy PA_NZ rows using batch-precomputed tile indices."""
+        rows = src_cache.view(-1, PA_NZ_TILE_WIDTH).index_select(0, src_indices)
         torch_npu.npu_scatter_nd_update_(
-            dst_cache.view(-1, 16),
+            dst_cache.view(-1, PA_NZ_TILE_WIDTH),
             dst_indices.view(-1, 1),
             rows,
         )
@@ -3403,22 +3400,23 @@ class AscendMLAImpl(MLAAttentionImpl):
         if flash.metadata_async and not flash.metadata_started:
             self.start_flash_mla_metadata(attn_metadata)
         if flash.prolog_slots is not None:
-            flash.prolog_slots.masked_fill_(~flash.token_live | (flash.prolog_slots < 0), 0)
             cache_indices = flash.prolog_slots[:num_decode_tokens].to(torch.int64)
         else:
             cache_indices = flash.slots[:num_decode_tokens].to(torch.int64).clamp_min(0)
         use_current_workspace = self.dcp_enabled and flash.current is not None
         if use_current_workspace:
             assert flash.current is not None
+            if block_size != FLASHMLA_BLOCK_SIZE:
+                raise ValueError(
+                    f"PA_NZ DCP current-cache copy requires block size {FLASHMLA_BLOCK_SIZE}, got {block_size}"
+                )
             # The DCP current chunk is replicated on every rank and is independent
             # of this rank's slot ownership. Write the prolog result directly to
             # the FlashMLA current cache at the same slots used by current
             # attention; invalid rows go to a scratch page outside block_table.
             current = flash.current
-            current_slots = current.slots[:num_decode_tokens].to(torch.int64)
-            valid_current = (current_slots >= 0) & flash.token_live[:num_decode_tokens]
-            scratch_slot = (current.cache.shape[0] - 1) * current.cache.shape[1]
-            current_slots = torch.where(valid_current, current_slots, torch.full_like(current_slots, scratch_slot))
+            assert flash.pa_nz_current_slots is not None
+            current_slots = flash.pa_nz_current_slots[:num_decode_tokens]
             prolog_cache = current.cache
             prolog_slots = current_slots
         else:
@@ -3450,12 +3448,18 @@ class AscendMLAImpl(MLAAttentionImpl):
             current_k_nope = current_k_pe = None
             if use_current_workspace:
                 assert flash.current is not None
-                history_slots = flash.slots[:num_decode_tokens].to(torch.int64)
-                valid_history = (history_slots >= 0) & flash.token_live[:num_decode_tokens]
-                history_slots = torch.where(valid_history, history_slots, torch.zeros_like(history_slots))
+                assert flash.pa_nz_history_slots is not None
+                assert flash.pa_nz_copy_src_indices is not None
+                assert flash.pa_nz_copy_dst_indices is not None
                 # The prolog already populated the current cache. Copy its tile
                 # rows directly into history for the next decode step.
-                self._copy_pa_nz_rows(flash.current.cache, merged_cache, current_slots, history_slots)
+                tile_rows = num_decode_tokens * PA_NZ_TILE_COUNT
+                self._copy_pa_nz_rows(
+                    flash.current.cache,
+                    merged_cache,
+                    flash.pa_nz_copy_src_indices[:tile_rows],
+                    flash.pa_nz_copy_dst_indices[:tile_rows],
+                )
             return split_attention(
                 history_q_nope,
                 history_q_pe,

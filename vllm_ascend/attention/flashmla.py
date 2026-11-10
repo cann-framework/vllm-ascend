@@ -28,11 +28,34 @@ FLASHMLA_V_DIM = 512
 FLASHMLA_BLOCK_SIZE = 128
 FLASHMLA_MASK_SIZE = 2048
 FLASHMLA_MAX_BATCH_SIZE = 65535
+PA_NZ_TILE_WIDTH = 16
+PA_NZ_TILE_COUNT = FLASHMLA_QK_DIM // PA_NZ_TILE_WIDTH
 
 
 def _pa_nz_mask_mode(q_len: int, configured_mask_mode: int) -> int:
     """Decode always uses no-mask; multi-token history keeps the adapter mode."""
     return 0 if q_len == 1 else configured_mask_mode
+
+
+def _pa_nz_tile_indices(
+    slots: torch.Tensor,
+    block_size: int,
+    tile_offsets: torch.Tensor,
+    tile_count: int,
+) -> torch.Tensor:
+    """Build flattened PA_NZ tile rows from already-sanitized token slots.
+
+    The geometry tensors are owned by ``FlashMLADecode`` and reused for every
+    MLA layer.  Only the request-dependent block and in-block offsets are
+    calculated during metadata refresh.
+    """
+    block_ids = torch.div(slots, block_size, rounding_mode="floor")
+    offsets = torch.remainder(slots, block_size)
+    return (
+        block_ids[:, None] * (tile_count * block_size)
+        + tile_offsets[None, :]
+        + offsets[:, None]
+    ).reshape(-1)
 
 
 def prepare_flashmla_batch_req_state(
@@ -366,8 +389,16 @@ class PaNzFlashMLAImpl:
         return output, lse
 
     def validate_cache(self, kv_cache: torch.Tensor) -> None:
-        if kv_cache.ndim != 4 or kv_cache.shape[2] != 1 or kv_cache.shape[-1] != FLASHMLA_QK_DIM:
-            raise ValueError(f"PA_NZ FlashMLA cache must be [blocks, block_size, 1, {FLASHMLA_QK_DIM}]")
+        if (
+            kv_cache.ndim != 4
+            or kv_cache.shape[1] != FLASHMLA_BLOCK_SIZE
+            or kv_cache.shape[2] != 1
+            or kv_cache.shape[-1] != FLASHMLA_QK_DIM
+        ):
+            raise ValueError(
+                "PA_NZ FlashMLA cache must be "
+                f"[blocks, {FLASHMLA_BLOCK_SIZE}, 1, {FLASHMLA_QK_DIM}]"
+            )
         if kv_cache.dtype != torch.bfloat16:
             raise ValueError("PA_NZ FlashMLA cache must be BF16")
         if not kv_cache.is_contiguous():
@@ -418,6 +449,14 @@ class FlashMLADecode:
     metadata_builder: Any = None
     metadata_started: bool = False
     metadata_async: bool = False
+    # PA_NZ DCP copy geometry is batch metadata.  The cache contents are
+    # layer-local, but these slot/tile addresses are identical for every MLA
+    # layer and therefore must not be rebuilt in the layer loop.
+    pa_nz_tile_offsets: torch.Tensor | None = None
+    pa_nz_current_slots: torch.Tensor | None = None
+    pa_nz_history_slots: torch.Tensor | None = None
+    pa_nz_copy_src_indices: torch.Tensor | None = None
+    pa_nz_copy_dst_indices: torch.Tensor | None = None
 
 
 class FlashMLAMetadataBuilder:
@@ -559,6 +598,21 @@ class FlashMLAMetadataBuilder:
                 slots=torch.full_like(flash.slots, -1),
                 attn_mask=self.attn_mask,
             )
+            if adapter.config.layout_kv == "PA_NZ":
+                # The PA_NZ prolog/cache contract uses a fixed 128-token page
+                # and 16-element tiles.  Keep every tensor at a stable address
+                # so graph replay and all MLA layers can reuse the metadata.
+                tile_offsets = (
+                    torch.arange(PA_NZ_TILE_COUNT, dtype=torch.int64, device=self.device)
+                    * FLASHMLA_BLOCK_SIZE
+                )
+                flash.pa_nz_tile_offsets = tile_offsets
+                flash.pa_nz_current_slots = torch.zeros_like(flash.current.slots)
+                flash.pa_nz_history_slots = torch.zeros_like(flash.slots)
+                index_shape = (tokens * PA_NZ_TILE_COUNT,)
+                index_ints = {"dtype": torch.int64, "device": self.device}
+                flash.pa_nz_copy_src_indices = torch.zeros(index_shape, **index_ints)
+                flash.pa_nz_copy_dst_indices = torch.zeros(index_shape, **index_ints)
         return flash
 
     def build(
@@ -636,7 +690,12 @@ class FlashMLAMetadataBuilder:
                 flash.cos.copy_(cos)
                 flash.sin.copy_(sin)
             if flash.prolog_slots is not None:
-                flash.prolog_slots.copy_(flash.slots)
+                # Prolog must never receive -1 for graph padding or an empty
+                # request.  Do this once with the batch metadata instead of
+                # masking the same slots in every MLA layer.
+                flash.prolog_slots.copy_(
+                    torch.where(flash.token_live & (flash.slots >= 0), flash.slots, 0)
+                )
             if flash.current is not None:
                 current = flash.current
                 page_counts = (flash.used_q + FLASHMLA_BLOCK_SIZE - 1) // FLASHMLA_BLOCK_SIZE
@@ -648,6 +707,40 @@ class FlashMLAMetadataBuilder:
                 requests = torch.searchsorted(flash.cu[1:], indices.to(torch.int32), right=True)
                 current.slots.copy_(page_starts[requests] * FLASHMLA_BLOCK_SIZE + indices - flash.cu[requests])
                 current.slots.masked_fill_(~flash.token_live, -1)
+                if flash.pa_nz_current_slots is not None:
+                    assert flash.pa_nz_history_slots is not None
+                    assert flash.pa_nz_copy_src_indices is not None
+                    assert flash.pa_nz_copy_dst_indices is not None
+                    assert flash.pa_nz_tile_offsets is not None
+                    current_valid = flash.token_live & (current.slots >= 0)
+                    history_valid = flash.token_live & (flash.slots >= 0)
+                    scratch_slot = (current.cache.shape[0] - 1) * FLASHMLA_BLOCK_SIZE
+                    flash.pa_nz_current_slots.copy_(
+                        torch.where(current_valid, current.slots, scratch_slot)
+                    )
+                    flash.pa_nz_history_slots.copy_(
+                        torch.where(history_valid, flash.slots, 0)
+                    )
+                    # Keep the old copy semantics: invalid source rows read
+                    # the current scratch page and invalid destination rows
+                    # target slot zero.  The slot decoding now happens once
+                    # per batch rather than once per MLA layer.
+                    flash.pa_nz_copy_src_indices.copy_(
+                        _pa_nz_tile_indices(
+                            flash.pa_nz_current_slots,
+                            FLASHMLA_BLOCK_SIZE,
+                            flash.pa_nz_tile_offsets,
+                            PA_NZ_TILE_COUNT,
+                        )
+                    )
+                    flash.pa_nz_copy_dst_indices.copy_(
+                        _pa_nz_tile_indices(
+                            flash.pa_nz_history_slots,
+                            FLASHMLA_BLOCK_SIZE,
+                            flash.pa_nz_tile_offsets,
+                            PA_NZ_TILE_COUNT,
+                        )
+                    )
 
         # Refresh on the caller's stream before return; captured buffer caching
         # preserves the addresses used by graph replay.
@@ -698,6 +791,9 @@ class FlashMLAMetadataBuilder:
         """Keep side-stream schedule inputs alive until the fork/join completes."""
         if self.metadata_stream is None:
             return
+        # PA_NZ copy slots/indices are refreshed and consumed on the caller
+        # stream; they are deliberately not part of the side-stream schedule
+        # build and therefore do not need a metadata-stream lifetime record.
         for tensor in (flash.schedule, flash.cache_lens, flash.cu, flash.used_q):
             tensor.record_stream(self.metadata_stream)
         if flash.current is not None:
