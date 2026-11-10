@@ -80,6 +80,10 @@ def _kimi_megamoe_weights_supported(vllm_config: VllmConfig, *, allow_unknown: b
     config = get_ascend_config()
     eplb = getattr(config, "eplb_config", None)
     parallel_eplb = getattr(vllm_config.parallel_config, "eplb_config", None)
+    use_v2_eplb = bool(
+        getattr(vllm_config, "use_v2_model_runner", False)
+        and getattr(vllm_config.parallel_config, "enable_eplb", False)
+    )
     activation = getattr(vllm_config.model_config.hf_text_config, "hidden_act", None)
     return (
         layouts == frozenset((QuantType.W4A8MXFP,))
@@ -88,7 +92,7 @@ def _kimi_megamoe_weights_supported(vllm_config: VllmConfig, *, allow_unknown: b
         and not getattr(config, "mix_placement", False)
         and not getattr(eplb, "dynamic_eplb", False)
         and not getattr(eplb, "num_redundant_experts", 0)
-        and not getattr(parallel_eplb, "num_redundant_experts", 0)
+        and (not getattr(parallel_eplb, "num_redundant_experts", 0) or use_v2_eplb)
     )
 
 
@@ -180,9 +184,11 @@ def log_kimi_v2_megamoe_config(vllm_config: VllmConfig) -> None:
     description = getattr(getattr(vllm_config, "quant_config", None), "quant_description", None)
     group_size = description.get("group_size", _KIMI_MEGA_MOE_GROUP_SIZE) if isinstance(description, dict) else None
     layouts = getattr(vllm_config.model_config, "_ascend_kimi_moe_quant_types", None) or ()
+    parallel_eplb = getattr(vllm_config.parallel_config, "eplb_config", None)
     logger.info(
         "Kimi V2 MegaMoE config: fused_mc2=%s, runtime_available=%s, hardware_mxfp=%s, "
-        "capable=%s, weights_supported=%s, layouts=%s, group_size=%s, ep_size=%s, pcp_size=%s, kv_role=%s",
+        "capable=%s, weights_supported=%s, layouts=%s, group_size=%s, ep_size=%s, pcp_size=%s, kv_role=%s, "
+        "eplb_enabled=%s, redundant_experts=%s",
         get_ascend_config().enable_fused_mc2,
         is_mega_moe_supported(),
         get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP),
@@ -193,6 +199,8 @@ def log_kimi_v2_megamoe_config(vllm_config: VllmConfig) -> None:
         get_ep_group().world_size,
         vllm_config.parallel_config.prefill_context_parallel_size,
         getattr(getattr(vllm_config, "kv_transfer_config", None), "kv_role", None),
+        getattr(vllm_config.parallel_config, "enable_eplb", False),
+        getattr(parallel_eplb, "num_redundant_experts", 0),
     )
 
 

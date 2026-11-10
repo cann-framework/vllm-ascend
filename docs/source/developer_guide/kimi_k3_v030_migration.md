@@ -272,6 +272,25 @@ the padded MegaMoE numerical reference; complete model accuracy, PP/DCP,
 long-running request transitions and latency still require deployment tests.
 Independent P and D instances make decisions in their own communication domains.
 
+MRv2's upstream `--enable-eplb` supports redundant expert slots with this
+Prefill backend. For 224 logical experts, eight redundant experts and EP8,
+the physical capacity is 232 experts, or 29 per rank. The existing router
+maps logical TopK IDs to physical IDs before dispatch; the communicator uses
+physical capacity, and the returned per-expert token counts feed V2's existing
+load recorder. MegaMoE reuses the weight lists registered for EPLB migration
+and views their byte scales as E8M0 without copying storage. Ordinary Decode
+continues to use transposed views of those same live lists. Legacy Ascend
+dynamic EPLB and mix placement retain their existing fallback.
+
+The CPU regressions check selection with `kv_producer`, DP1, TP8/EP8 and
+eight redundant experts, plus storage sharing across simulated in-place
+weight migration. On A5, test the 29-expert weight-list contract with
+`torchrun --nproc_per_node=8 tests/e2e/nightly/single_node/ops/test_mega_moe.py --experts 232 --tokens 1 32 256 --v2-prefill --eplb`.
+This operator case does not run the asynchronous EPLB controller. Real-model
+validation must retain `--enable-eplb --eplb-config.num_redundant_experts 8`
+and run beyond the configured `step_interval` until a cycle commits, then
+check accuracy, mappings, local load counts and Prefill/Decode transitions.
+
 The multimodal K3 wrapper constructs its language model through
 `init_vllm_registered_model`, which deep-copies `model_config` in
 `with_hf_config`. Routed-layer quantization records belong to that inner
@@ -284,7 +303,8 @@ remain ineligible after propagation.
 To diagnose a missing MegaMoE call, inspect the `Kimi V2 MegaMoE config` INFO
 line emitted after model loading. It reports the normalized fused-MC2 setting,
 operator availability, hardware support, actual registered routed layouts,
-group size, EP/PCP sizes and KV role. An internal `fused_mc2=1` is expected
+group size, EP/PCP sizes, KV role, upstream EPLB flag and redundant expert
+count. An internal `fused_mc2=1` is expected
 after the user's `enable_fused_mc2=2` is normalized. Kimi's A5 path requires
 `W4A8MXFP`; an ordinary INT4/INT8 `W4A8` checkpoint does not meet this layout
 contract and must not be enabled by relaxing the selector.
@@ -364,7 +384,8 @@ regressions for the following fixes:
   simulates release, then checks Prefill/Decode/Prefill storage ownership.
 - Kimi MegaMoE execution requires registered W4A8 MXFP routed layouts,
   group size 32, supported activation and the existing EP limit (2–64), with
-  no mixed layouts, dynamic EPLB, redundant experts or mix placement. These
+  no mixed layouts, legacy dynamic EPLB or mix placement. Redundant experts
+  are supported with MRv2's upstream EPLB and remain excluded otherwise. These
   constraints also govern weight preparation. Layouts are recorded as an
   immutable set on the owning model config, without a global registry.
 - Before weights exist, startup still reserves 0.30's configured prefill

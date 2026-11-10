@@ -300,6 +300,40 @@ class TestKimiMegaMoEV2(unittest.TestCase):
             self.assertEqual(self.forward_context(desc.num_tokens)["moe_comm_type"].name, "FUSED_MC2")
         self.collective.assert_not_called()
 
+    def test_v2_eplb_redundant_experts_allow_prefill_but_not_decode(self):
+        self.config.parallel_config.enable_eplb = True
+        self.config.parallel_config.eplb_config = NS(num_redundant_experts=8)
+        self.config.parallel_config.tensor_parallel_size = 8
+        self.config.parallel_config.world_size_across_dp = 8
+        self.config.model_config.hf_text_config.n_routed_experts = 224
+        self.config.kv_transfer_config = NS(kv_role="kv_producer")
+        self.ns["get_ep_group"] = lambda: NS(world_size=8)
+        self.ns["get_tensor_model_parallel_world_size"] = lambda: 8
+        self.assertTrue(self.ns["_kimi_megamoe_weights_supported"](self.config))
+        for prefill, expected in ((True, "FUSED_MC2"), (False, "MC2"), (True, "FUSED_MC2")):
+            with self.state.v2_moe_batch_context(self.config, 8, dummy_run=False, is_profile=False):
+                self.record([prefill], 8)
+                desc, sync = self.ns["dispatch_cg_and_sync_dp"](None, 1, 8, None, 1, 0)
+                self.assertIsNone(sync)
+                self.assertEqual(self.forward_context(desc.num_tokens)["moe_comm_type"].name, expected)
+        self.collective.assert_not_called()
+
+    def test_v2_eplb_does_not_relax_legacy_placement_guards(self):
+        self.config.parallel_config.eplb_config = NS(num_redundant_experts=8)
+        for v2, enabled, dynamic, ascend_redundancy, mix in (
+            (False, True, False, 0, False),
+            (True, False, False, 0, False),
+            (True, True, True, 0, False),
+            (True, True, False, 8, False),
+            (True, True, False, 0, True),
+        ):
+            with self.subTest(v2=v2, enabled=enabled, dynamic=dynamic, redundancy=ascend_redundancy, mix=mix):
+                self.config.use_v2_model_runner = v2
+                self.config.parallel_config.enable_eplb = enabled
+                self.ascend.eplb_config = NS(dynamic_eplb=dynamic, num_redundant_experts=ascend_redundancy)
+                self.ascend.mix_placement = mix
+                self.assertFalse(self.ns["_kimi_megamoe_weights_supported"](self.config))
+
     def test_profile_is_explicit_and_counts_dummy_rows(self):
         with self.state.v2_moe_batch_context(self.config, 16, dummy_run=True, is_profile=True):
             self.ns["dispatch_cg_and_sync_dp"](None, 1, 16, None, 1, 0, need_eager=True)

@@ -7,6 +7,7 @@ Source the CANN environment and set the HCCL/GLOO interface before running:
     torchrun --nproc_per_node=8 test_mega_moe.py --tokens 256 --graph
     torchrun --nproc_per_node=8 test_mega_moe.py --tokens 2048 --input-scale 10
     torchrun --nproc_per_node=8 test_mega_moe.py --tokens 1 32 256 --v2-prefill
+    torchrun --nproc_per_node=8 test_mega_moe.py --experts 232 --tokens 1 32 256 --v2-prefill --eplb
 
 Use a fresh process for each graph shape to isolate CANN/HCCL graph lifetime.
 Defaults retain 28 local experts and the routed FFN dimensions of an EP32
@@ -52,6 +53,7 @@ def main():
     p.add_argument("--graph", action="store_true")
     p.add_argument("--input-scale", type=float, default=1.0)
     p.add_argument("--v2-prefill", action="store_true")
+    p.add_argument("--eplb", action="store_true", help="Use EPLB weight lists; --experts includes redundant slots")
     a = p.parse_args()
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -94,6 +96,7 @@ def main():
         # Exercise the production weight producer for both layouts. Only backend
         # selection is isolated from the global model configuration in this test.
         layer = torch.nn.Module()
+        layer.activation = a.activation
         for name, dims in (("w13", (2 * a.intermediate, a.hidden)), ("w2", (a.hidden, a.intermediate))):
             w, scale = make_weights(*dims)
             layer.register_parameter(name + "_weight", torch.nn.Parameter(w, requires_grad=False))
@@ -102,9 +105,11 @@ def main():
         for name, value in layer.named_parameters():
             baseline.register_parameter(name, torch.nn.Parameter(value.clone(), requires_grad=False))
         method = object.__new__(w4a8_mxfp4.AscendW4A8MXFPDynamicFusedMoEMethod)
+        method.use_expert_weight_list = False
         with patch.object(w4a8_mxfp4, "get_current_vllm_config", return_value=None):
             with patch.object(w4a8_mxfp4, "use_cann_megamoe", return_value=False):
                 method.process_weights_after_loading(baseline)
+            method.use_expert_weight_list = a.eplb
             with patch.object(w4a8_mxfp4, "use_cann_megamoe", return_value=True):
                 method.process_weights_after_loading(layer)
         with patch.object(w4a8_mxfp4, "_EXTRA_CTX", SimpleNamespace(use_mega_moe=True)):
@@ -187,7 +192,7 @@ def main():
             mxfp_scale_dtype=torch_npu.float8_e8m0fnu,
             mxfp_per_token_scale_dtype=torch_npu.float8_e8m0fnu,
             mxfp_use_bf16=True,
-            dynamic_eplb=False,
+            dynamic_eplb=a.eplb,
             activation=a.activation,
             mc2_mask=active_mask,
         )

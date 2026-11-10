@@ -6,7 +6,7 @@ import unittest
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace as NS
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -101,6 +101,70 @@ class TestKimiMigrationReview(unittest.TestCase):
         second = method.get_fused_mc2_weights(layer)
         self.assertIs(first.w1, second.w1)
         torch.testing.assert_close(second.w1[0], torch.ones(128, 32, dtype=torch.uint8))
+
+    def test_eplb_megamoe_scales_share_live_migration_storage(self):
+        context = NS(use_mega_moe=True)
+        namespace = dict(
+            torch=torch,
+            torch_npu=NS(npu_format_cast=lambda weight, *args, **kwargs: weight, float4_e2m1fn_x2=296),
+            ACL_FORMAT_FRACTAL_NZ=29,
+            MoEActivation=NS(SITU="situ"),
+            _EXTRA_CTX=context,
+            MoEWeights=NS,
+        )
+        cls = load_class(
+            "vllm_ascend/quantization/methods/w4a8/w4a8_mxfp4.py",
+            "AscendW4A8MXFPDynamicFusedMoEMethod",
+            {"process_weights_after_loading", "_get_mlp_weights", "get_fused_mc2_weights", "get_eplb_weight_views"},
+            namespace,
+        )
+        for activation in ("silu", "situ"):
+            with self.subTest(activation=activation):
+                method = cls()
+                method.use_expert_weight_list = True
+                layer = torch.nn.Module()
+                layer.activation = activation
+                local_experts = (224 + 8) // 8
+                for name, shape in (
+                    ("w13_weight", (local_experts, 128, 32)),
+                    ("w2_weight", (local_experts, 64, 32)),
+                    ("w13_weight_scale", (local_experts, 128, 2)),
+                    ("w2_weight_scale", (local_experts, 64, 2)),
+                ):
+                    layer.register_parameter(name, torch.nn.Parameter(torch.ones(shape, dtype=torch.uint8), False))
+                with patch.object(torch, "npu", NS(empty_cache=Mock()), create=True):
+                    method.process_weights_after_loading(layer)
+                context.use_mega_moe = True
+                before = method.get_fused_mc2_weights(layer)
+                migration_weights = method.get_eplb_weight_views(layer)
+                self.assertIs(before.w1, migration_weights[0])
+                self.assertIs(before.w2, migration_weights[1])
+                for scales, source in (
+                    (before.w1_scale, migration_weights[2]),
+                    (before.w2_scale, migration_weights[3]),
+                ):
+                    self.assertEqual(len(scales), local_experts)
+                    for scale, original in zip(scales, source):
+                        self.assertEqual(scale.dtype, torch.float8_e8m0fnu)
+                        self.assertEqual(original.dtype, torch.uint8)
+                        self.assertEqual(scale.untyped_storage().data_ptr(), original.untyped_storage().data_ptr())
+                for weights in migration_weights:
+                    weights[-1].view(torch.uint8).fill_(127)
+                context.use_mega_moe = False
+                decoded = method.get_fused_mc2_weights(layer)
+                self.assertEqual(decoded.w1_scale[0].dtype, torch.uint8)
+                self.assertEqual(decoded.w1_scale[0].shape, (1, 128, 2))
+                context.use_mega_moe = True
+                after = method.get_fused_mc2_weights(layer)
+                for weights in (before, decoded, after):
+                    for tensors, source in zip(
+                        (weights.w1, weights.w2, weights.w1_scale, weights.w2_scale), migration_weights
+                    ):
+                        self.assertEqual(len(tensors), local_experts)
+                        self.assertEqual(
+                            tensors[-1].untyped_storage().data_ptr(), source[-1].untyped_storage().data_ptr()
+                        )
+                        self.assertTrue(torch.all(tensors[-1].view(torch.uint8) == 127))
 
     def test_preprojected_front_does_not_project_again_or_record_serial_events(self):
         projection = Mock(side_effect=lambda x: (x[:, :2] * 2, x))
