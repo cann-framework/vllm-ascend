@@ -8,12 +8,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 import native_reconcile  # noqa: E402
+import native_result  # noqa: E402
 import native_source  # noqa: E402
 import prepare_request  # noqa: E402
 import wait_result  # noqa: E402
@@ -122,6 +124,25 @@ class BlueSourceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 prepare_request.create_plan("workflow_dispatch", {}, '[{"test_id":"missing"}]', 123, 1)
 
+    def test_plan_inherits_model_resource_overrides(self):
+        case = replace(
+            prepare_request.BLUE_CASES["dispatch_smoke_8p"],
+            ci_overrides={"worker": "blue", "target_pool": "another_pool", "docker": "another_container"},
+        )
+        with patch.dict(prepare_request.BLUE_CASES, {case.test_name: case}):
+            plan = prepare_request.create_plan("pull_request_target", self.event, "", 123, 1)
+        for item in (plan["cases"][1], plan["cases"][3]):
+            self.assertEqual(
+                (item["worker"], item["target_pool"], item["docker"]),
+                ("blue", "another_pool", "another_container"),
+            )
+        probe = replace(prepare_request.BLUE_CASES["worker_os_blue"], ci_overrides={"target_pool": "another_pool"})
+        with (
+            patch.dict(prepare_request.BLUE_CASES, {probe.test_name: probe}),
+            self.assertRaisesRegex(ValueError, "probe cannot request resources"),
+        ):
+            prepare_request.create_plan("pull_request_target", self.event, "", 123, 1)
+
     def test_new_model_case_expands_without_changing_workflow(self):
         root = SCRIPTS.parents[2]
         with tempfile.TemporaryDirectory() as tmp:
@@ -207,6 +228,74 @@ class BlueSourceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "conflicting case results"):
             find(result, {**result, "status": "FAIL", "exit_code": 1})
 
+    def test_waiter_script_accepts_valid_result_without_inherited_pythonpath(self):
+        root = SCRIPTS.parents[2]
+        source = {
+            "mode": "commit",
+            "run_id": 123,
+            "attempt": 1,
+            "head_sha": "a" * 40,
+            "control_sha": "c" * 40,
+            "plan_digest": self.plan["plan_digest"],
+        }
+        case = self.plan["cases"][1]
+        result = {key: case[key] for key in ("case_id", "test_id", "worker", "target_pool", "docker", "resources")}
+        result.update(
+            schema=3,
+            repo=prepare_request.REPO,
+            workflow=prepare_request.WORKFLOW,
+            run_id=123,
+            attempt=1,
+            sha="a" * 40,
+            plan_digest=self.plan["plan_digest"],
+            status="PASS",
+            exit_code=0,
+            cleanup_verified=True,
+            last_20_lines=[],
+            native_source=source,
+        )
+        comments = [{"user": {"login": "worker"}, "body": f"Lite-CI-V3 123:1:{case['case_id']}\n" + json.dumps(result)}]
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "source.json").write_text(json.dumps(source))
+            (folder / "sitecustomize.py").write_text(
+                "import io,json,os,urllib.request\n"
+                "class Response(io.BytesIO):\n    headers = {}\n"
+                "def fake(req,timeout):\n"
+                "    data = json.loads(os.environ['MOCK_RESPONSES'])\n"
+                "    key = 'artifacts' if '/artifacts?' in req.full_url else 'comments'\n"
+                "    return Response(json.dumps(data[key]).encode())\n"
+                "urllib.request.urlopen = fake\n"
+            )
+            env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+            env.update(
+                PYTHONPATH=str(root) + os.pathsep + str(folder),
+                GITHUB_REPOSITORY=prepare_request.REPO,
+                GITHUB_RUN_ID="123",
+                GITHUB_RUN_ATTEMPT="1",
+                GITHUB_WORKFLOW_SHA="c" * 40,
+                CI_RESULT_AUTHOR="worker",
+                CI_CASE=json.dumps(case),
+                CI_SOURCE_SHA="a" * 40,
+                CI_PLAN_DIGEST=self.plan["plan_digest"],
+                CI_WORKFLOW=prepare_request.WORKFLOW,
+                CI_NATIVE_SOURCE=str(folder / "source.json"),
+                GH_TOKEN="fake",
+                MOCK_RESPONSES=json.dumps(
+                    {"artifacts": {"artifacts": [{"name": "lite-ci-request-1"}]}, "comments": comments}
+                ),
+            )
+            completed = subprocess.run(
+                [sys.executable, ".github/scripts/lite_actions/wait_result.py"],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("PASS", completed.stdout)
+
     def test_reconciler_skips_untested_pr_and_rechecks_stale_test(self):
         self.base = "c" * 40
         self.pr["base"]["ref"] = "releases/v0.30.0"
@@ -232,11 +321,69 @@ class BlueSourceTests(unittest.TestCase):
         self.assertEqual(native_reconcile.reconcile(get, send), [])
         self.assertEqual(calls, [])
         statuses.append({"context": "Lite-Actions-Blue-Merge", "description": "older base"})
+        self.assertEqual(native_reconcile.reconcile(get, send), [])
+        self.assertEqual(calls, [])
+        statuses.append({"context": native_result.context(7), "description": "older base"})
         result = native_reconcile.reconcile(get, send)
         self.assertEqual(result[0]["run_id"], 789)
         self.assertEqual(len(calls), 2)
         native_reconcile.reconcile(get, send)
         self.assertEqual(len(calls), 2)
+
+    def test_shared_head_uses_independent_pr_statuses(self):
+        main_pr = copy.deepcopy(self.pr)
+        release_pr = copy.deepcopy(self.pr)
+        release_pr["number"] = 8
+        release_pr["base"]["ref"] = "releases/v0.30.0"
+        untested_pr = copy.deepcopy(self.pr)
+        untested_pr["number"] = 9
+        pulls = {pr["number"]: pr for pr in (main_pr, release_pr, untested_pr)}
+        tests = [c["test_id"] for c in self.plan["cases"]]
+        statuses = [
+            {"context": "Lite-Actions-Blue-Merge", "description": "old static status"},
+            {"context": native_result.context(7), "description": native_result.description("b" * 40, tests, "main")},
+            {
+                "context": native_result.context(8),
+                "description": native_result.description("b" * 40, tests, "releases/v0.30.0"),
+            },
+        ]
+        calls = []
+
+        def get(path):
+            if path.startswith("/pulls?"):
+                return list(pulls.values())
+            if path.startswith("/pulls/"):
+                return pulls[int(path.rsplit("/", 1)[-1])]
+            if path == "/branches/main":
+                return {"commit": {"sha": "c" * 40}}
+            if path == "/branches/releases%2Fv0.30.0":
+                return {"commit": {"sha": "b" * 40}}
+            if path.startswith("/commits/"):
+                return {"statuses": statuses}
+            raise AssertionError(path)
+
+        def send(path, data):
+            calls.append((path, data))
+            if path.startswith("/statuses/"):
+                statuses.insert(0, data)
+            return {"workflow_run_id": 789}
+
+        results = native_reconcile.reconcile(get, send)
+        self.assertEqual([x["pr"] for x in results], [7, 8])
+        self.assertEqual(calls[0][1]["context"], native_result.context(7))
+        self.assertEqual(len(calls), 2)
+        native_reconcile.reconcile(get, send)
+        self.assertEqual(len(calls), 2)
+
+    def test_retarget_marks_its_pr_pending_before_merge_is_ready(self):
+        with (
+            patch.object(native_result, "current_pr", return_value=(self.pr, "a" * 40, "b" * 40)),
+            patch.object(native_result, "post") as post,
+        ):
+            native_result.invalidate_retarget(7)
+        path, status = post.call_args.args
+        self.assertEqual(path, "/statuses/" + "a" * 40)
+        self.assertEqual((status["context"], status["state"]), (native_result.context(7), "pending"))
 
 
 if __name__ == "__main__":

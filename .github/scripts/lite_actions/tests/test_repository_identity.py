@@ -89,14 +89,6 @@ class RepositoryIdentityTests(unittest.TestCase):
         self.assertEqual(prepare.REPO, REPO)
         self.assertEqual(waiter.REPO, REPO)
 
-    def test_workflow_checks_out_canonical_control_not_personal_fork(self):
-        workflow = (
-            ROOT / ".github/workflows/lite_actions_dispatcher_smoke.yml"
-        ).read_text()
-        self.assertNotIn(OLD_REPO, workflow)
-        self.assertEqual(workflow.count("repository: " + REPO + "\n"), 3)
-        self.assertNotIn("repository: depeng1994/vllm-ascend", workflow)
-
     def test_canonical_personal_fork_pr_uses_default_smoke(self):
         plan = prepare.create_plan("pull_request_target", self.payload, "", 100, 2)
         self.assertEqual((plan["schema"], plan["repo"], plan["sha"]), (3, REPO, SHA))

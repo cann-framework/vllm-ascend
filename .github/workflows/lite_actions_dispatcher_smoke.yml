@@ -4,7 +4,7 @@ run-name: >-
 
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review, labeled]
+    types: [opened, reopened, synchronize, ready_for_review, labeled, edited]
   workflow_dispatch:
     inputs:
       test_cases:
@@ -35,14 +35,16 @@ permissions:
   statuses: write
 
 concurrency:
-  group: lite-vllm-${{ github.event.pull_request.number || inputs.source_pr || github.run_id }}
+  group: >-
+    ${{ github.event_name == 'pull_request_target' && github.event.action == 'edited' && !github.event.changes.base.ref.from && format('lite-vllm-ignored-{0}', github.run_id) || format('lite-vllm-{0}', github.event.pull_request.number || inputs.source_pr || github.run_id) }}
   cancel-in-progress: true
 
 jobs:
   prepare:
     if: >-
       github.repository == 'cann-framework/vllm-ascend' &&
-      (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request_target')
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request_target') &&
+      (github.event_name != 'pull_request_target' || github.event.action != 'edited' || github.event.changes.base.ref.from)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -56,6 +58,12 @@ jobs:
           repository: cann-framework/vllm-ascend
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
+      - name: Invalidate the previous target result
+        if: github.event_name == 'pull_request_target' && github.event.action == 'edited' && github.event.changes.base.ref.from
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/native_result.py --pending-pr "$CI_PR_NUMBER" --state pending
       - name: Create trusted smoke plan and immutable Blue merge source
         id: plan
         env:
@@ -112,7 +120,7 @@ jobs:
           CI_CASE: ${{ toJSON(matrix) }}
           CI_WORKFLOW: lite_actions_dispatcher_smoke.yml
           CI_NATIVE_SOURCE: ${{ needs.prepare.outputs.native_source == 'true' && '.ci-source/source.json' || '' }}
-        run: python3 .github/scripts/lite_actions/wait_result.py
+        run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/wait_result.py
 
   result:
     if: always() && needs.prepare.result != 'skipped'

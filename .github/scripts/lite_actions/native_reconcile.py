@@ -11,7 +11,7 @@ import os
 import urllib.error
 
 from blue_catalog import BLUE_SMOKE_SUITE
-from native_result import CONTEXT, description, post
+from native_result import context, description, post
 from native_source import REPO, api, current_pr
 
 WORKFLOW = "lite_actions_dispatcher_smoke.yml"
@@ -38,14 +38,6 @@ def reconcile(get=api, send=post):
         if not isinstance(head, str) or len(head) != 40:
             continue
         try:
-            pr, current_head, base = current_pr(number, get)
-        except ValueError as exc:
-            if str(exc) != "unauthorized Blue PR source":
-                raise
-            continue
-        if head != current_head:
-            continue
-        try:
             statuses = get("/commits/" + head + "/status?per_page=100").get("statuses", [])
         except urllib.error.HTTPError as exc:
             if exc.code != 404:
@@ -57,10 +49,18 @@ def reconcile(get=api, send=post):
                     continue
                 raise
             raise
-        prior = next((x for x in statuses if x.get("context") == CONTEXT), None)
+        prior = next((x for x in statuses if x.get("context") == context(number)), None)
         # Existing versions may need a Base-only recheck; do not start every
         # historical open PR when the workflow is enabled for more forks.
         if not prior:
+            continue
+        try:
+            pr, current_head, base = current_pr(number, get)
+        except ValueError as exc:
+            if str(exc) != "unauthorized Blue PR source":
+                raise
+            continue
+        if head != current_head:
             continue
         tests = list(BLUE_SMOKE_SUITE)
         desc = description(base, tests, pr["base"]["ref"])
@@ -75,7 +75,7 @@ def reconcile(get=api, send=post):
             "/statuses/" + head,
             {
                 "state": "pending",
-                "context": CONTEXT,
+                "context": context(number),
                 "description": desc,
                 "target_url": f"https://github.com/{REPO}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
             },

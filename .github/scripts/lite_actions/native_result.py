@@ -7,9 +7,14 @@ import os
 import urllib.request
 from pathlib import Path
 
-from native_source import REPO, api, assert_current
+from blue_catalog import BLUE_SMOKE_SUITE
+from native_source import REPO, api, assert_current, current_pr
 
-CONTEXT = "Lite-Actions-Blue-Merge"
+
+def context(pr_number):
+    if type(pr_number) is not int or pr_number < 1:
+        raise ValueError("invalid PR number")
+    return f"Lite-Actions-Blue-Merge-PR-{pr_number}"
 
 
 def description(base_sha, test_ids, base_ref):
@@ -65,18 +70,38 @@ def publish(source, state):
         "/statuses/" + source["head_sha"],
         {
             "state": state,
-            "context": CONTEXT,
+            "context": context(source["pr_number"]),
             "description": description(source["base_sha"], source["test_ids"], source["base_ref"]),
             "target_url": f"https://github.com/{REPO}/actions/runs/{source['run_id']}/attempts/{source['attempt']}",
         },
     )
 
 
+def invalidate_retarget(number):
+    pr, head, base = current_pr(number)
+    post(
+        "/statuses/" + head,
+        {
+            "state": "pending",
+            "context": context(number),
+            "description": description(base, list(BLUE_SMOKE_SUITE), pr["base"]["ref"]),
+            "target_url": f"https://github.com/{REPO}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+        },
+    )
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--source", type=Path, required=True)
+    source_arg = p.add_mutually_exclusive_group(required=True)
+    source_arg.add_argument("--source", type=Path)
+    source_arg.add_argument("--pending-pr", type=int)
     p.add_argument("--state", choices=("pending", "success", "failure"), required=True)
     a = p.parse_args()
+    if a.pending_pr is not None:
+        if a.state != "pending":
+            p.error("--pending-pr requires pending state")
+        invalidate_retarget(a.pending_pr)
+        return
     source = json.loads(a.source.read_text())
     if (
         source.get("repository") != REPO

@@ -64,10 +64,16 @@ def create_plan(event, payload, value, run_id, attempt):
             test = BLUE_CASES[test_id]
             nodes, ngpu, timeout = test.nnodes, test.ngpu, test.timeout
             label, kind = test.test_descr, test.ci_kind
-            worker = test.ci_overrides.get("worker", defaults["worker"])
+            overrides = test.ci_overrides or {}
+            if not isinstance(overrides, dict) or set(overrides) - {"worker", "target_pool", "docker"}:
+                raise ValueError("unknown case override")
+            if kind == "worker_probe" and set(overrides) & {"target_pool", "docker"}:
+                raise ValueError("probe cannot request resources")
+            config = {**defaults, **overrides}
         else:
             nodes, ngpu, timeout = CASES[test_id]
-            label, kind, worker = f"A5 HCCL distributed smoke {nodes * ngpu}P", "npu_smoke", defaults["worker"]
+            label, kind = f"A5 HCCL distributed smoke {nodes * ngpu}P", "npu_smoke"
+            config = defaults
         items.append(
             {
                 "case_id": f"case_{i:03d}_{test_id}",
@@ -75,10 +81,10 @@ def create_plan(event, payload, value, run_id, attempt):
                 "test_id": test_id,
                 "label": label,
                 "kind": kind,
-                "worker": worker,
-                "target_pool": defaults["target_pool"] if nodes else None,
+                "worker": config["worker"],
+                "target_pool": config["target_pool"] if kind != "worker_probe" else None,
                 "resources": {"nodes": nodes, "devices_per_node": ngpu},
-                "docker": defaults["docker"] if nodes else None,
+                "docker": config["docker"] if kind != "worker_probe" else None,
                 "execution_timeout_seconds": timeout,
             }
         )
