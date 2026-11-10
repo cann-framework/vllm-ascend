@@ -36,6 +36,14 @@ jobs:
           review_id=$(jq -er '.id' /tmp/probe-review.json)
           trap 'gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$PROBE_PR/reviews/$review_id/dismissals" -f message="End of controlled approval test" >/dev/null || true' EXIT
           jq -e --arg sha "$PROBE_SHA" '.user.login == "github-actions[bot]" and .state == "APPROVED" and .commit_id == $sha' /tmp/probe-review.json >/dev/null
+          decision=REVIEW_REQUIRED
+          for attempt in $(seq 1 10); do
+            decision=$(gh pr view "$PROBE_PR" -R "$GITHUB_REPOSITORY" --json reviewDecision --jq '.reviewDecision')
+            printf 'Review decision after bot approval: %s\n' "$decision"
+            [[ "$decision" == APPROVED ]] && break
+            sleep 2
+          done
+          [[ "$decision" == APPROVED ]]
           gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$PROBE_PR/reviews/$review_id/dismissals" -f message='End of controlled approval test' >/dev/null
           gh api "repos/$GITHUB_REPOSITORY/pulls/$PROBE_PR/reviews/$review_id" --jq '{id,state,commit_id,user:.user.login}'
           trap - EXIT
