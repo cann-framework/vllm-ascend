@@ -384,7 +384,6 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
                         get_ascend_config().enable_multi_streams
                         and layout == "pa_nz"
                     ),
-                    reserved_pages=getattr(kv_cache_spec, "flash_mla_reserved_pages", 0),
                 )
                 self.flashmla_states[layout] = state
                 if self.flashmla_state is None:
@@ -3350,17 +3349,6 @@ class AscendMLAImpl(MLAAttentionImpl):
             rows.reshape(-1, 16),
         )
 
-    @staticmethod
-    def _extend_pa_nz_cache(cache: torch.Tensor, reserved_pages: int) -> torch.Tensor:
-        if reserved_pages <= 0:
-            return cache
-        return torch.as_strided(
-            cache,
-            size=(cache.shape[0] + reserved_pages, *cache.shape[1:]),
-            stride=cache.stride(),
-            storage_offset=cache.storage_offset(),
-        )
-
     def _forward_decode_flash_bf16(
         self,
         hidden_states: torch.Tensor,
@@ -3384,12 +3372,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_decodes = attn_metadata.num_decodes
         merged_cache = kv_cache if isinstance(kv_cache, torch.Tensor) else kv_cache[0]
-        reserved_pages = flash.reserved_pages
-        if reserved_pages:
-            merged_cache = self._extend_pa_nz_cache(merged_cache, reserved_pages)
         block_size = merged_cache.shape[1]
-        hidden_page = merged_cache.shape[0] - reserved_pages if reserved_pages else None
-        scratch_page = merged_cache.shape[0] - 1 if reserved_pages else None
         if flash.block_columns is not None:
             valid_cols = (flash.cache_lens + block_size - 1) // block_size
             last_columns = (valid_cols - 1).clamp_min(0).to(torch.long)
@@ -3399,12 +3382,9 @@ class AscendMLAImpl(MLAAttentionImpl):
                 last_columns[:, None],
             ).squeeze(1)
             stale = flash.block_columns[None, :] >= valid_cols[:, None]
-            if hidden_page is not None:
-                flash.block_table.masked_fill_(stale, hidden_page)
-            else:
-                flash.block_table.copy_(
-                    torch.where(stale, last_blocks[:, None], flash.block_table)
-                )
+            flash.block_table.copy_(
+                torch.where(stale, last_blocks[:, None], flash.block_table)
+            )
         if num_decodes > 0 and flash.tail_last_block_ids is not None and flash.tail_invalid is not None:
             clear_partial_block_tail(
                 merged_cache,
@@ -3416,14 +3396,10 @@ class AscendMLAImpl(MLAAttentionImpl):
                     flash.tail_invalid[:num_decodes],
                 ),
             )
-        if num_decode_tokens > attn_metadata.num_actual_tokens and reserved_pages == 0:
-            raise RuntimeError("PA_NZ decode with graph/batch padding requires a reserved scratch page.")
         if flash.metadata_async and flash.metadata_builder is not None and not flash.metadata_started:
             flash.metadata_builder.start_metadata(flash)
         if flash.prolog_slots is not None:
-            if scratch_page is not None:
-                scratch_slot = scratch_page * block_size
-                flash.prolog_slots.masked_fill_(~flash.token_live, scratch_slot)
+            flash.prolog_slots.masked_fill_(~flash.token_live | (flash.prolog_slots < 0), 0)
             cache_indices = flash.prolog_slots[:num_decode_tokens].to(torch.int64)
         else:
             cache_indices = flash.slots[:num_decode_tokens].to(torch.int64).clamp_min(0)
@@ -3475,14 +3451,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 )
                 history_slots = cache_indices
                 valid_slots = (history_slots >= 0) & flash.token_live[:num_decode_tokens]
-                if scratch_page is not None:
-                    history_slots = torch.where(
-                        valid_slots,
-                        history_slots,
-                        torch.full_like(history_slots, scratch_page * block_size),
-                    )
-                else:
-                    history_slots = history_slots.clamp_min(0)
+                history_slots = torch.where(valid_slots, history_slots, torch.zeros_like(history_slots))
                 # The private current cache holds every row; persist only valid
                 # rank-owned rows into history for the next decode step.
                 self._scatter_pa_nz_rows(merged_cache, history_slots, current_rows)

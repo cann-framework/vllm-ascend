@@ -142,11 +142,6 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     # stride. vLLM main removed this field from AttentionSpec, but it remains
     # part of the Ascend runner/backend contract.
     indexes_kv_by_block_stride: bool = False
-    # "pa_bbnd": the 0.30 token-fused external FlashMLA cache.
-    # "pa_nz": the 0.27-style merged PA_NZ cache selected by
-    # VLLM_ASCEND_ENABLE_FLASH_MLA. PA_NZ requires a contiguous page.
-    flash_mla_layout: str = "pa_bbnd"
-    flash_mla_reserved_pages: int = 0
 
     @property
     def uses_packed_sfa_main_cache(self) -> bool:
@@ -162,11 +157,6 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             and not self.indexes_kv_by_block_stride
             and not self.cache_sparse_sfa_c8
         )
-
-    @property
-    def requires_contiguous_page(self) -> bool:
-        """Whether the selected FlashMLA layout needs dense per-page storage."""
-        return self.flash_mla_layout == "pa_nz"
 
     @property
     def real_page_size_bytes(self) -> int:
@@ -220,8 +210,6 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             cache_sparse_sfa_turboquant=first_spec.cache_sparse_sfa_turboquant,
             store_on_host=first_spec.store_on_host,
             indexes_kv_by_block_stride=first_spec.indexes_kv_by_block_stride,
-            flash_mla_layout=first_spec.flash_mla_layout,
-            flash_mla_reserved_pages=max(spec.flash_mla_reserved_pages for spec in specs),
         )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:

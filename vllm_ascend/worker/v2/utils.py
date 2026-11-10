@@ -8,10 +8,7 @@ import torch
 from vllm.compilation import breakable_cudagraph
 from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import logger
-from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
-
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.compilation.acl_graph import (
@@ -24,42 +21,6 @@ from vllm_ascend.compilation.updatable_graph import UpdatableGraph
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.utils import super_kernel_scope, weak_ref_tensor, weak_ref_tensors
 from vllm_ascend.worker.v2.attn_utils import ring_state_update_skipped
-
-
-def _trim_attention_cache_views(
-    kv_cache: Any,
-    num_blocks: int,
-    layer_name: str,
-) -> Any:
-    """Keep the zeroer-facing view at the scheduler's logical block count."""
-    is_tuple = isinstance(kv_cache, tuple)
-    is_list = isinstance(kv_cache, list)
-    tensors = kv_cache if (is_tuple or is_list) else (kv_cache,)
-    trimmed: list[Any] = []
-    changed = False
-    for tensor in tensors:
-        if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
-            trimmed.append(tensor)
-            continue
-        kernel_blocks = tensor.shape[0]
-        if kernel_blocks > num_blocks and kernel_blocks % num_blocks != 0:
-            for extra_pages in range(1, 17):
-                physical_blocks = num_blocks + extra_pages
-                if kernel_blocks % physical_blocks == 0:
-                    logical_blocks = num_blocks * (kernel_blocks // physical_blocks)
-                    if logical_blocks < kernel_blocks:
-                        tensor = torch.as_strided(
-                            tensor,
-                            size=(logical_blocks, *tensor.shape[1:]),
-                            stride=tensor.stride(),
-                            storage_offset=tensor.storage_offset(),
-                        )
-                        changed = True
-                    break
-        trimmed.append(tensor)
-    if not changed:
-        return kv_cache
-    return tuple(trimmed) if is_tuple else (trimmed if is_list else trimmed[0])
 
 
 class AscendV2KVBlockZeroer(KVBlockZeroer):
@@ -88,12 +49,6 @@ class AscendV2KVBlockZeroer(KVBlockZeroer):
         self._meta = None
         runner_only_attn_layers = runner_only_attn_layers or set()
         groups = list(attn_groups_iter)
-        mla_layer_names = {
-            layer_name
-            for group in groups
-            if isinstance(group.kv_cache_spec, (AscendMLAAttentionSpec, MLAAttentionSpec, AscendSlidingWindowMLASpec))
-            for layer_name in group.layer_names
-        }
         # The 4th component of an mxfp8 tuple is the static checkpoint V
         # scale: clearing a recycled block must preserve it.
         layer_caches: dict[str, Any] = {}
@@ -102,11 +57,6 @@ class AscendV2KVBlockZeroer(KVBlockZeroer):
                 if layer_name in runner_only_attn_layers:
                     continue
                 kv_cache = static_forward_context[layer_name].kv_cache
-                if layer_name in mla_layer_names:
-                    trimmed = _trim_attention_cache_views(kv_cache, num_blocks, layer_name)
-                    if trimmed is not kv_cache:
-                        static_forward_context[layer_name].kv_cache = trimmed
-                        kv_cache = trimmed
                 if cache_dtype == "mxfp8" and isinstance(kv_cache, tuple) and len(kv_cache) == 4:
                     kv_cache = kv_cache[:3]
                 layer_caches[layer_name] = kv_cache

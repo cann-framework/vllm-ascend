@@ -111,7 +111,6 @@ from vllm_ascend.utils import (
 from vllm_ascend.worker.kvpp_cache import allocate_kvpp_cache
 from vllm_ascend.worker.utils import (
     get_single_raw_mla_backing,
-    make_pa_nz_cache_view,
     make_page_strided_cache_view,
 )
 
@@ -292,13 +291,6 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 non_causal_multi_token_decode=spec.non_causal_multi_token_decode,
                 model_version=model_version,
                 indexes_kv_by_block_stride=indexes_kv_by_block_stride,
-                flash_mla_layout=getattr(getattr(attn_module, "impl", None), "flash_mla_layout", "pa_bbnd"),
-                flash_mla_reserved_pages=(
-                    2
-                    if getattr(getattr(attn_module, "impl", None), "flash_mla_layout", "pa_bbnd")
-                    == "pa_nz"
-                    else 0
-                ),
                 **ratio_kwargs,
             )
         if isinstance(attn_module, DeepseekV32IndexerCache):
@@ -974,11 +966,9 @@ def _uses_single_raw_mla_cache(
         # preprocessing contract. Keep their allocation compatible with it.
         return False
     if getattr(impl, "flash_mla_layout", None) == "pa_nz":
-        if vllm_config.kv_transfer_config is not None and not supports_component_major_mla_pd(vllm_config):
-            return False
-        if not kv_cache_spec.requires_contiguous_page:
-            return False
-        return bool(getattr(impl, "use_flashmla", False))
+        # PA_NZ and the BF16 prolog share one fused raw backing even without
+        # PD transfer; the vendor reader consumes the fused tensor directly.
+        return True
     if not supports_component_major_mla_pd(vllm_config):
         return False
     if getattr(impl, "use_flashmla", False):
@@ -1169,33 +1159,6 @@ def _allocate_kv_cache(
         for layer_name, start, layer_size in dsv4_regions:
             kv_cache_raw_tensors[layer_name] = dsv4_backing[start : start + layer_size]
 
-    # Kimi K3 PA_NZ keeps target/draft/Mamba page strides distinct, but they
-    # still alias one shared hybrid pool. A block ID is owned by one group at
-    # a time, so the pool is the largest group's bytes per block, not the sum
-    # of all groups. Allocating every descriptor independently multiplies the
-    # pools and can exhaust the KV budget before capture.
-    if any(getattr(spec, "flash_mla_layout", None) == "pa_nz" for spec in layer_kv_cache_spec.values()):
-        pool_size = max((allocation.size for allocation in kv_cache_config.kv_cache_tensors), default=0)
-        if pool_size <= 0:
-            raise ValueError("PA_NZ KV cache config has no allocation.")
-        backing = _allocate_int8_cache_tensor(pool_size, alignment, device)
-        for allocation in kv_cache_config.kv_cache_tensors:
-            layer_names = get_kv_cache_tensor_layers(allocation)
-            layer_count = max(1, len(layer_names))
-            layer_stride = allocation.layer_stride or (allocation.size // layer_count)
-            for layer_idx, layer_name in enumerate(layer_names):
-                start = allocation.offset + layer_idx * layer_stride
-                end = start + layer_stride
-                if end > backing.numel():
-                    raise ValueError(
-                        "PA_NZ KV cache view for "
-                        f"{layer_name} exceeds backing: size={backing.numel()}, "
-                        f"start={start}, end={end}, layer_stride={layer_stride}, "
-                        f"num_blocks={kv_cache_config.num_blocks}."
-                    )
-                kv_cache_raw_tensors[layer_name] = backing[start:end]
-        return kv_cache_raw_tensors
-
     # vLLM #51718 changed every KVCacheTensor to describe a view into one
     # common backing allocation. Hybrid groups overlay that backing from byte
     # zero because a block ID belongs to only one group at a time. Allocate it
@@ -1299,13 +1262,9 @@ def _allocate_kv_cache(
             continue
 
         if hybrid_backing is not None:
-            reserved_pages = max(
-                (getattr(spec, "flash_mla_reserved_pages", 0) for spec in layer_kv_cache_spec.values()),
-                default=0,
-            )
             for layer_idx, layer_name in enumerate(shared_names):
                 layer_spec = layer_kv_cache_spec[layer_name]
-                layer_size = (kv_cache_config.num_blocks + reserved_pages) * layer_spec.page_size_bytes
+                layer_size = kv_cache_config.num_blocks * layer_spec.page_size_bytes
                 if (
                     kv_cache_tensor.layer_stride != layer_size
                     or kv_cache_tensor.block_stride != layer_spec.page_size_bytes
@@ -1831,23 +1790,26 @@ def _reshape_kv_cache_v2(
 
                 attn_impl = vllm_config.compilation_config.static_forward_context[layer_name].impl
                 if getattr(attn_impl, "flash_mla_layout", None) == "pa_nz":
-                    # The 0.27 BF16 FlashMLA operator owns a dense merged
-                    # PA_NZ page; padded block strides are rejected. Reserve
-                    # hidden/scratch pages at the end of the physical backing.
-                    reserved_pages = getattr(kv_cache_spec, "flash_mla_reserved_pages", 0)
-                    slot_bytes_unpadded = kv_cache_spec.unpadded_page_size_bytes // kernel_blocks_per_manager
-                    # Keep the view presented to the runner at the logical
-                    # num_blocks. The reserved pages stay in the backing
-                    # storage and are exposed only to the PA_NZ prolog.
-                    pa_nz_cache = make_pa_nz_cache_view(
+                    # PA_NZ reuses the ND allocator and page stride. The first
+                    # axis is the physical 128-token kernel page, so the page
+                    # stride must remain the unpadded slot size.
+                    dense_page_bytes = slot_bytes * kernel_blocks_per_manager
+                    page_size_padded = getattr(kv_cache_spec, "page_size_padded", None)
+                    if (
+                        kv_cache_spec.page_size_bytes != dense_page_bytes
+                        or page_size_padded not in (None, dense_page_bytes)
+                    ):
+                        raise ValueError(
+                            "PA_NZ requires dense scheduler pages: "
+                            f"layer={layer_name}, page={kv_cache_spec.page_size_bytes}, "
+                            f"padded={page_size_padded}, dense={dense_page_bytes}."
+                        )
+                    kv_caches[layer_name] = make_page_strided_cache_view(
                         single_raw_mla_cache,
                         (*component_shape, fused_dim),
                         kv_cache_spec.dtype,
-                        slot_bytes_unpadded,
+                        slot_bytes,
                     )
-                    if reserved_pages:
-                        pa_nz_cache[-reserved_pages:].zero_()
-                    kv_caches[layer_name] = pa_nz_cache
                     continue
                 if attn_impl.use_flashmla:
                     # FlashMLA consumes one token-fused tensor with
@@ -1889,22 +1851,6 @@ def _reshape_kv_cache_v2(
                     if kv_cache_spec.page_size_padded is not None
                     else kv_cache_spec.page_size_bytes
                 )
-                layer_specs = _get_layer_kv_cache_specs(kv_cache_config)
-                if any(getattr(spec, "flash_mla_layout", None) == "pa_nz" for spec in layer_specs.values()):
-                    reserved_pages = max(
-                        (getattr(spec, "flash_mla_reserved_pages", 0) for spec in layer_specs.values()),
-                        default=0,
-                    )
-                    physical_page_bytes = total_bytes // (
-                        kv_cache_config.num_blocks + reserved_pages
-                    )
-                    if (
-                        physical_page_bytes > 0
-                        and total_bytes
-                        % (kv_cache_config.num_blocks + reserved_pages)
-                        == 0
-                    ):
-                        page_stride_bytes = physical_page_bytes
 
             if total_bytes % page_stride_bytes:
                 raise ValueError(f"KV cache for {layer_name} is not a whole number of pages.")
@@ -2007,46 +1953,6 @@ def _reshape_kv_cache_v2(
 
     for layer_name, target_layer_name in shared_kv_cache_layers.items():
         kv_caches[layer_name] = kv_caches[target_layer_name]
-
-    # Reserved PA_NZ pages live in the raw backing, but some reshape paths
-    # (notably a draft-only KV config, where no layer advertises the target's
-    # reserved-page count) still fold them into the first dimension. Recover
-    # the logical kernel-block count from the tensor geometry itself so the
-    # runner/PD/block-zeroer always sees exactly num_blocks logical blocks.
-    layer_specs = _get_layer_kv_cache_specs(kv_cache_config)
-    num_logical_blocks = kv_cache_config.num_blocks
-    for layer_name, cache in list(kv_caches.items()):
-        spec = layer_specs.get(layer_name)
-        if not isinstance(spec, (AscendMLAAttentionSpec, MLAAttentionSpec, AscendSlidingWindowMLASpec)):
-            continue
-        tensors = cache if isinstance(cache, tuple) else (cache,)
-        trimmed: list[torch.Tensor] = []
-        changed = False
-        for tensor in tensors:
-            if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
-                trimmed.append(tensor)
-                continue
-            kernel_blocks = tensor.shape[0]
-            if kernel_blocks > num_logical_blocks and kernel_blocks % num_logical_blocks != 0:
-                # Extra hidden/scratch pages make the raw block count
-                # (num_blocks + reserved) * kernel_blocks_per_page.
-                for extra_pages in range(1, 17):
-                    physical_blocks = num_logical_blocks + extra_pages
-                    if kernel_blocks % physical_blocks == 0:
-                        logical_blocks = num_logical_blocks * (kernel_blocks // physical_blocks)
-                        if logical_blocks < kernel_blocks:
-                            tensor = torch.as_strided(
-                                tensor,
-                                size=(logical_blocks, *tensor.shape[1:]),
-                                stride=tensor.stride(),
-                                storage_offset=tensor.storage_offset(),
-                            )
-                            changed = True
-                        break
-            trimmed.append(tensor)
-        if changed:
-            kv_caches[layer_name] = tuple(trimmed) if isinstance(cache, tuple) else trimmed[0]
-
     return kv_caches
 
 
