@@ -489,7 +489,6 @@ class FlashMLADecode:
     metadata_started: bool = False
     metadata_generated: bool = False
     metadata_async: bool = False
-    reserved_pages: int = 0
 
 
 class FlashMLAMetadataBuilder:
@@ -502,10 +501,8 @@ class FlashMLAMetadataBuilder:
         *,
         cache_block_size: int = FLASHMLA_BLOCK_SIZE,
         enable_async: bool = False,
-        reserved_pages: int = 0,
     ):
         self.enable_async = bool(enable_async)
-        self.reserved_pages = int(reserved_pages)
         self.metadata_stream = torch.npu.Stream() if self.enable_async else None
         self.metadata_start = torch.npu.Event() if self.enable_async else None
         self.metadata_ready = torch.npu.Event() if self.enable_async else None
@@ -663,7 +660,6 @@ class FlashMLAMetadataBuilder:
             tail_offsets=tail_offsets,
             prolog_slots=torch.full((tokens,), -1, dtype=torch.int64, device=self.device),
             block_columns=torch.arange(columns, dtype=torch.int64, device=self.device),
-            reserved_pages=self.reserved_pages,
         )
         if adapter.config.layout_kv == "PA_NZ" and self.dcp_size > 1 and causal and self.use_spec_decode:
             # Only PA_NZ needs the replicated speculative current chunk.
