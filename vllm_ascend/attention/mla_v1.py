@@ -3327,26 +3327,23 @@ class AscendMLAImpl(MLAAttentionImpl):
         return decode_q_nope, decode_q_pe
 
     @staticmethod
-    def _gather_pa_nz_rows(cache: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
-        """Gather complete token rows from the physical PA_NZ tile layout."""
+    def _copy_pa_nz_rows(
+        src_cache: torch.Tensor,
+        dst_cache: torch.Tensor,
+        src_slots: torch.Tensor,
+        dst_slots: torch.Tensor,
+    ) -> None:
+        """Copy complete token tiles between two PA_NZ caches without a token-major rebuild."""
         from vllm_ascend.ops.flash_mla_pa_nz import pa_nz_tile_indices  # noqa: PLC0415
 
-        tile_count = cache.shape[-1] // 16
-        tile_indices = pa_nz_tile_indices(slots.to(torch.int64), cache.shape[1], tile_count)
-        rows = cache.view(-1, 16).index_select(0, tile_indices)
-        return rows.view(slots.numel(), tile_count, 16).reshape(slots.numel(), cache.shape[-1])
-
-    @staticmethod
-    def _scatter_pa_nz_rows(cache: torch.Tensor, slots: torch.Tensor, rows: torch.Tensor) -> None:
-        """Scatter complete token rows into the physical PA_NZ tile layout."""
-        from vllm_ascend.ops.flash_mla_pa_nz import pa_nz_tile_indices  # noqa: PLC0415
-
-        tile_count = rows.shape[-1] // 16
-        tile_indices = pa_nz_tile_indices(slots.to(torch.int64), cache.shape[1], tile_count)
+        tile_count = src_cache.shape[-1] // 16
+        src_indices = pa_nz_tile_indices(src_slots.to(torch.int64), src_cache.shape[1], tile_count)
+        dst_indices = pa_nz_tile_indices(dst_slots.to(torch.int64), dst_cache.shape[1], tile_count)
+        rows = src_cache.view(-1, 16).index_select(0, src_indices)
         torch_npu.npu_scatter_nd_update_(
-            cache.view(-1, 16),
-            tile_indices.view(-1, 1),
-            rows.reshape(-1, 16),
+            dst_cache.view(-1, 16),
+            dst_indices.view(-1, 1),
+            rows,
         )
 
     def _forward_decode_flash_bf16(
@@ -3407,11 +3404,16 @@ class AscendMLAImpl(MLAAttentionImpl):
         if use_current_workspace:
             assert flash.current is not None
             # The DCP current chunk is replicated on every rank and is independent
-            # of this rank's slot ownership. Writing it through the history slots
-            # would use -1 on non-owner ranks and feed the PROLOG/current read with
-            # unrelated cache rows.
-            prolog_cache = flash.current.cache
-            prolog_slots = torch.arange(num_decode_tokens, dtype=torch.int64, device=hidden_states.device)
+            # of this rank's slot ownership. Write the prolog result directly to
+            # the FlashMLA current cache at the same slots used by current
+            # attention; invalid rows go to a scratch page outside block_table.
+            current = flash.current
+            current_slots = current.slots[:num_decode_tokens].to(torch.int64)
+            valid_current = (current_slots >= 0) & flash.token_live[:num_decode_tokens]
+            scratch_slot = (current.cache.shape[0] - 1) * current.cache.shape[1]
+            current_slots = torch.where(valid_current, current_slots, torch.full_like(current_slots, scratch_slot))
+            prolog_cache = current.cache
+            prolog_slots = current_slots
         else:
             prolog_cache = merged_cache
             prolog_slots = cache_indices
@@ -3442,19 +3444,12 @@ class AscendMLAImpl(MLAAttentionImpl):
             current_k_nope = current_k_pe = None
             if use_current_workspace:
                 assert flash.current is not None
-                current_rows = self._gather_pa_nz_rows(prolog_cache, prolog_slots)
-                current_k_nope = current_rows[..., : self.kv_lora_rank].view(
-                    num_decode_tokens, self.num_kv_heads, self.kv_lora_rank
-                )
-                current_k_pe = current_rows[..., self.kv_lora_rank :].view(
-                    num_decode_tokens, self.num_kv_heads, self.qk_rope_head_dim
-                )
-                history_slots = cache_indices
-                valid_slots = (history_slots >= 0) & flash.token_live[:num_decode_tokens]
-                history_slots = torch.where(valid_slots, history_slots, torch.zeros_like(history_slots))
-                # The private current cache holds every row; persist only valid
-                # rank-owned rows into history for the next decode step.
-                self._scatter_pa_nz_rows(merged_cache, history_slots, current_rows)
+                history_slots = flash.slots[:num_decode_tokens].to(torch.int64)
+                valid_history = (history_slots >= 0) & flash.token_live[:num_decode_tokens]
+                history_slots = torch.where(valid_history, history_slots, torch.zeros_like(history_slots))
+                # The prolog already populated the current cache. Copy its tile
+                # rows directly into history for the next decode step.
+                self._copy_pa_nz_rows(flash.current.cache, merged_cache, current_slots, history_slots)
             return split_attention(
                 history_q_nope,
                 history_q_pe,
@@ -3464,6 +3459,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 current_k_pe,
                 block_size,
                 attn_metadata,
+                current_kv_staged=use_current_workspace,
             )
         record_attention_compute_start()
         attn_output, _ = flash.adapter.attention(
