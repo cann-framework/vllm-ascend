@@ -118,6 +118,7 @@ def runtime(monkeypatch):
             events.append(("wait", self.name, event))
 
     main_stream, attn_stream = Stream("main"), Stream("attn")
+    metadata_stream = [Stream("metadata")]
 
     @contextmanager
     def on_stream(stream):
@@ -131,7 +132,13 @@ def runtime(monkeypatch):
     monkeypatch.setattr(
         torch,
         "npu",
-        SimpleNamespace(current_stream=lambda: main_stream, stream=on_stream, Stream=lambda: Stream()),
+        SimpleNamespace(
+            current_stream=lambda: {"main": main_stream, "attn": attn_stream}.get(
+                active_stream[0], metadata_stream[0]
+            ),
+            stream=on_stream,
+            Stream=lambda: metadata_stream[0],
+        ),
         raising=False,
     )
     monkeypatch.setattr(torch.Tensor, "record_stream", lambda tensor, stream: recorded_streams.append((tensor, stream)))
@@ -259,6 +266,8 @@ def runtime(monkeypatch):
             setattr(impl, name, MethodType(method, impl))
         impl._forward_decode_split_attention = Mock(wraps=impl._forward_decode_split_attention)
         impl._run_dcp_mtp_split_attention_op = Mock(side_effect=AssertionError("FlashMLA must not call FIA"))
+        impl.start_flash_mla_metadata = Mock()
+        impl.wait_flash_mla_metadata = Mock()
         return impl
 
     return SimpleNamespace(
@@ -398,6 +407,20 @@ def test_metadata_side_stream_records_inputs_and_waits_before_use(runtime):
         id(flash.used_q),
         id(flash.current.schedule),
     }
+
+
+def test_dcp_bbnd_waits_for_metadata_before_attention(runtime):
+    calls = []
+    flash = SimpleNamespace(metadata_async=True, metadata_started=False)
+    metadata = SimpleNamespace(external_flashmla=flash)
+    impl = SimpleNamespace(
+        start_flash_mla_metadata=lambda _: calls.append("start"),
+        wait_flash_mla_metadata=lambda _: calls.append("wait"),
+        _forward_decode_split_attention=lambda *args: calls.append("attention"),
+    )
+    preprocessed = SimpleNamespace(ql_nope=None, q_pe=None, current_k_nope=None, current_k_pe=None)
+    runtime.forward(impl, preprocessed, torch.empty(1, 128), metadata)
+    assert calls == ["start", "wait", "attention"]
 
 
 @pytest.mark.parametrize("speculative,rank", [(False, 0), (True, 7)])

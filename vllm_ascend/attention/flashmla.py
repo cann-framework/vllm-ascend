@@ -801,7 +801,7 @@ class FlashMLAMetadataBuilder:
 
     def wait_metadata(self, flash: FlashMLADecode) -> None:
         """Make the main stream wait for an in-flight async schedule build."""
-        if not flash.metadata_started:
+        if not flash.metadata_async or not flash.metadata_started:
             return
         assert self.metadata_ready is not None
         torch.npu.current_stream().wait_event(self.metadata_ready)

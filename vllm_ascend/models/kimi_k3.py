@@ -1099,16 +1099,17 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
             self.attn_res_query_plan.refresh(specs)
 
     def _start_flash_mla_metadata(self) -> None:
-        """Start one shared FlashMLA metadata build before the layer loop."""
+        """Start all shared FlashMLA metadata builds before the layer loop."""
         if not is_forward_context_available():
             return
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
             return
+        started = set()
         for layer in self.layers:
             self_attn = getattr(layer, "self_attn", None)
             impl = getattr(self_attn, "impl", None)
-            if not hasattr(impl, "start_flash_mla_metadata"):
+            if impl is None or not hasattr(impl, "start_flash_mla_metadata"):
                 continue
             layer_metadata = attn_metadata.get(getattr(impl, "layer_name", None))
             flash = (
@@ -1120,10 +1121,11 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
                 flash is None
                 or not getattr(flash, "metadata_async", False)
                 or getattr(layer_metadata, "num_decode_tokens", 0) <= 0
+                or id(flash) in started
             ):
                 continue
             impl.start_flash_mla_metadata(layer_metadata)
-            return
+            started.add(id(flash))
 
     def forward(
         self,
@@ -1133,8 +1135,12 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        # Launch the shared metadata build before embedding, attention-residual
+        # preparation, and MoE router/GMM/TopK work.  The builder owns a
+        # dedicated metadata stream; attention waits on its ready event at the
+        # consumer, so the MoE streams remain independent.
+        self._start_flash_mla_metadata()
         if self.config.attn_res_block_size is None:
-            self._start_flash_mla_metadata()
             return super().forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -1190,7 +1196,6 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
             block_residual[:, : residual.size(1), :].copy_(residual)
         residual = block_residual
 
-        self._start_flash_mla_metadata()
         optimize_attn_res_prefill = _use_attn_res_prefill_cache()
         attn_res_op = None
         if self.attn_res_mode != "native":
