@@ -98,9 +98,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         self._pending_bulk_copy: tuple[MambaSpecDecodeGPUContext, int, torch.Tensor] | None = None
         self._mega_request_tracker = None
         additional_config = getattr(self.vllm_config, "additional_config", None) or {}
-        if additional_config.get("enable_mega_kda", False) or additional_config.get(
-            "enable_mega_kda_replayssm", False
-        ):
+        if additional_config.get("enable_mega_kda_replayssm", False):
             # Request index zero is real; shift it past the reserved null row.
             self._mega_request_tracker = MegaKDAFirstVerifyTracker(self.max_num_reqs + 1, self.device)
 

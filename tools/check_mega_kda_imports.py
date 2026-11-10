@@ -26,6 +26,7 @@ OPERATORS = {
     "torch": (),
     "torch_npu": (),
     "ops.mega_recurrent_kda": ("mega_recurrent_kda",),
+    "ops.commit_recurrent_kda": ("commit_recurrent_kda",),
 }
 
 
@@ -74,8 +75,9 @@ def main() -> None:
             faulthandler.cancel_dump_traceback_later()
         print(f"DONE {name} in {time.monotonic() - started:.2f}s", flush=True)
     print(
-        "Imports passed. Required: PR #6 20-argument BF16/NZ ABI with explicit RMS epsilon. "
-        "An import/signature check does not prove weight layout, cache semantics or numerical correctness.",
+        "Imports passed. Required: ReplaySSM keyword ABIs for mega_recurrent_kda and "
+        "commit_recurrent_kda. An import/signature check does not prove weight layout, "
+        "cache semantics or numerical correctness.",
         flush=True,
     )
 
