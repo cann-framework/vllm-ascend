@@ -30,6 +30,7 @@ FLASHMLA_MASK_SIZE = 2048
 FLASHMLA_MAX_BATCH_SIZE = 65535
 PA_NZ_TILE_WIDTH = 16
 PA_NZ_TILE_COUNT = FLASHMLA_QK_DIM // PA_NZ_TILE_WIDTH
+FLASHMLA_STREAM_ALLOCATION_ATTEMPTS = 64
 
 
 def _pa_nz_mask_mode(q_len: int, configured_mask_mode: int) -> int:
@@ -474,7 +475,23 @@ class FlashMLAMetadataBuilder:
         # stream. The attention path waits once before entering the split
         # history/current execution, so both schedules are visible there.
         self.enable_async = bool(enable_async)
-        self.metadata_stream = torch.npu.Stream() if self.enable_async else None
+        self.metadata_stream = None
+        if self.enable_async:
+            # Stream() can draw from a runtime pool: distinct Python objects
+            # alone do not establish isolation from the Kimi router stream.
+            reserved_streams = (
+                torch.npu.current_stream(),
+                getattr(impl.vllm_config, "_kimi_router_stream", None),
+                getattr(impl.vllm_config, "_kimi_shared_comm_stream", None),
+                getattr(impl.vllm_config, "_kimi_shared_compute_stream", None),
+            )
+            for _ in range(FLASHMLA_STREAM_ALLOCATION_ATTEMPTS):
+                stream = torch.npu.Stream()
+                if all(reserved is None or stream != reserved for reserved in reserved_streams):
+                    self.metadata_stream = stream
+                    break
+            if self.metadata_stream is None:
+                raise RuntimeError("Unable to allocate a FlashMLA stream distinct from the Kimi MoE streams")
         # Re-record per step so each captured graph owns its own fork/join.
         self.metadata_start = None
         self.metadata_ready = None
@@ -627,6 +644,11 @@ class FlashMLAMetadataBuilder:
         columns = common.block_table_tensor.shape[1]
         q_len = max(1, int(getattr(common, "max_query_len", 1) or 1))
         key = tokens, rows, columns, common.causal, q_len
+        # Retained graph buffers build their schedule inside the captured
+        # forward; launching it here would duplicate work on every replay.
+        start_during_refresh = (
+            self.enable_async and not retain_for_graph and (has_prefill or key not in self.buffers)
+        )
         if has_prefill:
             if retain_for_graph:
                 raise ValueError("FlashMLA graph buffers require a decode-only batch")
@@ -670,6 +692,10 @@ class FlashMLAMetadataBuilder:
                 )
             flash.cache_lens[:num_decodes].copy_(lengths)
             flash.cache_lens.masked_fill_(flash.used_q == 0, 0)
+            if start_during_refresh:
+                # The schedule only needs lengths and query boundaries. Fork
+                # now, while the caller prepares tables, slots and copy indices.
+                self.start_metadata(flash)
             flash.block_table.zero_()
             flash.block_table[:num_decodes].copy_(common.block_table_tensor[:num_decodes])
             flash.slots.fill_(-1)

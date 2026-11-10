@@ -202,6 +202,7 @@ def runtime(monkeypatch):
         speculative=True,
         layout="pa_bbnd",
         enable_async=False,
+        router_stream=None,
     ):
         impl = SimpleNamespace(
             num_heads=heads,
@@ -212,6 +213,7 @@ def runtime(monkeypatch):
             dcp_rank=rank,
             flash_mla_layout=layout,
             vllm_config=SimpleNamespace(
+                _kimi_router_stream=router_stream,
                 parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=interleave),
                 speculative_config=SimpleNamespace(method="dspark") if speculative else None,
             ),
@@ -407,6 +409,61 @@ def test_metadata_side_stream_records_inputs_and_waits_before_use(runtime):
         id(flash.used_q),
         id(flash.current.schedule),
     }
+
+
+def test_metadata_stream_avoids_router_stream(runtime, monkeypatch):
+    router = object()
+    metadata = object()
+    candidates = iter((router, metadata))
+    monkeypatch.setattr(torch.npu, "Stream", lambda: next(candidates))
+    builder = runtime.builder(enable_async=True, router_stream=router)
+    assert builder.metadata_stream is metadata
+
+
+def test_metadata_stream_rejects_persistent_router_collision(runtime, monkeypatch):
+    router = object()
+    monkeypatch.setattr(torch.npu, "Stream", lambda: router)
+    with pytest.raises(RuntimeError, match="distinct from the Kimi MoE streams"):
+        runtime.builder(enable_async=True, router_stream=router)
+
+
+def test_eager_metadata_starts_before_remaining_batch_refresh(runtime, monkeypatch):
+    builder = runtime.builder(enable_async=True)
+    inputs = common([35, 130], [2, 2], tokens=4)
+    order = []
+    original_schedule = builder._refresh_schedule
+    original_copy = torch.Tensor.copy_
+
+    def schedule(flash):
+        order.append("schedule")
+        original_schedule(flash)
+
+    def copy_tensor(destination, source, *args, **kwargs):
+        if source.untyped_storage().data_ptr() == inputs.block_table_tensor.untyped_storage().data_ptr():
+            order.append("block_table")
+        return original_copy(destination, source, *args, **kwargs)
+
+    monkeypatch.setattr(builder, "_refresh_schedule", schedule)
+    monkeypatch.setattr(torch.Tensor, "copy_", copy_tensor)
+    flash = builder.build(inputs, 2, 4, False)
+    assert flash.metadata_started
+    assert order == ["schedule", "block_table"]
+
+
+def test_graph_buffer_schedule_is_not_submitted_during_replay_input_refresh(runtime, monkeypatch):
+    builder = runtime.builder(enable_async=True)
+    inputs = common([35, 130], [2, 2], tokens=4)
+    refresh = Mock(wraps=builder._refresh_schedule)
+    monkeypatch.setattr(builder, "_refresh_schedule", refresh)
+    flash = builder.build(inputs, 2, 4, False, retain_for_graph=True)
+    assert not flash.metadata_started
+    refresh.assert_not_called()
+    builder.start_metadata(flash)
+    refresh.assert_called_once()
+    refresh.reset_mock()
+    assert builder.build(inputs, 2, 4, False) is flash
+    assert not flash.metadata_started
+    refresh.assert_not_called()
 
 
 def test_dcp_bbnd_waits_for_metadata_before_attention(runtime):

@@ -110,7 +110,7 @@ from vllm_ascend.ops.kimi_situ import initialize_kimi_situ_ops
 from vllm_ascend.ops.linear_op import KimiOProjMMReduceScatterOp
 from vllm_ascend.quantization.methods.base import PreparedLinearInput
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
-from vllm_ascend.utils import get_rotation_path, is_950
+from vllm_ascend.utils import get_rotation_path, is_950, shared_experts_calculation_stream
 from vllm_ascend.worker.v2.pp_transport import (
     PPTransportDataType,
     add_pp_transport_tensors,
@@ -493,6 +493,8 @@ class AscendKimiMoE(nn.Module):
         if self.shared_experts is not None and get_ascend_config().multistream_overlap_shared_expert:
             # Share a communication stream across this model's MoE layers;
             # keep it separate from both Router and shared Cube/Vector work.
+            if not hasattr(vllm_config, "_kimi_shared_compute_stream"):
+                vllm_config._kimi_shared_compute_stream = shared_experts_calculation_stream()
             if not hasattr(vllm_config, "_kimi_shared_comm_stream"):
                 vllm_config._kimi_shared_comm_stream = torch.npu.Stream()
             object.__setattr__(self.experts, "_kimi_shared_comm_stream", vllm_config._kimi_shared_comm_stream)
@@ -1111,7 +1113,8 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
             impl = getattr(self_attn, "impl", None)
             if impl is None or not hasattr(impl, "start_flash_mla_metadata"):
                 continue
-            layer_metadata = attn_metadata.get(getattr(impl, "layer_name", None))
+            layer_name = getattr(self_attn, "layer_name", None) or getattr(impl, "layer_name", None)
+            layer_metadata = attn_metadata.get(layer_name)
             flash = (
                 layer_metadata.get_external_flashmla(getattr(impl, "flash_mla_layout", None))
                 if layer_metadata is not None

@@ -221,7 +221,8 @@ class AscendK3DSparkModel(UpstreamK3DSparkModel):
             impl = getattr(self_attn, "impl", None)
             if impl is None or not hasattr(impl, "start_flash_mla_metadata"):
                 continue
-            layer_metadata = attn_metadata.get(getattr(impl, "layer_name", None))
+            layer_name = getattr(self_attn, "layer_name", None) or getattr(impl, "layer_name", None)
+            layer_metadata = attn_metadata.get(layer_name)
             flash = (
                 layer_metadata.get_external_flashmla(getattr(impl, "flash_mla_layout", None))
                 if layer_metadata is not None
