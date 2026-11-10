@@ -417,7 +417,6 @@ class FlashMLADecode:
     block_columns: torch.Tensor | None = None
     metadata_builder: Any = None
     metadata_started: bool = False
-    metadata_generated: bool = False
     metadata_async: bool = False
 
 
@@ -430,12 +429,16 @@ class FlashMLAMetadataBuilder:
         attn_mask: torch.Tensor,
         enable_async: bool = False,
     ):
-        self.enable_async = bool(enable_async)
-        self.metadata_stream = torch.npu.Stream() if self.enable_async else None
-        self.metadata_start = torch.npu.Event() if self.enable_async else None
-        self.metadata_ready = torch.npu.Event() if self.enable_async else None
         self.dcp_size = getattr(impl, "dcp_size", 1)
         self.dcp_rank = getattr(impl, "dcp_rank", 0)
+        # DCP splits the schedule between history and current adapters on the
+        # attention stream, so keep it synchronous until that split supports
+        # the same fork/join contract.
+        self.enable_async = bool(enable_async) and self.dcp_size == 1
+        self.metadata_stream = torch.npu.Stream() if self.enable_async else None
+        # Re-record per step so each captured graph owns its own fork/join.
+        self.metadata_start = None
+        self.metadata_ready = None
         # Materialize once: an integer rank would trigger a blocking H2D copy
         # inside get_dcp_local_seq_lens on every metadata refresh.
         self.dcp_rank_tensor = (
@@ -574,10 +577,14 @@ class FlashMLAMetadataBuilder:
             if retain_for_graph:
                 raise ValueError("FlashMLA graph buffers require a decode-only batch")
             flash = self._allocate(tokens, rows, columns, common.causal, q_len=q_len)
+            flash.metadata_async = self.enable_async
         else:
             cached_flash = self.buffers.get(key)
             if cached_flash is None:
                 flash = self._allocate(tokens, rows, columns, common.causal, q_len=q_len)
+                # Captured forwards record the stream fork/join inside the
+                # graph, so replay rebuilds the schedule without Python.
+                flash.metadata_async = self.enable_async
                 if retain_for_graph:
                     self.buffers[key] = flash
             else:
@@ -585,11 +592,9 @@ class FlashMLAMetadataBuilder:
 
         flash.q_len = q_len
         flash.metadata_builder = self
-        flash.metadata_async = (
-            self.enable_async and not retain_for_graph and flash.layout == "PA_NZ"
-        )
 
         def refresh():
+            flash.metadata_started = False
             # The extra zero-used request owns physical graph/SP padding.
             flash.cu.fill_(tokens)
             flash.cu[: num_decodes + 1].copy_(common.query_start_loc[: num_decodes + 1].clamp_max(num_decode_tokens))
@@ -632,8 +637,6 @@ class FlashMLAMetadataBuilder:
                 flash.sin.copy_(sin)
             if flash.prolog_slots is not None:
                 flash.prolog_slots.copy_(flash.slots)
-            flash.metadata_started = False
-            flash.metadata_generated = False
             if flash.current is not None:
                 current = flash.current
                 page_counts = (flash.used_q + FLASHMLA_BLOCK_SIZE - 1) // FLASHMLA_BLOCK_SIZE
@@ -645,55 +648,60 @@ class FlashMLAMetadataBuilder:
                 requests = torch.searchsorted(flash.cu[1:], indices.to(torch.int32), right=True)
                 current.slots.copy_(page_starts[requests] * FLASHMLA_BLOCK_SIZE + indices - flash.cu[requests])
                 current.slots.masked_fill_(~flash.token_live, -1)
-                current.schedule.copy_(
-                    current.adapter.build_metadata(
-                        flash.used_q,
-                        flash.cu,
-                        flash.used_q,
-                        q_len=flash.q_len,
-                    )
-                )
 
         # Refresh on the caller's stream before return; captured buffer caching
         # preserves the addresses used by graph replay.
         refresh()
         if not flash.metadata_async:
-            self.start_metadata(flash, force_sync=True)
+            self._refresh_schedule(flash)
         return flash
 
-    def start_metadata(self, flash: FlashMLADecode, *, force_sync: bool = False) -> None:
-        """Build the schedule on the side stream, or synchronously when forced."""
-        if flash.metadata_generated:
-            return
-        if not self.enable_async or force_sync or not flash.metadata_async:
-            flash.schedule.copy_(
-                flash.adapter.build_metadata(
-                    flash.cache_lens,
+    def _refresh_schedule(self, flash: FlashMLADecode) -> None:
+        flash.schedule.copy_(
+            flash.adapter.build_metadata(
+                flash.cache_lens,
+                flash.cu,
+                flash.used_q,
+                q_len=flash.q_len,
+            )
+        )
+        if flash.current is not None:
+            current = flash.current
+            current.schedule.copy_(
+                current.adapter.build_metadata(
+                    flash.used_q,
                     flash.cu,
                     flash.used_q,
                     q_len=flash.q_len,
                 )
             )
-            flash.metadata_started = False
-            flash.metadata_generated = True
+
+    def start_metadata(self, flash: FlashMLADecode) -> None:
+        """Build this step's schedule before the layer loop."""
+        if not flash.metadata_async or flash.metadata_started:
             return
-        if self.metadata_stream is None or self.metadata_start is None or self.metadata_ready is None:
-            raise RuntimeError("FlashMLA async metadata was enabled without stream/event resources.")
+        if self.metadata_stream is None:
+            flash.metadata_async = False
+            self._refresh_schedule(flash)
+            flash.metadata_started = True
+            return
         main_stream = torch.npu.current_stream()
-        self.metadata_start.record(main_stream)
+        self.metadata_start = main_stream.record_event()
         self.metadata_stream.wait_event(self.metadata_start)
+        self._record_metadata_stream(flash)
         with torch.npu.stream(self.metadata_stream):
-            flash.schedule.copy_(
-                flash.adapter.build_metadata(
-                    flash.cache_lens,
-                    flash.cu,
-                    flash.used_q,
-                    q_len=flash.q_len,
-                )
-            )
-            self.metadata_ready.record()
+            self._refresh_schedule(flash)
+            self.metadata_ready = torch.npu.current_stream().record_event()
         flash.metadata_started = True
-        flash.metadata_generated = True
+
+    def _record_metadata_stream(self, flash: FlashMLADecode) -> None:
+        """Keep side-stream schedule inputs alive until the fork/join completes."""
+        if self.metadata_stream is None:
+            return
+        for tensor in (flash.schedule, flash.cache_lens, flash.cu, flash.used_q):
+            tensor.record_stream(self.metadata_stream)
+        if flash.current is not None:
+            flash.current.schedule.record_stream(self.metadata_stream)
 
     def wait_metadata(self, flash: FlashMLADecode) -> None:
         """Make the main stream wait for an in-flight async schedule build."""
@@ -701,4 +709,3 @@ class FlashMLAMetadataBuilder:
             return
         assert self.metadata_ready is not None
         torch.npu.current_stream().wait_event(self.metadata_ready)
-        flash.metadata_started = False

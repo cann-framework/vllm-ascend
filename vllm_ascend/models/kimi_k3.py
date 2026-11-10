@@ -1108,8 +1108,7 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
         for layer in self.layers:
             self_attn = getattr(layer, "self_attn", None)
             impl = getattr(self_attn, "impl", None)
-            state = getattr(impl, "flash_mla_state", None)
-            if state is None:
+            if not hasattr(impl, "start_flash_mla_metadata"):
                 continue
             layer_metadata = attn_metadata.get(getattr(impl, "layer_name", None))
             flash = (
@@ -1123,7 +1122,7 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
                 or getattr(layer_metadata, "num_decode_tokens", 0) <= 0
             ):
                 continue
-            state.start_metadata(flash)
+            impl.start_flash_mla_metadata(layer_metadata)
             return
 
     def forward(
