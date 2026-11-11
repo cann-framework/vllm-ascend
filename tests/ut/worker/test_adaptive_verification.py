@@ -56,6 +56,57 @@ def test_aclgraph_model_forwards_confidence_computation():
     model.compute_confidence.assert_called_once_with(hidden, markov)
 
 
+def test_full_capture_starts_active_flash_metadata_before_model(monkeypatch):
+    import vllm_ascend.worker.v2.aclgraph_utils as graph_utils
+
+    order = []
+    flash = SimpleNamespace(
+        metadata_async=True, metadata_started=True, metadata_capture_started=False,
+        metadata_start=object(), metadata_ready=object(), metadata_capture_events=[],
+    )
+
+    def start_metadata(value):
+        assert not value.metadata_started
+        value.metadata_started = True
+        order.append(("metadata", value))
+
+    builder = SimpleNamespace(
+        start_metadata=start_metadata, wait_metadata=lambda value: order.append(("join", value))
+    )
+
+    class Attention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_name = "target.attention"
+            self.impl = SimpleNamespace(flash_mla_metadata_builder=builder, flash_mla_layout="pa_nz")
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention = Attention()
+
+        def forward(self):
+            order.append(("model", None))
+
+    metadata = SimpleNamespace(num_decode_tokens=1, get_external_flashmla=lambda layout: flash)
+    context = SimpleNamespace(attn_metadata={"target.attention": metadata}, cudagraph_runtime_mode=CUDAGraphMode.FULL)
+    monkeypatch.setattr(graph_utils, "get_forward_context", lambda: context)
+    monkeypatch.setattr(graph_utils, "_EXTRA_CTX", SimpleNamespace(capturing=False))
+    monkeypatch.setattr(torch.npu, "is_current_stream_capturing", lambda: True)
+    device_metadata = SimpleNamespace(
+        begin_forward=lambda: order.append(("other_metadata", None)),
+        finish=lambda: order.append(("finish", None)),
+    )
+    wrapped = ModelWithContext(Model(), device_metadata=device_metadata)
+    wrapped()
+    assert order == [
+        ("metadata", flash), ("other_metadata", None), ("model", None), ("join", flash), ("finish", None)
+    ]
+    assert flash.metadata_capture_started
+    assert flash.metadata_started
+    assert flash.metadata_capture_events == [(flash.metadata_start, flash.metadata_ready)]
+
+
 @pytest.mark.parametrize(
     ("adaptive_verification", "context_len", "expected"),
     [
