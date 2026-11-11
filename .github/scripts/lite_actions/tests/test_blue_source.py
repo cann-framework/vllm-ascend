@@ -177,9 +177,9 @@ class BlueSourceTests(unittest.TestCase):
         root = SCRIPTS.parents[2]
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp)
-            shutil.copytree(root / "tests", target / "tests")
+            shutil.copytree(root / "tests", target / "model/tests")
             shutil.copytree(SCRIPTS, target / "scripts")
-            catalog = target / "tests/integration_tests/training_cases/dispatch_smoke.py"
+            catalog = target / "model/tests/integration_tests/training_cases/dispatch_smoke.py"
             text = catalog.read_text()
             text = text.replace(
                 '        "dispatch_smoke_16p",', '        "dispatch_smoke_16p",\n        "new_smoke_8p",'
@@ -200,7 +200,7 @@ class BlueSourceTests(unittest.TestCase):
             )
             env = {
                 **os.environ,
-                "PYTHONPATH": str(target) + os.pathsep + str(target / "scripts"),
+                "PYTHONPATH": str(target / "model") + os.pathsep + str(target / "scripts"),
                 "GITHUB_REF": "refs/heads/main",
                 "GITHUB_SHA": "c" * 40,
             }
@@ -211,6 +211,27 @@ class BlueSourceTests(unittest.TestCase):
                 json.loads(result.stdout),
                 ["worker_os_blue", "dispatch_smoke_8p", "dispatch_smoke_16p", "new_smoke_8p", "dispatch_smoke_8p"],
             )
+
+    def test_plan_rejects_source_that_changed_after_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            event = Path(tmp) / "event.json"
+            event.write_text("{}")
+            env = {
+                "GITHUB_REPOSITORY": prepare_request.REPO,
+                "GITHUB_EVENT_PATH": str(event),
+                "GITHUB_EVENT_NAME": "workflow_dispatch",
+                "GITHUB_REF": "refs/heads/main",
+                "GITHUB_SHA": "a" * 40,
+                "GITHUB_RUN_ID": "123",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "CI_CHECKED_SOURCE_SHA": "b" * 40,
+            }
+            with (
+                patch.dict(os.environ, env, clear=True),
+                patch.object(native_source, "prepare_source", return_value={"source_sha": "a" * 40}),
+                self.assertRaisesRegex(ValueError, "source changed"),
+            ):
+                prepare_request.main()
 
     def test_waiter_requires_matching_source_identity(self):
         source = self.build()

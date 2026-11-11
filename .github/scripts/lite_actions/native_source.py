@@ -9,8 +9,6 @@ import time
 import urllib.parse
 import urllib.request
 
-from blue_catalog import BLUE_SMOKE_SUITE
-
 REPO = "cann-framework/vllm-ascend"
 REPO_ID = 1438625957
 SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -74,13 +72,6 @@ def assert_current(source, get=api):
             source["head_sha"], source["base_sha"], source["head_repo_id"], source["base_ref"]
         ):
             raise ValueError("STALE: PR Head/Base advanced; rerun from the current PR")
-        tests = list(BLUE_SMOKE_SUITE)
-        if tests != source["test_ids"] and not (
-            len(source["test_ids"]) == 1 and source["test_ids"][0] in tests
-        ):
-            raise ValueError("STALE: Blue selection or authorization changed")
-
-
 def build_source(plan, event, get=api):
     control = os.environ["GITHUB_WORKFLOW_SHA"]
     if not SHA.fullmatch(control):

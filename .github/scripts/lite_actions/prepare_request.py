@@ -93,7 +93,8 @@ def main():
     effective_event = os.environ["GITHUB_EVENT_NAME"]
     source_pr = os.environ.get("CI_SOURCE_PR", "")
     commit = os.environ.get("CI_COMMIT", "")
-    test_case = os.environ.get("CI_TEST_CASE", "")
+    resolve_only = os.environ.get("CI_RESOLVE_ONLY") == "1"
+    test_case = "" if resolve_only else os.environ.get("CI_TEST_CASE", "")
     if source_pr and commit:
         raise ValueError("choose either a PR or a commit")
     if source_pr:
@@ -116,12 +117,19 @@ def main():
     from native_source import prepare_source
 
     source = prepare_source(plan, payload)
+    if resolve_only:
+        with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+            output.write("source_sha=" + source["source_sha"] + "\n")
+        return
+    if source["source_sha"] != os.environ.get("CI_CHECKED_SOURCE_SHA"):
+        raise ValueError("tested source changed while preparing the plan")
     out.joinpath("source.json").write_text(json.dumps(source, sort_keys=True) + "\n")
     (out / "ci-request.json").write_text(json.dumps(plan, separators=(",", ":"), ensure_ascii=False) + "\n")
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write("native_source=true\n")
         output.write("matrix=" + json.dumps({"include": plan["cases"]}, separators=(",", ":")) + "\n")
         output.write("sha=" + plan["sha"] + "\n")
+        output.write("source_sha=" + source["source_sha"] + "\n")
         output.write("plan_digest=" + plan["plan_digest"] + "\n")
 
 
