@@ -83,8 +83,11 @@ eligible Decode MoE scopes. Draft, Prefill and unsupported batches do not emit
 these scopes. Other models retain their generic 0.30 policy.
 
 Named scopes cover Router/latent down through routed Combine and latent
-norm/up. Nested exclusions keep shared AllGather, shared ReduceScatter, the
-final join and Add outside fusion. The owning ACL graph is optimized once
+norm/up. Nested exclusions keep shared AllGather, input preparation, Gate/Up,
+SiTU, Down, ReduceScatter, the final join and Add outside fusion. Shared work
+retains its streams, core limits and Dispatch/SiTU/GMM1 event ordering, so
+shared computation stays outside the routed fusion scope without changing
+the Decode schedule. The owning ACL graph is optimized once
 after successful capture with `dcci_disable_on_kernel=[".*"]` and
 `auto_op_parallel=1`; replay never repeats optimization. Capture tracking is
 local to the forward context for V1 and to the owning `UpdatableGraph` capture

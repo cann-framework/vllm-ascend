@@ -175,7 +175,7 @@ class TestSituHooks(unittest.TestCase):
 
 
 class TestDecodeDependencies(unittest.TestCase):
-    def test_bf16_and_mxfp_share_vector_barriers(self):
+    def test_shared_compute_excluded_without_changing_vector_barriers(self):
         for quantized in (False, True):
             for superkernel in (False, True):
                 with self.subTest(quantized=quantized, superkernel=superkernel):
@@ -183,12 +183,15 @@ class TestDecodeDependencies(unittest.TestCase):
 
     def check_dependency_graph(self, quantized, superkernel):
         nodes = []
+        active_scopes = []
+        observed_scopes = {}
         last = {"main": None, "shared": None, "comm": None}
         current = ["main"]
 
         def op(name, deps=()):
             idx = len(nodes)
             nodes.append((current[0], name, [d for d in (last[current[0]], *deps) if d is not None]))
+            observed_scopes[name] = active_scopes[-1] if active_scopes else "unmarked"
             last[current[0]] = idx
             return idx
 
@@ -213,6 +216,16 @@ class TestDecodeDependencies(unittest.TestCase):
             finally:
                 current[0] = old
 
+        @contextmanager
+        def scope(name, enabled):
+            if enabled:
+                active_scopes.append(name)
+            try:
+                yield
+            finally:
+                if enabled:
+                    self.assertEqual(active_scopes.pop(), name)
+
         limits = []
         npu = NS(current_stream=lambda: streams[current[0]])
         ns = dict(
@@ -226,6 +239,7 @@ class TestDecodeDependencies(unittest.TestCase):
             ),
             npu_stream_switch=switch,
             shared_experts_calculation_stream=lambda: streams["shared"],
+            moe_superkernel_scope=scope,
         )
         load(
             "vllm_ascend/ops/fused_moe/kimi_decode_schedule.py",
@@ -233,6 +247,12 @@ class TestDecodeDependencies(unittest.TestCase):
             ns,
         )
         x = torch.tensor([[1.0, 2.0]])
+
+        def prepare(prepared, ready):
+            with switch(streams["shared"]):
+                streams["shared"].wait_event(ready)
+                op("shared_prepare")
+            return prepared
 
         def gate_up(prepared, ready):
             with switch(streams["shared"]):
@@ -257,35 +277,44 @@ class TestDecodeDependencies(unittest.TestCase):
         gate = NS(weight_scale=1) if quantized else NS()
         shared = NS(
             layer=NS(gate_up_proj=gate, down_proj=object()),
-            prepare_for_router_overlap=lambda p, r: p,
+            prepare_for_router_overlap=prepare,
             enqueue_gate_up_after_router=gate_up,
             apply_activation=activate,
             _prepare_linear_input_for_overlap=Mock(side_effect=AssertionError("Down quantization ran before GMM1")),
             part2=down,
             _pad_and_reduce_scatter=scatter,
         )
-        op("ready")
-        schedule = ns["KimiDecodeSchedule"](
-            shared, x, last["main"], comm_stream=streams["comm"], enable_superkernel=superkernel
-        )
-        self.assertFalse(any(name == "gate_up" for _, name, _ in nodes))
-        op("before_dispatch")
-        schedule.before_dispatch(last["main"])
-        op("dispatch")
-        schedule.after_dispatch()
-        op("gmm1")
-        with patch.object(torch.Tensor, "record_stream") as comm_record:
-            schedule.after_gmm1()
-        comm_record.assert_called_once_with(streams["comm"])
-        op("routed_situ")
-        op("gmm2")
-        op("combine")
-        with patch.object(torch.Tensor, "record_stream") as record_stream:
-            actual = schedule.finalize()
-        record_stream.assert_called_once_with(streams["main"])
-        npu.current_stream().wait_event(schedule.output_done)
-        op("add")
+        # Run inside the same enclosing named scope as the runtime MoE op.
+        with scope("layer_1.moe", superkernel):
+            op("ready")
+            schedule = ns["KimiDecodeSchedule"](
+                shared, x, last["main"], comm_stream=streams["comm"], enable_superkernel=superkernel
+            )
+            self.assertFalse(any(name == "gate_up" for _, name, _ in nodes))
+            op("before_dispatch")
+            schedule.before_dispatch(last["main"])
+            op("dispatch")
+            schedule.after_dispatch()
+            op("gmm1")
+            with patch.object(torch.Tensor, "record_stream") as comm_record:
+                schedule.after_gmm1()
+            comm_record.assert_called_once_with(streams["comm"])
+            op("routed_situ")
+            op("gmm2")
+            op("combine")
+            with patch.object(torch.Tensor, "record_stream") as record_stream:
+                actual = schedule.finalize()
+            record_stream.assert_called_once_with(streams["main"])
+            with scope(None, superkernel):
+                npu.current_stream().wait_event(schedule.output_done)
+                op("add")
         torch.testing.assert_close(actual, x * 2 + 3)
+        self.assertEqual(active_scopes, [])
+
+        for name in ("shared_prepare", "gate_up", "shared_situ", "shared_down", "shared_rs", "add"):
+            self.assertEqual(observed_scopes[name], None if superkernel else "unmarked", name)
+        for name in ("dispatch", "gmm1", "routed_situ", "gmm2", "combine"):
+            self.assertEqual(observed_scopes[name], "layer_1.moe" if superkernel else "unmarked", name)
 
         def ancestors(i):
             return set(nodes[i][2]).union(*(ancestors(d) for d in nodes[i][2]))
@@ -309,7 +338,60 @@ class TestDecodeDependencies(unittest.TestCase):
         shared._prepare_linear_input_for_overlap.assert_not_called()
         if quantized:
             self.assertIn(ids["gmm1"], ancestors(ids["shared_down_quant"]))
+            self.assertEqual(observed_scopes["shared_down_quant"], None if superkernel else "unmarked")
         self.assertEqual(limits, [("shared", (16, 32) if quantized else (32, 1))])
+
+    def test_shared_failures_restore_routed_scope(self):
+        for stage in ("prepare_for_router_overlap", "enqueue_gate_up_after_router", "apply_activation", "part2"):
+            with self.subTest(stage=stage):
+                self.check_shared_failure_restores_routed_scope(stage)
+
+    def check_shared_failure_restores_routed_scope(self, stage):
+        active_scopes = []
+
+        @contextmanager
+        def scope(name, enabled):
+            if enabled:
+                active_scopes.append(name)
+            try:
+                yield
+            finally:
+                if enabled:
+                    self.assertEqual(active_scopes.pop(), name)
+
+        def fail(*args):
+            self.assertIsNone(active_scopes[-1])
+            raise RuntimeError("shared failure")
+
+        stream = Mock()
+        shared = NS(
+            layer=NS(gate_up_proj=NS()),
+            prepare_for_router_overlap=Mock(),
+            enqueue_gate_up_after_router=Mock(),
+            apply_activation=Mock(),
+            part2=Mock(),
+        )
+        getattr(shared, stage).side_effect = fail
+        ns = dict(
+            torch=NS(npu=NS(current_stream=lambda: stream)),
+            torch_npu=NS(npu=NS(npugraph_ex=NS(scope=NS(limit_core_num=lambda *args: nullcontext())))),
+            npu_stream_switch=lambda stream: nullcontext(),
+            shared_experts_calculation_stream=lambda: stream,
+            moe_superkernel_scope=scope,
+        )
+        load(
+            "vllm_ascend/ops/fused_moe/kimi_decode_schedule.py",
+            {"KimiDecodeSchedule", "ROUTER_CORE_LIMIT", "BF16_SHARED_CORE_LIMIT", "MXFP_SHARED_CORE_LIMIT"},
+            ns,
+        )
+        with scope("layer_1.moe", True):
+            with self.assertRaisesRegex(RuntimeError, "shared failure"):
+                schedule = ns["KimiDecodeSchedule"](shared, object(), object(), enable_superkernel=True)
+                schedule.before_dispatch(object())
+                schedule.after_dispatch()
+                schedule.after_gmm1()
+            self.assertEqual(active_scopes, ["layer_1.moe"])
+        self.assertEqual(active_scopes, [])
 
 
 class TestRuntimeMoEBoundary(unittest.TestCase):

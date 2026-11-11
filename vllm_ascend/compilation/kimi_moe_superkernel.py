@@ -49,7 +49,7 @@ def collect_moe_superkernel_scopes(forward_context, enabled: bool):
 
 @contextmanager
 def moe_superkernel_scope(name: str | None, enabled: bool):
-    """None excludes shared communication from the enclosing named scope."""
+    """None excludes shared-expert work from the enclosing named scope."""
     if not enabled:
         yield
         return
