@@ -98,7 +98,7 @@ jobs:
           CI_RESULT_AUTHOR: ${{ vars.LITE_CI_RESULT_ACTOR || 'depeng1994' }}
           CI_PLAN_DIGEST: ${{ needs.prepare.outputs.plan_digest }}
           CI_CASE: ${{ toJSON(matrix) }}
-          CI_WORKFLOW: lite-ci-dispatcher-smoke.yml
+          CI_WORKFLOW: lite_actions_dispatcher_smoke.yml
           CI_NATIVE_SOURCE: ${{ needs.prepare.outputs.native_source == 'true' && '.ci-source/source.json' || '' }}
         run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/wait_result.py
 

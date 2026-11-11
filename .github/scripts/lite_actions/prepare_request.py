@@ -10,7 +10,7 @@ from pathlib import Path
 from blue_catalog import BLUE_CASES, BLUE_DEFAULTS, BLUE_SMOKE_SUITE
 
 REPO = "cann-framework/vllm-ascend"
-WORKFLOW = "lite-ci-dispatcher-smoke.yml"
+WORKFLOW = "lite_actions_dispatcher_smoke.yml"
 
 
 
