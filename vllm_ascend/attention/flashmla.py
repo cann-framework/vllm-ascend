@@ -10,7 +10,7 @@ in preflight tests: the decode hot path must not copy lengths or tables to the C
 """
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -450,6 +450,10 @@ class FlashMLADecode:
     metadata_builder: Any = None
     metadata_started: bool = False
     metadata_async: bool = False
+    metadata_start: Any = None
+    metadata_ready: Any = None
+    metadata_capture_started: bool = False
+    metadata_capture_events: list[tuple[Any, Any]] = field(default_factory=list)
     # PA_NZ DCP copy geometry is batch metadata.  The cache contents are
     # layer-local, but these slot/tile addresses are identical for every MLA
     # layer and therefore must not be rebuilt in the layer loop.
@@ -492,9 +496,6 @@ class FlashMLAMetadataBuilder:
                     break
             if self.metadata_stream is None:
                 raise RuntimeError("Unable to allocate a FlashMLA stream distinct from the Kimi MoE streams")
-        # Re-record per step so each captured graph owns its own fork/join.
-        self.metadata_start = None
-        self.metadata_ready = None
         # Materialize once: an integer rank would trigger a blocking H2D copy
         # inside get_dcp_local_seq_lens on every metadata refresh.
         self.dcp_rank_tensor = (
@@ -644,6 +645,9 @@ class FlashMLAMetadataBuilder:
         columns = common.block_table_tensor.shape[1]
         q_len = max(1, int(getattr(common, "max_query_len", 1) or 1))
         key = tokens, rows, columns, common.causal, q_len
+        # Captured buffers run their producer in the graph on every replay.
+        # Other batches can fork as soon as the schedule inputs are ready.
+        start_during_refresh = self.enable_async and not retain_for_graph and (has_prefill or key not in self.buffers)
         if has_prefill:
             if retain_for_graph:
                 raise ValueError("FlashMLA graph buffers require a decode-only batch")
@@ -666,6 +670,7 @@ class FlashMLAMetadataBuilder:
 
         def refresh():
             flash.metadata_started = False
+            flash.metadata_capture_started = False
             # The extra zero-used request owns physical graph/SP padding.
             flash.cu.fill_(tokens)
             flash.cu[: num_decodes + 1].copy_(common.query_start_loc[: num_decodes + 1].clamp_max(num_decode_tokens))
@@ -687,6 +692,8 @@ class FlashMLAMetadataBuilder:
                 )
             flash.cache_lens[:num_decodes].copy_(lengths)
             flash.cache_lens.masked_fill_(flash.used_q == 0, 0)
+            if start_during_refresh:
+                self.start_metadata(flash)
             flash.block_table.zero_()
             flash.block_table[:num_decodes].copy_(common.block_table_tensor[:num_decodes])
             flash.slots.fill_(-1)
@@ -796,12 +803,14 @@ class FlashMLAMetadataBuilder:
             flash.metadata_started = True
             return
         main_stream = torch.npu.current_stream()
-        self.metadata_start = main_stream.record_event()
-        self.metadata_stream.wait_event(self.metadata_start)
+        if self.metadata_stream == main_stream:
+            raise RuntimeError("FlashMLA metadata stream aliases the current execution stream")
+        flash.metadata_start = main_stream.record_event()
+        self.metadata_stream.wait_event(flash.metadata_start)
         self._record_metadata_stream(flash)
         with torch.npu.stream(self.metadata_stream):
             self._refresh_schedule(flash)
-            self.metadata_ready = torch.npu.current_stream().record_event()
+            flash.metadata_ready = torch.npu.current_stream().record_event()
         flash.metadata_started = True
 
     def _record_metadata_stream(self, flash: FlashMLADecode) -> None:
@@ -820,5 +829,5 @@ class FlashMLAMetadataBuilder:
         """Make the main stream wait for an in-flight async schedule build."""
         if not flash.metadata_async or not flash.metadata_started:
             return
-        assert self.metadata_ready is not None
-        torch.npu.current_stream().wait_event(self.metadata_ready)
+        assert flash.metadata_ready is not None
+        torch.npu.current_stream().wait_event(flash.metadata_ready)

@@ -1182,11 +1182,15 @@ class AscendMLAImpl(MLAAttentionImpl):
         flash = attn_metadata.get_external_flashmla(self.flash_mla_layout)
         if flash is None or self.flash_mla_metadata_builder is None:
             return
-        if _EXTRA_CTX.capturing:
+        capture_start = _EXTRA_CTX.capturing and not flash.metadata_capture_started
+        if capture_start:
             # The warmup forward may have recorded an earlier fork/join; the
             # captured graph needs its own pair inside the capture region.
             flash.metadata_started = False
+            flash.metadata_capture_started = True
         self.flash_mla_metadata_builder.start_metadata(flash)
+        if capture_start and flash.metadata_async:
+            flash.metadata_capture_events.append((flash.metadata_start, flash.metadata_ready))
 
     def wait_flash_mla_metadata(self, attn_metadata: M) -> None:
         """Order this stream after the side-stream FlashMLA schedule build."""

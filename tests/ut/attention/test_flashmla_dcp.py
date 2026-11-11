@@ -411,6 +411,25 @@ def test_metadata_side_stream_records_inputs_and_waits_before_use(runtime):
     }
 
 
+def test_metadata_wait_uses_the_event_for_each_flash(runtime, monkeypatch):
+    builder = runtime.builder(enable_async=True)
+    first = builder.build(common([35], [1]), 1, 1, False, retain_for_graph=True)
+    second = builder.build(common([35], [2]), 1, 2, False, retain_for_graph=True)
+    stream = builder.metadata_stream
+    produced = iter((object(), object()))
+    monkeypatch.setattr(stream, "record_event", lambda: next(produced))
+    builder.start_metadata(first)
+    builder.start_metadata(second)
+    assert first.metadata_ready is not second.metadata_ready
+    runtime.events.clear()
+    builder.wait_metadata(first)
+    builder.wait_metadata(second)
+    assert runtime.events == [
+        ("wait", "main", first.metadata_ready),
+        ("wait", "main", second.metadata_ready),
+    ]
+
+
 def test_metadata_stream_avoids_router_stream(runtime, monkeypatch):
     router = object()
     metadata = object()
