@@ -132,15 +132,18 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             first = torch.zeros(count, dtype=torch.int32, device=device)
         else:
             query_lens = torch.diff(input_batch.query_start_loc[: count + 1])
-            spec_mask = (
-                torch.zeros(count, dtype=torch.bool, device=device)
-                if drafts is None
-                else (drafts[:count] >= 0).to(device=device, non_blocking=True)
-            )
+            if drafts is None:
+                spec_mask = torch.zeros(count, dtype=torch.bool, device=device)
+            else:
+                spec_mask_cpu = torch.empty(count, dtype=torch.bool, pin_memory=device.type == "npu")
+                torch.ge(drafts[:count], 0, out=spec_mask_cpu)
+                spec_mask = spec_mask_cpu.to(device=device, non_blocking=True)
+            is_prefilling_cpu = torch.empty(count, dtype=torch.bool, pin_memory=device.type == "npu")
+            is_prefilling_cpu.copy_(metadata.is_prefilling[:count])
             first = tracker.update(
                 raw_indices + 1,
                 input_batch.seq_lens[:count] - query_lens,
-                metadata.is_prefilling[:count].to(device=device, non_blocking=True),
+                is_prefilling_cpu.to(device=device, non_blocking=True),
                 spec_mask,
             )
         return AscendMegaKDAMambaHybridAttnMetadata(
