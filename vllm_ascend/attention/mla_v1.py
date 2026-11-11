@@ -1120,6 +1120,10 @@ class AscendMLAImpl(MLAAttentionImpl):
             raise RuntimeError(
                 "VLLM_ASCEND_ENABLE_PA_NZ=1 requires q_lora_rank, fused_qkv_a_proj and q_proj."
             )
+        if self.q_a_layernorm is None or self.kv_a_layernorm is None:
+            raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 requires Q/KV RMSNorm layers.")
+        if self.q_a_layernorm.variance_epsilon != self.kv_a_layernorm.variance_epsilon:
+            raise ValueError("DSL Prolog requires identical Q/KV RMSNorm epsilon")
         if self.kv_lora_rank != FLASHMLA_V_DIM or self.qk_rope_head_dim != FLASHMLA_QK_DIM - FLASHMLA_V_DIM:
             raise RuntimeError(
                 f"VLLM_ASCEND_ENABLE_PA_NZ=1 requires kv_lora_rank={FLASHMLA_V_DIM} and "
@@ -3377,7 +3381,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         kv_cache: torch.Tensor | tuple[torch.Tensor],
         attn_metadata: M,
     ) -> torch.Tensor:
-        """Decode through the BF16 PA_NZ prolog + 0.27 FlashMLA operator."""
+        """Decode through the current BF16 PA_NZ prolog and FlashMLA."""
         from vllm_ascend.ops.flash_mla_pa_nz import mla_prolog_no_rope  # noqa: PLC0415
 
         flash = attn_metadata.get_external_flashmla(self.flash_mla_layout)
@@ -3430,7 +3434,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         else:
             prolog_cache = merged_cache
             prolog_slots = cache_indices
-        q, *_ = mla_prolog_no_rope(
+        q, _, _ = mla_prolog_no_rope(
             hidden_states[:num_decode_tokens],
             self.weight_dq,
             self.flash_weight_uq_qr,
