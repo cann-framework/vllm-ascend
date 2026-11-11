@@ -3399,8 +3399,6 @@ class AscendMLAImpl(MLAAttentionImpl):
             flash.block_table.copy_(
                 torch.where(stale, last_blocks[:, None], flash.block_table)
             )
-        if flash.metadata_async and not flash.metadata_started:
-            self.start_flash_mla_metadata(attn_metadata)
         if flash.prolog_slots is not None:
             cache_indices = flash.prolog_slots[:num_decode_tokens].to(torch.int64)
         else:

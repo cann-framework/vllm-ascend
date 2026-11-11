@@ -644,11 +644,6 @@ class FlashMLAMetadataBuilder:
         columns = common.block_table_tensor.shape[1]
         q_len = max(1, int(getattr(common, "max_query_len", 1) or 1))
         key = tokens, rows, columns, common.causal, q_len
-        # Retained graph buffers build their schedule inside the captured
-        # forward; launching it here would duplicate work on every replay.
-        start_during_refresh = (
-            self.enable_async and not retain_for_graph and (has_prefill or key not in self.buffers)
-        )
         if has_prefill:
             if retain_for_graph:
                 raise ValueError("FlashMLA graph buffers require a decode-only batch")
@@ -692,10 +687,6 @@ class FlashMLAMetadataBuilder:
                 )
             flash.cache_lens[:num_decodes].copy_(lengths)
             flash.cache_lens.masked_fill_(flash.used_q == 0, 0)
-            if start_during_refresh:
-                # The schedule only needs lengths and query boundaries. Fork
-                # now, while the caller prepares tables, slots and copy indices.
-                self.start_metadata(flash)
             flash.block_table.zero_()
             flash.block_table[:num_decodes].copy_(common.block_table_tensor[:num_decodes])
             flash.slots.fill_(-1)
