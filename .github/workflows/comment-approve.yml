@@ -1,0 +1,126 @@
+name: Committer approval
+
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/comment_approve.py'
+      - '.github/scripts/test_comment_approve.py'
+      - '.github/workflows/comment-approve.yml'
+  issue_comment:
+    types: [created, edited, deleted]
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, edited]
+  workflow_run:
+    workflows: [Dispatcher-Smoke]
+    types: [completed]
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Initialize existing PR versions before enabling approval, or re-evaluate approvals'
+        type: choice
+        options: [initialize, reconcile]
+        default: initialize
+
+permissions: {}
+
+jobs:
+  test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: python3 -B -m unittest discover -s .github/scripts -p 'test_comment_approve.py' -v
+
+  record:
+    if: >-
+      vars.APPROVAL_AUTOMATION_ENABLED == 'true' &&
+      (github.event_name == 'pull_request_target' ||
+       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+        (github.event.comment.body == '/approve' || github.event.changes.body.from == '/approve')))
+    runs-on: ubuntu-latest
+    environment: committer-approval
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # Never check out the PR head: this job has a write-capable token.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Record the head or approval
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          APPROVAL_SIGNING_KEY: ${{ secrets.APPROVAL_APP_PRIVATE_KEY }}
+        run: python3 -B .github/scripts/comment_approve.py record
+
+  initialize:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'initialize' && vars.APPROVAL_AUTOMATION_ENABLED != 'true'
+    runs-on: ubuntu-latest
+    environment: committer-approval
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Initialize current PR versions
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          APPROVAL_SIGNING_KEY: ${{ secrets.APPROVAL_APP_PRIVATE_KEY }}
+        run: python3 -B .github/scripts/comment_approve.py initialize
+
+  evaluate:
+    needs: record
+    if: >-
+      always() && vars.APPROVAL_AUTOMATION_ENABLED == 'true' &&
+      !(github.event_name == 'workflow_dispatch' && inputs.mode == 'initialize') &&
+      (needs.record.result != 'skipped' || github.event_name == 'workflow_run' ||
+       github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    environment: committer-approval
+    timeout-minutes: 15
+    # Serialize evaluation, not recording. GitHub can replace pending jobs;
+    # every approval must be recorded before it enters this queue.
+    concurrency:
+      group: committer-approval-evaluate
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: read
+      issues: read
+      pull-requests: write
+      statuses: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Create a repository-scoped checks token
+        id: checks-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.APPROVAL_APP_ID }}
+          private-key: ${{ secrets.APPROVAL_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-checks: write
+      - name: Check approvals and merge
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CHECKS_TOKEN: ${{ steps.checks-token.outputs.token }}
+          APPROVAL_SIGNING_KEY: ${{ secrets.APPROVAL_APP_PRIVATE_KEY }}
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/.github/scripts/lite_actions
+          APPROVAL_MODE: ${{ (needs.record.result != 'success' && needs.record.result != 'skipped') && 'invalidate' || (github.event_name == 'issue_comment' || github.event_name == 'pull_request_target') && 'evaluate' || 'reconcile' }}
+        run: python3 -B .github/scripts/comment_approve.py "$APPROVAL_MODE"
