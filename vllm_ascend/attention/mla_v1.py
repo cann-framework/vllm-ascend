@@ -3387,6 +3387,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         num_decode_tokens = attn_metadata.num_decode_tokens
         merged_cache = kv_cache if isinstance(kv_cache, torch.Tensor) else kv_cache[0]
         block_size = merged_cache.shape[1]
+        # The model hook normally starts this at step entry. Keep a local
+        # fallback so a direct caller never consumes an uninitialized schedule.
+        if flash.metadata_async and not flash.metadata_started:
+            self.start_flash_mla_metadata(attn_metadata)
         if flash.block_columns is not None:
             valid_cols = (flash.cache_lens + block_size - 1) // block_size
             last_columns = (valid_cols - 1).clamp_min(0).to(torch.long)
@@ -3521,6 +3525,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         bsz = attn_metadata.num_decode_tokens
         history_slots = attn_metadata.slot_mapping[:bsz]
         layout_flash = attn_metadata.get_external_flashmla(self.flash_mla_layout)
+        if layout_flash is not None and layout_flash.metadata_async and not layout_flash.metadata_started:
+            self.start_flash_mla_metadata(attn_metadata)
         flash_mlapo = layout_flash is not None
         if flash_mlapo:
             history_slots = layout_flash.slots[:bsz]
