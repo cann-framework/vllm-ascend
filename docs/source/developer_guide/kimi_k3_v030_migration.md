@@ -85,9 +85,9 @@ these scopes. Other models retain their generic 0.30 policy.
 Named scopes cover Router/latent down through routed Combine and latent
 norm/up. Nested exclusions keep shared AllGather, shared ReduceScatter, the
 final join and Add outside fusion. Shared Gate/Up, SiTU and Down remain inside
-the named scope. All MoE layers reuse one Router stream per model. Dispatch is
-submitted before shared Gate/Up, which still waits only for dispatch readiness
-and shared input readiness. Shared ReduceScatter is submitted after routed
+the named scope. Router stream creation retains the release baseline's
+per-layer policy. Dispatch is submitted before shared Gate/Up, which still
+waits only for dispatch readiness and shared input readiness. Shared ReduceScatter is submitted after routed
 GMM2 and before Combine, and waits only for shared Down completion. The owning
 ACL graph is optimized once
 after successful capture with `dcci_disable_on_kernel=[".*"]` and
