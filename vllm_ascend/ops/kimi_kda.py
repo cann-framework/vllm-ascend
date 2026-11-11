@@ -75,6 +75,38 @@ _KDA_BFG_STREAM: torch.npu.Stream | None = None
 _MEGA_KDA_COMMIT_STREAM: torch.npu.Stream | None = None
 
 
+def _is_pd_decode_worker(vllm_config) -> bool:
+    """Whether this worker receives requests through PD KV transfer."""
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    return kv_transfer_config is not None and bool(getattr(kv_transfer_config, "is_kv_consumer", False))
+
+
+def _is_pd_prefill_worker(vllm_config) -> bool:
+    """Whether this worker only prefills and forwards through PD KV transfer."""
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    return kv_transfer_config is not None and bool(getattr(kv_transfer_config, "is_kv_producer", False))
+
+
+def release_mega_kda_nd_weights(model) -> int:
+    """Release the default-path ND KDA projections on PD decode workers.
+
+    Called after memory profiling so the profile forward still measures the
+    conservative peak activation with the ND weights resident. The caller
+    subtracts the returned byte count from its weights accounting so the
+    freed budget flows into the KV cache pool.
+    """
+    released = 0
+    for module in model.modules():
+        if (
+            isinstance(module, AscendKimiK3DeltaAttention)
+            and getattr(module, "_mega_weights", None) is not None
+            and getattr(module, "_mega_pd_decode_worker", False)
+            and not getattr(module, "_mega_nd_released", False)
+        ):
+            released += module._release_default_kda_weights()
+    return released
+
+
 def _ascend_kda_forward(
     mixed_qkv: torch.Tensor,
     g1: torch.Tensor,
@@ -416,6 +448,14 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         # independent of multistream_overlap_shared_expert: the MoE switch
         # keeps its own stream, and commit runs on _mega_kda_commit_stream().
         self.overlap_mega_kda_commit = self.use_mega_kda_replayssm
+        # PD decode workers receive both KV and KDA state through the
+        # connector, so their default (prefill/recompute) KDA path is dead in
+        # steady state; the ND projections can be released after the NZ
+        # operands are built. PD prefill workers never run the MegaKDA
+        # verify/decode operator, so they skip the NZ operand build entirely.
+        self._mega_pd_decode_worker = _is_pd_decode_worker(vllm_config)
+        self._mega_pd_prefill_worker = _is_pd_prefill_worker(vllm_config)
+        self._mega_nd_released = False
         quant_config = getattr(vllm_config, "quant_config", None)
         uses_mixed_projection = bool(
             quant_config is not None
@@ -641,6 +681,18 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        if getattr(self, "_mega_nd_released", False):
+            # The ND projections were released after profiling on this PD
+            # decode worker. Any real prefill/recompute batch reaching here
+            # has no weights left to run on; fail loudly instead of silently
+            # producing garbage from empty tensors.
+            raise RuntimeError(
+                "The default KDA path (prefill/recompute/fallback) ran after its ND "
+                "projections were released on this PD decode worker. ReplaySSM "
+                "MegaKDA expects all decode/verify work on the MegaKDA operator; "
+                "prefill batches require the ND weights, which only remain on "
+                "non-PD-decode workers."
+            )
         if self.uses_mixed_projection:
             num_tokens = hidden_states.size(0)
             mixed_qkv, beta, g1, g2 = self._run_overlapped_qkv_bfg(hidden_states)
@@ -852,7 +904,14 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         """Called by the model post-load hook after *all* quant finalizers."""
         self._mega_weights = None
         self._mega_weight_signature = None
+        self._mega_nd_released = False
         if not self.use_mega_kda_replayssm:
+            return False
+        if getattr(self, "_mega_pd_prefill_worker", False):
+            # A PD prefill worker only runs prefill batches, which always take
+            # the default KDA path; building the NZ operands would double the
+            # projection footprint without ever being consumed.
+            logger.info_once("MegaKDA NZ operands skipped on the PD prefill worker for %s", self.prefix)
             return False
         layers = (self.in_proj_qkvgfab, self.o_proj)
         layers += (self.fused_bfg_proj,) if self.uses_mixed_projection else (self.f_b_proj,)
@@ -881,6 +940,37 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         self._mega_weight_signature = self._current_mega_weight_signature()
         logger.info_once("MegaKDA BF16/NZ operands prepared after loading for %s", self.prefix)
         return True
+
+    def _release_default_kda_weights(self) -> int:
+        """Drop the ND projections superseded by the MegaKDA NZ operands.
+
+        Only valid on a PD decode worker: every request arrives with its KV
+        and KDA state already transferred, so decode and verify always run
+        through the MegaKDA operator and the default (prefill/recompute) KDA
+        path is dead. Releasing the ND originals keeps the NZ operand set the
+        single resident copy, restoring the pre-MegaKDA weight footprint.
+        Returns the number of device bytes freed.
+        """
+        released = 0
+        for param in self._released_mega_nd_params():
+            released += param.numel() * param.element_size()
+            param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+        if released:
+            self._mega_nd_released = True
+            logger.info_once(
+                "MegaKDA released the default-path ND projections on the PD decode worker for %s", self.prefix
+            )
+        return released
+
+    def _released_mega_nd_params(self) -> list:
+        params = [self.in_proj_qkvgfab.weight, self.o_proj.weight]
+        if self.uses_mixed_projection:
+            params.append(self.fused_bfg_proj.weight)
+            params.append(self.fused_bfg_proj.f_a_weight)
+            params.append(self.fused_bfg_proj.f_b_weight)
+        else:
+            params.append(self.f_b_proj.weight)
+        return params
 
     def _current_mega_weight_signature(self) -> tuple:
         weights = [
@@ -923,7 +1013,11 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         plan: _MegaKDAPlan,
         replay_plan: _MegaKDAReplayPlan | None = None,
     ) -> torch.Tensor:
-        if self._mega_weight_signature != self._current_mega_weight_signature():
+        # Released layers no longer hold the ND originals the signature reads;
+        # weights cannot change after the post-load hook in serving anyway.
+        if not getattr(self, "_mega_nd_released", False) and self._mega_weight_signature != (
+            self._current_mega_weight_signature()
+        ):
             raise RuntimeError("MegaKDA weights changed; run the model process_weights_after_loading hook again")
         conv_state, recurrent_state = self.kv_cache[:2]
         if replay_plan is None:

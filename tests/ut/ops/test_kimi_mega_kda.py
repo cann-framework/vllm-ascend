@@ -112,6 +112,7 @@ def runtime():
         logger=MagicMock(),
         _PACKED_CONV_WEIGHT_NAME="ascend_conv1d_weight",
         _MEGA_KDA_MAX_BATCH_MULTIPLIER=32,
+        _MEGA_KDA_CACHE_ALIGNMENT_BYTES=16,
         MEGA_KDA_NZ_FORMAT=29,
         tensor_model_parallel_all_reduce=MagicMock(side_effect=lambda x: x + 1),
         wait_for_kv_layer_from_connector=MagicMock(),
@@ -125,6 +126,9 @@ def runtime():
         "_mega_cache_supported",
         "_build_mega_weights",
         "_prepare_mega_weights",
+        "_release_default_kda_weights",
+        "_released_mega_nd_params",
+        "_forward_default",
         "_current_mega_weight_signature",
         "_forward_mega_kda",
         "_execute_mega_kda",
@@ -542,3 +546,80 @@ def test_normal_decode_uses_one_accepted_token(runtime):
     plan, _ = _plan(runtime, layer, metadata)
     assert plan is not None and plan.spec_len == 1
     assert plan.conv_num_accepted_tokens.tolist() == plan.num_accepted_tokens.tolist() == [1] * 4
+
+
+def test_pd_decode_worker_releases_nd_projections(runtime):
+    layer = _attention(runtime)
+    assert layer._prepare_mega_weights()
+    assert not layer._mega_nd_released
+    nz_pointer = layer._mega_weights.qkv.data_ptr()
+
+    layer._mega_pd_decode_worker = True
+    expected = (
+        layer.in_proj_qkvgfab.weight.numel() * 2 + layer.o_proj.weight.numel() * 2 + layer.f_b_proj.weight.numel() * 2
+    )
+    released = layer._release_default_kda_weights()
+
+    assert released == expected
+    assert released > 0
+    assert layer._mega_nd_released
+    assert layer.in_proj_qkvgfab.weight.numel() == 0
+    assert layer.o_proj.weight.numel() == 0
+    assert layer.f_b_proj.weight.numel() == 0
+    # The NZ operand set stays resident and untouched.
+    assert layer._mega_weights.qkv.data_ptr() == nz_pointer
+    assert layer._mega_weights.qkv.numel() > 0
+    assert layer.get_parameter("ascend_conv1d_weight").numel() > 0
+    assert layer.o_norm.weight.numel() > 0
+
+
+def test_released_default_path_fails_loudly(runtime):
+    layer = _attention(runtime)
+    layer._mega_nd_released = True
+    hidden = torch.randn(8, layer.hidden_size)
+    # _attention() stubs the instance attribute; call the extracted method.
+    forward_default = type(layer)._forward_default
+
+    # After the post-profile release there is no dummy run left that may take
+    # this path: every caller (real prefill/recompute, plan-None fallback)
+    # must fail loudly instead of producing garbage from empty weights.
+    runtime["get_forward_context"].return_value = SimpleNamespace(attn_metadata=None)
+    with pytest.raises(RuntimeError, match="released"):
+        forward_default(layer, hidden, torch.arange(8))
+    runtime["get_forward_context"].return_value = SimpleNamespace(attn_metadata={layer.prefix: object()})
+    with pytest.raises(RuntimeError, match="released"):
+        forward_default(layer, hidden, torch.arange(8))
+
+
+def test_release_mega_kda_nd_weights_targets_pd_decode_layers_only(runtime):
+    _definitions("vllm_ascend/ops/kimi_kda.py", {"release_mega_kda_nd_weights"}, runtime)
+    eligible = _attention(runtime)
+    eligible._mega_pd_decode_worker = True
+    plain = _attention(runtime)
+    model = SimpleNamespace(modules=lambda: [eligible, plain])
+    nz_pointer = eligible._mega_weights.qkv.data_ptr()
+
+    released = runtime["release_mega_kda_nd_weights"](model)
+
+    assert released > 0
+    assert eligible._mega_nd_released
+    assert eligible.in_proj_qkvgfab.weight.numel() == 0
+    assert eligible._mega_weights.qkv.data_ptr() == nz_pointer
+    # Non-PD-decode layers keep their ND weights and stay unreleased.
+    assert not plain._mega_nd_released
+    assert plain.in_proj_qkvgfab.weight.numel() > 0
+    # A second call is a no-op (idempotent across repeated profile runs).
+    assert runtime["release_mega_kda_nd_weights"](model) == 0
+
+
+def test_pd_prefill_worker_skips_mega_operand_build(runtime):
+    layer = _attention(runtime)
+    assert layer._mega_weights is not None
+
+    layer._mega_pd_prefill_worker = True
+    assert not layer._prepare_mega_weights()
+    assert layer._mega_weights is None
+    # The ND projections stay resident: the prefill worker still needs them.
+    assert layer.in_proj_qkvgfab.weight.numel() > 0
+    assert layer.o_proj.weight.numel() > 0
+    assert not layer._mega_nd_released
