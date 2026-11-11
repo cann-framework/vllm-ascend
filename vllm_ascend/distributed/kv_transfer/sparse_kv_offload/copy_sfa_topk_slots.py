@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
+from vllm.logger import logger
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -166,6 +167,14 @@ class CopySfaRequestStates:
             state = retained[req]
             slots[row] = state.slot
             active[row] = True
+            if req in pending:
+                logger.info(
+                    "[SFA][slot] bind req=%s slot=%d row=%d capacity=%d",
+                    req,
+                    state.slot,
+                    row,
+                    capacity,
+                )
             if computed_tokens is None:
                 continue
             prefix = (int(computed_tokens[row]) // block_size) * block_size

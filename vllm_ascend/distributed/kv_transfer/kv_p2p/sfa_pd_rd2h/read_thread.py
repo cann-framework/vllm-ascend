@@ -419,6 +419,15 @@ class MembPullReadThread(threading.Thread):
                     if set(dest_by_group) != expected_dest_groups:
                         raise ValueError("D DSpark draft block tables do not cover its destination cache groups")
                     source_by_layer = {name: source_by_group[item.group_id] for name, item in remote.items()}
+                    logger.info(
+                        "[DSpark][transfer] start req=%s generation=%s prompt=%d "
+                        "source_groups=%s dest_groups=%s",
+                        request_id,
+                        generation,
+                        descriptor.prompt_tokens,
+                        sorted(source_by_group),
+                        sorted(dest_by_group),
+                    )
                     for peer_ptrs, local_ptrs, lengths in build_draft_kv_read_batches(
                         remote,
                         local,
@@ -437,6 +446,12 @@ class MembPullReadThread(threading.Thread):
                     receiver.finish_direct_transfer(descriptor, success=True)
                     reserved = False
                     status = DSparkDraftKVStatus.ACCEPTED
+                    logger.info(
+                        "[DSpark][transfer] finish req=%s generation=%s prompt=%d",
+                        request_id,
+                        generation,
+                        descriptor.prompt_tokens,
+                    )
         except Exception as error:
             status = DSparkDraftKVStatus.FAILED
             if descriptor is not None and reserved and receiver is not None:
@@ -1016,7 +1031,7 @@ class MembPullReadThread(threading.Thread):
 
     def _log_read_result(self, read_info: dict[str, Any]) -> None:
         layer_name = read_info["layer_name"]
-        logger.debug(
+        logger.info(
             "MembPull D finished read: layer=%s, req=%s, pool_idx=%d, "
             "main=%d/%d blocks, indexer=%d/%d blocks (scale split), transfers=%d",
             layer_name,

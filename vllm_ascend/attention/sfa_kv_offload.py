@@ -327,6 +327,14 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             raise RuntimeError("fused_copy_sfa request slots and activity must be CPU tensors")
         pools_np = pools_cpu[:count].numpy()
         active_rows_np = active_cpu[:count].numpy()
+        logger.info(
+            "[SFA][metadata] reqs=%s slots=%s active=%s fused=%s draft=%s",
+            count,
+            pools_np.tolist(),
+            active_rows_np.tolist(),
+            self.use_fused_copy_sfa,
+            draft_index,
+        )
 
         def upload(name, values):
             buffer = self.copy_sfa_host[name][step]

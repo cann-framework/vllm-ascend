@@ -1089,6 +1089,41 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
         else:
             self.attn_res_query_plan.refresh(specs)
 
+    def _start_flash_mla_metadata(self) -> None:
+        """Start one shared FlashMLA metadata build before the layer loop."""
+        if not is_forward_context_available():
+            return
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return
+        for layer in self.layers:
+            self_attn = getattr(layer, "self_attn", None)
+            impl = getattr(self_attn, "impl", None)
+            state = getattr(impl, "flash_mla_state", None)
+            if state is None:
+                continue
+            layer_metadata = attn_metadata.get(getattr(impl, "layer_name", None))
+            flash = (
+                layer_metadata.get_external_flashmla(getattr(impl, "flash_mla_layout", None))
+                if layer_metadata is not None
+                else None
+            )
+            if (
+                flash is None
+                or not getattr(flash, "metadata_async", False)
+                or getattr(layer_metadata, "num_decode_tokens", 0) <= 0
+            ):
+                continue
+            state.start_metadata(flash)
+            logger.info(
+                "[FlashMLA] model hook started metadata: layer=%s decode_tokens=%d async=%s layout=%s",
+                impl.layer_name,
+                layer_metadata.num_decode_tokens,
+                getattr(flash, "metadata_async", False),
+                getattr(impl, "flash_mla_layout", None),
+            )
+            return
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1098,6 +1133,7 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if self.config.attn_res_block_size is None:
+            self._start_flash_mla_metadata()
             return super().forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -1153,6 +1189,7 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
             block_residual[:, : residual.size(1), :].copy_(residual)
         residual = block_residual
 
+        self._start_flash_mla_metadata()
         optimize_attn_res_prefill = _use_attn_res_prefill_cache()
         attn_res_op = None
         if self.attn_res_mode != "native":
