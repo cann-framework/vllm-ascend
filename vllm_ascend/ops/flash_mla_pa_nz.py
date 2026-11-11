@@ -7,13 +7,14 @@ imported when ``VLLM_ASCEND_ENABLE_PA_NZ`` is enabled, so installations
 without the optional ``cann_ops_transformer`` / ``cannbot-dsl`` operators keep
 working on the native PA_BBND path.
 
-The fused prolog is ``ops.mla_prolog_bf16`` (BF16, no quantization); the
-attention operator is ``flash_mla`` with ``layout_kv="PA_NZ"``.  W8A8C8 / FP8
-cache operators are intentionally not part of this module.
+The fused prolog is ``ops.mla_prolog_v4.mla_prolog_v2`` in BF16 A16C16,
+PA_NZ, NO_ROPE mode; the attention operator is ``flash_mla`` with
+``layout_kv="PA_NZ"``.  W8A8C8 / FP8 cache operators are intentionally not
+part of this module.
 """
 
 from collections.abc import Callable
-from functools import lru_cache
+from functools import lru_cache, partial
 from importlib import import_module
 
 import torch
@@ -56,14 +57,20 @@ def _get_pa_nz_flash_mla_ops() -> tuple[Callable, Callable]:
 
 @lru_cache
 def _get_bf16_mla_prolog_op() -> Callable:
-    """Load the Kimi K3 BF16 fused MLA prolog from cannbot-dsl."""
+    """Load and specialize the current cannbot-dsl BF16 prolog once."""
     try:
-        module = import_module("ops.mla_prolog_bf16")
-        return module.mla_prolog_bf16
-    except ImportError as exc:
+        module = import_module("ops.mla_prolog_v4")
+        return partial(
+            module.mla_prolog_v2,
+            qkv_quant_mode=module.QkvQuantMode.A16C16,
+            cache_mode=module.CacheMode.PA_NZ,
+            rope_mode=module.RopeMode.NO_ROPE,
+            return_qr=False,
+        )
+    except (ImportError, AttributeError) as exc:
         raise RuntimeError(
-            "VLLM_ASCEND_ENABLE_PA_NZ=1 requires mla_prolog_bf16 from "
-            "the cannbot-dsl package."
+            "VLLM_ASCEND_ENABLE_PA_NZ=1 requires ops.mla_prolog_v4.mla_prolog_v2 "
+            "with A16C16, PA_NZ and NO_ROPE support from a matching cannbot-dsl install."
         ) from exc
 
 
@@ -155,11 +162,12 @@ def mla_prolog_no_rope(
     cache_index: torch.Tensor,
     q_norm_eps: float,
 ):
-    """Run the BF16 fused no-RoPE prolog with a merged PA_NZ cache update.
+    """Return ``(q, descale_q, qr)`` and update the PA_NZ cache in place.
 
-    ``mla_prolog_bf16`` takes 10 positional arguments.  The merged ``ckv+kr``
-    cache is updated in place and the returned query already has its rope
-    segment concatenated, ready for FlashMLA.
+    The current ``mla_prolog_v2`` takes nine positional tensors and keyword
+    attributes. NZ projection weights retain logical ``[K, O]`` shapes.
+    In A16C16/NO_ROPE mode, q already contains the auxiliary 64 dimensions;
+    query quantization and the separate QR output are disabled.
     """
     prolog_op = _get_bf16_mla_prolog_op()
     return prolog_op(
@@ -172,7 +180,7 @@ def mla_prolog_no_rope(
         kv_norm_weight.float().contiguous(),
         kv_cache,
         cache_index.reshape(-1).to(torch.int64),
-        q_norm_eps,
+        norm_eps=q_norm_eps,
     )
 
 
