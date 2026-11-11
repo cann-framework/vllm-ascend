@@ -56,11 +56,17 @@ class BlueSourceTests(unittest.TestCase):
         cases = self.plan["cases"]
         self.assertEqual(
             [c["test_id"] for c in cases],
-            ["worker_os_blue", "dispatch_smoke_8p", "dispatch_smoke_16p", "dispatch_smoke_8p"],
+            ["worker_os_blue", "worker_os_yellow", "dispatch_smoke_8p", "dispatch_smoke_16p", "dispatch_smoke_8p"],
         )
-        self.assertEqual([c["resources"]["nodes"] for c in cases], [0, 1, 2, 1])
-        self.assertEqual(len({c["case_id"] for c in cases}), 4)
-        self.assertEqual(cases[1]["test_id"], cases[3]["test_id"])
+        self.assertEqual([c["resources"]["nodes"] for c in cases], [0, 0, 1, 2, 1])
+        self.assertEqual(len({c["case_id"] for c in cases}), 5)
+        self.assertEqual(cases[2]["test_id"], cases[4]["test_id"])
+
+    def test_yellow_probe_has_no_npu_lease(self):
+        item = self.plan["cases"][1]
+        self.assertEqual((item["test_id"], item["worker"], item["kind"]), ("worker_os_yellow", "yellow", "worker_probe"))
+        self.assertEqual(item["resources"], {"nodes": 0, "devices_per_node": 0})
+        self.assertEqual((item["target_pool"], item["docker"]), (None, None))
 
     def test_single_case_on_pr_keeps_merge_identity_without_full_suite_status(self):
         selection = "dispatch_smoke_8p"
@@ -161,7 +167,7 @@ class BlueSourceTests(unittest.TestCase):
         )
         with patch.dict(prepare_request.BLUE_CASES, {case.test_name: case}):
             plan = prepare_request.create_plan("pull_request_target", self.event, "", 123, 1)
-        for item in (plan["cases"][1], plan["cases"][3]):
+        for item in (plan["cases"][2], plan["cases"][4]):
             self.assertEqual(
                 (item["worker"], item["target_pool"], item["docker"]),
                 ("blue", "another_pool", "another_container"),
@@ -209,7 +215,7 @@ class BlueSourceTests(unittest.TestCase):
             )
             self.assertEqual(
                 json.loads(result.stdout),
-                ["worker_os_blue", "dispatch_smoke_8p", "dispatch_smoke_16p", "new_smoke_8p", "dispatch_smoke_8p"],
+                ["worker_os_blue", "worker_os_yellow", "dispatch_smoke_8p", "dispatch_smoke_16p", "new_smoke_8p", "dispatch_smoke_8p"],
             )
 
     def test_plan_rejects_source_that_changed_after_checkout(self):

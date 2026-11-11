@@ -91,7 +91,7 @@ class RepositoryIdentityTests(unittest.TestCase):
     def test_canonical_personal_fork_pr_uses_default_smoke(self):
         plan = prepare.create_plan("pull_request_target", self.payload, "", 100, 2)
         self.assertEqual((plan["schema"], plan["repo"], plan["sha"]), (3, REPO, SHA))
-        self.assertEqual(len(plan["cases"]), 4)
+        self.assertEqual(len(plan["cases"]), 5)
 
     def test_obsolete_target_repository_is_rejected_without_alias(self):
         self.payload["pull_request"]["base"]["repo"]["full_name"] = OLD_REPO
@@ -100,11 +100,11 @@ class RepositoryIdentityTests(unittest.TestCase):
 
     def test_other_source_fork_is_accepted(self):
         self.payload["pull_request"]["head"]["repo"]["full_name"] = "other/vllm-ascend"
-        self.assertEqual(len(prepare.create_plan("pull_request_target", self.payload, "", 100, 2)["cases"]), 4)
+        self.assertEqual(len(prepare.create_plan("pull_request_target", self.payload, "", 100, 2)["cases"]), 5)
 
     def test_other_actor_is_accepted(self):
         self.payload["pull_request"]["user"]["login"] = "other"
-        self.assertEqual(len(prepare.create_plan("pull_request_target", self.payload, "", 100, 2)["cases"]), 4)
+        self.assertEqual(len(prepare.create_plan("pull_request_target", self.payload, "", 100, 2)["cases"]), 5)
 
     def test_manual_tag_is_rejected(self):
         with patch.dict(
