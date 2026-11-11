@@ -11,9 +11,7 @@ from blue_catalog import BLUE_CASES, BLUE_DEFAULTS, BLUE_SMOKE_SUITE
 
 REPO = "cann-framework/vllm-ascend"
 WORKFLOW = "lite-ci-dispatcher-smoke.yml"
-A5_CASES = {"dispatch_smoke_a5_8p": (1, 8, 120), "dispatch_smoke_a5_32p": (4, 8, 240)}
-CASES = {**A5_CASES, **BLUE_CASES}
-DEFAULTS = dict(worker="yellow", target_pool="a5_shared_yellow", docker="vllm-kimi-wangjinyin")
+
 
 
 def selectors(event, payload, value):
@@ -34,45 +32,30 @@ def selectors(event, payload, value):
         sha = os.environ.get("CI_COMMIT") or os.environ["GITHUB_SHA"]
     else:
         raise ValueError("unsupported GitHub event")
-    if not value:
-        ids = list(BLUE_SMOKE_SUITE)
-    else:
-        values = json.loads(value)
-        if not isinstance(values, list) or not 1 <= len(values) <= 256:
-            raise ValueError("invalid smoke test selection")
-        if any(not isinstance(x, dict) or set(x) != {"test_id"} for x in values):
-            raise ValueError("only fixed test_id selectors supported")
-        ids = [x["test_id"] for x in values]
+    if value and value not in BLUE_SMOKE_SUITE:
+        raise ValueError("unknown dispatch Smoke case")
+    ids = [value] if value else list(BLUE_SMOKE_SUITE)
     if not isinstance(sha, str) or not re.fullmatch("[0-9a-f]{40}", sha):
         raise ValueError("invalid source SHA")
-    if not ids or len(ids) > 256 or any(x not in CASES for x in ids):
+    if not ids or len(ids) > 256 or any(x not in BLUE_CASES for x in ids):
         raise ValueError("unknown smoke case")
-    if any(ids.count(x) > 1 and (x not in BLUE_CASES or BLUE_CASES[x].ci_kind != "npu_smoke") for x in set(ids)):
-        raise ValueError("duplicate non-smoke case")
-    if any(x in BLUE_CASES for x in ids) and any(x in A5_CASES for x in ids):
-        raise ValueError("Blue and Yellow cases cannot share a native source plan")
     return sha, ids
 
 
 def create_plan(event, payload, value, run_id, attempt):
     sha, ids = selectors(event, payload, value)
-    defaults = BLUE_DEFAULTS if ids[0] in BLUE_CASES else DEFAULTS
+    defaults = BLUE_DEFAULTS
     items = []
     for i, test_id in enumerate(ids):
-        if test_id in BLUE_CASES:
-            test = BLUE_CASES[test_id]
-            nodes, ngpu, timeout = test.nnodes, test.ngpu, test.timeout
-            label, kind = test.test_descr, test.ci_kind
-            overrides = test.ci_overrides or {}
-            if not isinstance(overrides, dict) or set(overrides) - {"worker", "target_pool", "docker"}:
-                raise ValueError("unknown case override")
-            if kind == "worker_probe" and set(overrides) & {"target_pool", "docker"}:
-                raise ValueError("probe cannot request resources")
-            config = {**defaults, **overrides}
-        else:
-            nodes, ngpu, timeout = CASES[test_id]
-            label, kind = f"A5 HCCL distributed smoke {nodes * ngpu}P", "npu_smoke"
-            config = defaults
+        test = BLUE_CASES[test_id]
+        nodes, ngpu, timeout = test.nnodes, test.ngpu, test.timeout
+        label, kind = test.test_descr, test.ci_kind
+        overrides = test.ci_overrides or {}
+        if not isinstance(overrides, dict) or set(overrides) - {"worker", "target_pool", "docker"}:
+            raise ValueError("unknown case override")
+        if kind == "worker_probe" and set(overrides) & {"target_pool", "docker"}:
+            raise ValueError("probe cannot request resources")
+        config = {**defaults, **overrides}
         items.append(
             {
                 "case_id": f"case_{i:03d}_{test_id}",
@@ -113,8 +96,6 @@ def main():
     test_case = os.environ.get("CI_TEST_CASE", "")
     if source_pr and commit:
         raise ValueError("choose either a PR or a commit")
-    if test_case and test_case not in BLUE_SMOKE_SUITE:
-        raise ValueError("unknown dispatch Smoke case")
     if source_pr:
         if effective_event != "workflow_dispatch" or not re.fullmatch(r"[1-9][0-9]{0,8}", source_pr):
             raise ValueError("invalid native PR recheck")
@@ -123,25 +104,22 @@ def main():
         pr, _, _ = current_pr(int(source_pr))
         payload = {"pull_request": pr}
         effective_event = "pull_request_target"
-    selection = json.dumps([{"test_id": test_case}]) if test_case else os.environ.get("CI_TEST_CASES", "")
     plan = create_plan(
         effective_event,
         payload,
-        selection,
+        test_case,
         int(os.environ["GITHUB_RUN_ID"]),
         int(os.environ["GITHUB_RUN_ATTEMPT"]),
     )
     out = Path(".ci-request")
     out.mkdir(exist_ok=True)
-    native = plan["cases"][0]["test_id"] in BLUE_CASES
-    if native:
-        from native_source import prepare_source
+    from native_source import prepare_source
 
-        source = prepare_source(plan, payload)
-        out.joinpath("source.json").write_text(json.dumps(source, sort_keys=True) + "\n")
+    source = prepare_source(plan, payload)
+    out.joinpath("source.json").write_text(json.dumps(source, sort_keys=True) + "\n")
     (out / "ci-request.json").write_text(json.dumps(plan, separators=(",", ":"), ensure_ascii=False) + "\n")
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-        output.write("native_source=" + str(native).lower() + "\n")
+        output.write("native_source=true\n")
         output.write("matrix=" + json.dumps({"include": plan["cases"]}, separators=(",", ":")) + "\n")
         output.write("sha=" + plan["sha"] + "\n")
         output.write("plan_digest=" + plan["plan_digest"] + "\n")

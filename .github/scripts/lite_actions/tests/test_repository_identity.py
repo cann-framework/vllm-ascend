@@ -8,7 +8,6 @@ import copy
 import importlib.util
 import json
 import os
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -107,19 +106,6 @@ class RepositoryIdentityTests(unittest.TestCase):
         self.payload["pull_request"]["user"]["login"] = "other"
         self.assertEqual(len(prepare.create_plan("pull_request_target", self.payload, "", 100, 2)["cases"]), 4)
 
-    def test_manual_8p_and_32p_topologies_are_preserved(self):
-        selections = json.dumps([{"test_id": key} for key in prepare.A5_CASES])
-        with patch.dict(
-            os.environ, {"GITHUB_REF": "refs/heads/main", "GITHUB_SHA": SHA}, clear=True
-        ):
-            plan = prepare.create_plan("workflow_dispatch", {}, selections, 100, 2)
-        self.assertEqual(plan["repo"], REPO)
-        self.assertEqual([case["resources"]["nodes"] for case in plan["cases"]], [1, 4])
-        self.assertTrue(all(case["worker"] == "yellow" for case in plan["cases"]))
-        self.assertTrue(
-            all(case["docker"] == "vllm-kimi-wangjinyin" for case in plan["cases"])
-        )
-
     def test_manual_tag_is_rejected(self):
         with patch.dict(
             os.environ,
@@ -128,39 +114,12 @@ class RepositoryIdentityTests(unittest.TestCase):
         ), self.assertRaisesRegex(ValueError, "requires a branch"):
             prepare.create_plan("workflow_dispatch", {}, "", 100, 2)
 
-    def test_duplicate_selector_is_rejected(self):
-        selection = json.dumps([{"test_id": "dispatch_smoke_a5_8p"}] * 2)
+    def test_unknown_selector_is_rejected(self):
+        selection = "missing"
         with patch.dict(
             os.environ, {"GITHUB_REF": "refs/heads/main", "GITHUB_SHA": SHA}, clear=True
-        ), self.assertRaisesRegex(ValueError, "duplicate"):
+        ), self.assertRaisesRegex(ValueError, "unknown"):
             prepare.create_plan("workflow_dispatch", {}, selection, 100, 2)
-
-    def test_prepare_entrypoint_accepts_current_github_repository(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            event = root / "event.json"
-            event.write_text("{}")
-            env = {
-                "GITHUB_REPOSITORY": REPO,
-                "GITHUB_EVENT_PATH": str(event),
-                "GITHUB_EVENT_NAME": "workflow_dispatch",
-                "GITHUB_REF": "refs/heads/main",
-                "GITHUB_SHA": SHA,
-                "GITHUB_RUN_ID": "100",
-                "GITHUB_RUN_ATTEMPT": "2",
-                "GITHUB_OUTPUT": str(root / "outputs.txt"),
-                "CI_TEST_CASES": '[{"test_id":"dispatch_smoke_a5_8p"}]',
-            }
-            previous = Path.cwd()
-            try:
-                os.chdir(root)
-                with patch.dict(os.environ, env, clear=True):
-                    prepare.main()
-                plan = json.loads((root / ".ci-request/ci-request.json").read_text())
-                self.assertEqual(plan["repo"], REPO)
-                self.assertIn("plan_digest=", (root / "outputs.txt").read_text())
-            finally:
-                os.chdir(previous)
 
     def test_control_entrypoints_reject_other_repositories_before_io(self):
         for module in (prepare, waiter):

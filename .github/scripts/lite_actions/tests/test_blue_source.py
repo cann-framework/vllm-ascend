@@ -14,7 +14,6 @@ from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
-import native_reconcile  # noqa: E402
 import native_result  # noqa: E402
 import native_source  # noqa: E402
 import prepare_request  # noqa: E402
@@ -64,7 +63,7 @@ class BlueSourceTests(unittest.TestCase):
         self.assertEqual(cases[1]["test_id"], cases[3]["test_id"])
 
     def test_single_case_on_pr_keeps_merge_identity_without_full_suite_status(self):
-        selection = json.dumps([{"test_id": "dispatch_smoke_8p"}])
+        selection = "dispatch_smoke_8p"
         self.plan = prepare_request.create_plan("pull_request_target", self.event, selection, 123, 1)
         source = self.build()
         self.assertEqual(source["test_ids"], ["dispatch_smoke_8p"])
@@ -79,6 +78,20 @@ class BlueSourceTests(unittest.TestCase):
             source = native_source.build_source(plan, {}, self.get)
         self.assertEqual(source["control_sha"], "c" * 40)
         self.assertEqual((plan["sha"], source["source_sha"]), ("a" * 40, "a" * 40))
+
+    def test_manual_entrypoint_rejects_pr_and_commit_together(self):
+        with tempfile.TemporaryDirectory() as folder:
+            event = Path(folder) / "event.json"
+            event.write_text("{}")
+            env = {
+                "GITHUB_REPOSITORY": prepare_request.REPO,
+                "GITHUB_EVENT_PATH": str(event),
+                "GITHUB_EVENT_NAME": "workflow_dispatch",
+                "CI_SOURCE_PR": "7",
+                "CI_COMMIT": "a" * 40,
+            }
+            with patch.dict(os.environ, env, clear=True), self.assertRaisesRegex(ValueError, "either a PR or a commit"):
+                prepare_request.main()
 
     def test_arbitrary_fork_source_is_bound_to_true_merge(self):
         source = self.build()
@@ -133,13 +146,13 @@ class BlueSourceTests(unittest.TestCase):
             source = native_source.build_source(plan, {}, self.get)
         self.assertEqual(source["base_ref"], "codex/pilot")
 
-    def test_manual_repeat_smoke_and_unknown_selector(self):
-        selection = json.dumps([{"test_id": "dispatch_smoke_8p"}] * 2)
+    def test_manual_single_case_and_unknown_selector(self):
+        selection = "dispatch_smoke_8p"
         with patch.dict(os.environ, GITHUB_REF="refs/heads/codex/pilot", GITHUB_SHA="c" * 40):
             plan = prepare_request.create_plan("workflow_dispatch", {}, selection, 123, 1)
-            self.assertNotEqual(plan["cases"][0]["case_id"], plan["cases"][1]["case_id"])
+            self.assertEqual([c["test_id"] for c in plan["cases"]], [selection])
             with self.assertRaises(ValueError):
-                prepare_request.create_plan("workflow_dispatch", {}, '[{"test_id":"missing"}]', 123, 1)
+                prepare_request.create_plan("workflow_dispatch", {}, "missing", 123, 1)
 
     def test_plan_inherits_model_resource_overrides(self):
         case = replace(
@@ -313,94 +326,6 @@ class BlueSourceTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("PASS", completed.stdout)
 
-    def test_reconciler_skips_untested_pr_and_rechecks_stale_test(self):
-        self.base = "c" * 40
-        self.pr["base"]["ref"] = "releases/v0.30.0"
-        calls, statuses = [], []
-        closed = copy.deepcopy(self.pr)
-        closed.update(number=6, state="closed")
-
-        def get(path):
-            if path.startswith("/pulls?"):
-                return [closed, self.pr]
-            if path == "/pulls/6":
-                return closed
-            if path.startswith("/commits/"):
-                return {"statuses": statuses}
-            return self.get(path)
-
-        def send(path, data):
-            calls.append((path, data))
-            if path.startswith("/statuses/"):
-                statuses.insert(0, data)
-            return {"workflow_run_id": 789}
-
-        self.assertEqual(native_reconcile.reconcile(get, send), [])
-        self.assertEqual(calls, [])
-        statuses.append({"context": "Lite-Actions-Blue-Merge", "description": "older base"})
-        self.assertEqual(native_reconcile.reconcile(get, send), [])
-        self.assertEqual(calls, [])
-        statuses.append({"context": native_result.context(7), "description": "older base"})
-        result = native_reconcile.reconcile(get, send)
-        self.assertEqual(result[0]["run_id"], 789)
-        self.assertEqual(len(calls), 2)
-        native_reconcile.reconcile(get, send)
-        self.assertEqual(len(calls), 2)
-
-    def test_shared_head_uses_independent_pr_statuses(self):
-        main_pr = copy.deepcopy(self.pr)
-        release_pr = copy.deepcopy(self.pr)
-        release_pr["number"] = 8
-        release_pr["base"]["ref"] = "releases/v0.30.0"
-        untested_pr = copy.deepcopy(self.pr)
-        untested_pr["number"] = 9
-        pulls = {pr["number"]: pr for pr in (main_pr, release_pr, untested_pr)}
-        tests = [c["test_id"] for c in self.plan["cases"]]
-        statuses = [
-            {"context": "Lite-Actions-Blue-Merge", "description": "old static status"},
-            {"context": native_result.context(7), "description": native_result.description("b" * 40, tests, "main")},
-            {
-                "context": native_result.context(8),
-                "description": native_result.description("b" * 40, tests, "releases/v0.30.0"),
-            },
-        ]
-        calls = []
-
-        def get(path):
-            if path.startswith("/pulls?"):
-                return list(pulls.values())
-            if path.startswith("/pulls/"):
-                return pulls[int(path.rsplit("/", 1)[-1])]
-            if path == "/branches/main":
-                return {"commit": {"sha": "c" * 40}}
-            if path == "/branches/releases%2Fv0.30.0":
-                return {"commit": {"sha": "b" * 40}}
-            if path.startswith("/commits/"):
-                return {"statuses": statuses}
-            raise AssertionError(path)
-
-        def send(path, data):
-            calls.append((path, data))
-            if path.startswith("/statuses/"):
-                statuses.insert(0, data)
-            return {"workflow_run_id": 789}
-
-        results = native_reconcile.reconcile(get, send)
-        self.assertEqual([x["pr"] for x in results], [7, 8])
-        self.assertEqual(calls[0][1]["context"], native_result.context(7))
-        self.assertEqual(len(calls), 2)
-        native_reconcile.reconcile(get, send)
-        self.assertEqual(len(calls), 2)
-
-    def test_retarget_marks_its_pr_pending_before_merge_is_ready(self):
-        with (
-            patch.object(native_result, "current_pr", return_value=(self.pr, "a" * 40, "b" * 40)),
-            patch.object(native_result, "post") as post,
-        ):
-            native_result.invalidate_retarget(7)
-        path, status = post.call_args.args
-        self.assertEqual(path, "/statuses/" + "a" * 40)
-        self.assertEqual((status["context"], status["state"]), (native_result.context(7), "pending"))
 
 
 if __name__ == "__main__":

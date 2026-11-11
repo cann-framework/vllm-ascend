@@ -8,7 +8,7 @@ import urllib.request
 from pathlib import Path
 
 from blue_catalog import BLUE_SMOKE_SUITE
-from native_source import REPO, api, assert_current, current_pr
+from native_source import REPO, api, assert_current
 
 
 def context(pr_number):
@@ -79,31 +79,11 @@ def publish(source, state):
     )
 
 
-def invalidate_retarget(number):
-    pr, head, base = current_pr(number)
-    post(
-        "/statuses/" + head,
-        {
-            "state": "pending",
-            "context": context(number),
-            "description": description(base, list(BLUE_SMOKE_SUITE), pr["base"]["ref"]),
-            "target_url": f"https://github.com/{REPO}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
-        },
-    )
-
-
 def main():
     p = argparse.ArgumentParser()
-    source_arg = p.add_mutually_exclusive_group(required=True)
-    source_arg.add_argument("--source", type=Path)
-    source_arg.add_argument("--pending-pr", type=int)
+    p.add_argument("--source", type=Path, required=True)
     p.add_argument("--state", choices=("pending", "success", "failure"), required=True)
     a = p.parse_args()
-    if a.pending_pr is not None:
-        if a.state != "pending":
-            p.error("--pending-pr requires pending state")
-        invalidate_retarget(a.pending_pr)
-        return
     source = json.loads(a.source.read_text())
     if (
         source.get("repository") != REPO
