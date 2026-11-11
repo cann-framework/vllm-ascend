@@ -10,7 +10,7 @@ from pathlib import Path
 from blue_catalog import BLUE_CASES, BLUE_DEFAULTS, BLUE_SMOKE_SUITE
 
 REPO = "cann-framework/vllm-ascend"
-WORKFLOW = "lite_actions_dispatcher_smoke.yml"
+WORKFLOW = "lite-ci-dispatcher-smoke.yml"
 A5_CASES = {"dispatch_smoke_a5_8p": (1, 8, 120), "dispatch_smoke_a5_32p": (4, 8, 240)}
 CASES = {**A5_CASES, **BLUE_CASES}
 DEFAULTS = dict(worker="yellow", target_pool="a5_shared_yellow", docker="vllm-kimi-wangjinyin")

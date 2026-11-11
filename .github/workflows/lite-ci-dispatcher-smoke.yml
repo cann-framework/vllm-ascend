@@ -1,6 +1,5 @@
-name: Dispatcher-Smoke
-run-name: >-
-  ${{ inputs.pr && format('lite-vllm-recheck-{0}-{1}-00000000000000000000000000000000', inputs.pr, github.workflow_sha) || (inputs.commit && format('lite-vllm-commit-{0}-{1}', inputs.commit, github.workflow_sha)) || format('lite-vllm-manual-{0}', github.workflow_sha) }}
+name: lite-ci-dispatcher-smoke
+run-name: lite-ci-dispatcher-smoke
 
 on:
   workflow_dispatch:
@@ -99,7 +98,7 @@ jobs:
           CI_RESULT_AUTHOR: ${{ vars.LITE_CI_RESULT_ACTOR || 'depeng1994' }}
           CI_PLAN_DIGEST: ${{ needs.prepare.outputs.plan_digest }}
           CI_CASE: ${{ toJSON(matrix) }}
-          CI_WORKFLOW: lite_actions_dispatcher_smoke.yml
+          CI_WORKFLOW: lite-ci-dispatcher-smoke.yml
           CI_NATIVE_SOURCE: ${{ needs.prepare.outputs.native_source == 'true' && '.ci-source/source.json' || '' }}
         run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/wait_result.py
 
