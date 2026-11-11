@@ -15,8 +15,6 @@ SMOKE_DEFAULTS = {
 
 SMOKE_PROFILES = {
     "dispatch_smoke": [
-        "worker_os_blue",
-        # "worker_os_yellow",  # Enable when the Yellow worker is ready.
         "dispatch_smoke_8p",
         "dispatch_smoke_16p",
         "dispatch_smoke_8p",
@@ -25,18 +23,6 @@ SMOKE_PROFILES = {
 
 
 def build_smoke_list() -> list[OverrideDefinitions]:
-    def worker_os(worker: str) -> OverrideDefinitions:
-        return OverrideDefinitions(
-            test_name=f"worker_os_{worker}",
-            test_descr=f"OS probe on {worker}",
-            ci_kind="worker_probe",
-            ci_overrides={"worker": worker},
-            nnodes=0,
-            ngpu=0,
-            timeout=90,
-            check_loss=False,
-        )
-
     def npu_smoke(nodes: int) -> OverrideDefinitions:
         return OverrideDefinitions(
             test_name=f"dispatch_smoke_{nodes * 8}p",
@@ -50,8 +36,6 @@ def build_smoke_list() -> list[OverrideDefinitions]:
         )
 
     return [
-        worker_os("blue"),
-        worker_os("yellow"),
         npu_smoke(1),
         npu_smoke(2),
     ]
