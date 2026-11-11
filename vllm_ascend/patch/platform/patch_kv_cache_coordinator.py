@@ -206,11 +206,23 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 for g in kv_cache_config.kv_cache_groups
                 if is_prefix_cacheable(g.kv_cache_spec)
             ), "block_size must be divisible by hash_block_size"
-        self.enable_partial_hash_hits = dcp_world_size == 1 and any(
-            isinstance(g.kv_cache_spec, MambaSpec)
-            and g.kv_cache_spec.mamba_cache_mode == "align"
-            and g.kv_cache_spec.block_size > hash_block_size
-            for g in kv_cache_config.kv_cache_groups
+        # SWA needs whole-block hits. Fine hashing does not imply that every
+        # manager supports partial blocks (for example, Kimi + SWA draft).
+        # Unwrap v0.30's uniform group containers before checking the manager
+        # type; older vLLM revisions pass the concrete spec directly.
+        group_specs = tuple(_manager_spec(g.kv_cache_spec) for g in kv_cache_config.kv_cache_groups)
+        self.enable_partial_hash_hits = (
+            dcp_world_size == 1
+            and all(
+                isinstance(spec, (FullAttentionSpec, MambaSpec))
+                for spec in group_specs
+            )
+            and any(
+                isinstance(spec, MambaSpec)
+                and spec.mamba_cache_mode == "align"
+                and spec.block_size > hash_block_size
+                for spec in group_specs
+            )
         )
         self.verify_and_split_kv_cache_groups()
 

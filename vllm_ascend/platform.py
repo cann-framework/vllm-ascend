@@ -1787,6 +1787,14 @@ def _validate_draft_decode_context_parallel_config(vllm_config: VllmConfig) -> N
         _validate_model_pcp_dcp_config(draft_model_config, pcp_size, decode_context_parallel_size)
         return
 
+    # Ascend's DSpark proposer and attention backend use their own DCP
+    # metadata/slot mapping.  The generic GQA/MQA check below describes the
+    # ordinary head-sharding topology and rejects valid DSpark configurations
+    # such as TP8 with 16 KV heads and DCP8.  Keep the PCP/DCP stacking check
+    # above intact when PCP is enabled.
+    if getattr(speculative_config, "method", None) == "dspark":
+        return
+
     draft_parallel_config = speculative_config.draft_parallel_config
     if draft_parallel_config is not None:
         draft_tensor_parallel_size = draft_parallel_config.tensor_parallel_size
