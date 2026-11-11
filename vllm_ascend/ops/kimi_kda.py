@@ -65,13 +65,14 @@ from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import (
     AscendW8A8MXFP8DynamicLinearMethod,
 )
-from vllm_ascend.utils import npu_stream_switch, shared_experts_calculation_stream
+from vllm_ascend.utils import npu_stream_switch
 
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
 _F_PROJ_SHARD_ID = 1
 _MEGA_KDA_MAX_BATCH_MULTIPLIER = 32
 _MEGA_KDA_CACHE_ALIGNMENT_BYTES = 16
 _KDA_BFG_STREAM: torch.npu.Stream | None = None
+_MEGA_KDA_COMMIT_STREAM: torch.npu.Stream | None = None
 
 
 def _ascend_kda_forward(
@@ -116,6 +117,23 @@ def _kda_bfg_stream() -> torch.npu.Stream:
     if _KDA_BFG_STREAM is None:
         _KDA_BFG_STREAM = torch_npu.npu.Stream()
     return _KDA_BFG_STREAM
+
+
+def _mega_kda_commit_stream() -> torch.npu.Stream:
+    """Dedicated ReplaySSM commit stream, independent of the shared-expert stream.
+
+    The commit overlap is owned by enable_mega_kda_replayssm alone, so it must
+    not share a queue with the MoE shared-expert multistream: attention-phase
+    commit work and MLP-phase shared-expert work would otherwise serialize on
+    one stream and break both features' intended overlap windows. A dedicated
+    stream also keeps the commit operator's AIC quota selection (resolved from
+    the current stream) decoupled from any limits set on the shared-expert
+    stream.
+    """
+    global _MEGA_KDA_COMMIT_STREAM
+    if _MEGA_KDA_COMMIT_STREAM is None:
+        _MEGA_KDA_COMMIT_STREAM = torch_npu.npu.Stream()
+    return _MEGA_KDA_COMMIT_STREAM
 
 
 class _KDAFusedBFGLinear(MergedColumnParallelLinear):
@@ -394,9 +412,10 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             raise ValueError("enable_mega_kda_replayssm requires VLLM_USE_V2_MODEL_RUNNER=1")
         self._mega_operator = load_mega_kda_operator() if self.use_mega_kda_replayssm else None
         self._commit_operator = load_commit_recurrent_kda_operator() if self.use_mega_kda_replayssm else None
-        self.overlap_mega_kda_commit = (
-            self.use_mega_kda_replayssm and get_ascend_config().multistream_overlap_shared_expert
-        )
+        # Commit multistream is owned by ReplaySSM alone and deliberately
+        # independent of multistream_overlap_shared_expert: the MoE switch
+        # keeps its own stream, and commit runs on _mega_kda_commit_stream().
+        self.overlap_mega_kda_commit = self.use_mega_kda_replayssm
         quant_config = getattr(vllm_config, "quant_config", None)
         uses_mixed_projection = bool(
             quant_config is not None
@@ -591,7 +610,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         # Publish metadata and any connector/align copies BEFORE AllGather.
         # Only Commit moves to the auxiliary stream; all HCCL calls stay on
         # their original stream, in the original order.
-        stream = shared_experts_calculation_stream() if commit_async else None
+        stream = _mega_kda_commit_stream() if commit_async else None
         ready = torch.npu.current_stream().record_event() if commit_async else None
         with npu_stream_switch(stream, enabled=commit_async):
             if ready is not None:

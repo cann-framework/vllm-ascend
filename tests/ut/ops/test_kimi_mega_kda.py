@@ -323,7 +323,7 @@ def test_commit_and_all_gather_event_order(runtime, monkeypatch, gather_input, f
     main.record_event.return_value = "ready"
     auxiliary.record_event.return_value = "done"
     monkeypatch.setattr(torch, "npu", SimpleNamespace(current_stream=lambda: main), raising=False)
-    runtime["shared_experts_calculation_stream"] = lambda: auxiliary
+    runtime["_mega_kda_commit_stream"] = lambda: auxiliary
     runtime["npu_stream_switch"] = MagicMock(return_value=nullcontext())
     layer = _replay_layer(runtime)
     metadata = _metadata()
