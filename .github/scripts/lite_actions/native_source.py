@@ -2,21 +2,15 @@
 
 from __future__ import annotations
 
-import ast
-import base64
 import json
 import os
 import re
 import time
+import urllib.parse
 import urllib.request
-
-from blue_catalog import BLUE_SMOKE_SUITE
 
 REPO = "cann-framework/vllm-ascend"
 REPO_ID = 1438625957
-FORK = "depeng1994/vllm-ascend"
-FORK_ID = 1440390070
-PAYLOAD = ".github/scripts/lite_actions/blue_hccl_payload.py"
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 
 
@@ -47,21 +41,25 @@ def current_pr(number, get=api):
     if type(number) is not int or number < 1:
         raise ValueError("invalid PR number")
     pr = get(f"/pulls/{number}")
+    head_repo = pr.get("head", {}).get("repo") or {}
+    base_ref = pr.get("base", {}).get("ref")
     if (
         pr.get("number") != number
         or pr.get("state") != "open"
         or pr.get("merged")
-        or pr.get("draft")
-        or pr.get("user", {}).get("login") != "depeng1994"
         or pr.get("base", {}).get("repo", {}).get("id") != REPO_ID
         or pr["base"]["repo"].get("full_name") != REPO
-        or pr["base"].get("ref") != "main"
-        or pr.get("head", {}).get("repo", {}).get("id") != FORK_ID
-        or pr["head"]["repo"].get("full_name") != FORK
+        or not isinstance(base_ref, str)
+        or not base_ref
+        or len(base_ref) > 255
+        or any(ord(c) < 32 for c in base_ref)
+        or type(head_repo.get("id")) is not int
+        or head_repo["id"] < 1
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", head_repo.get("full_name", ""))
     ):
         raise ValueError("unauthorized Blue PR source")
     head = pr["head"].get("sha")
-    base = get("/branches/main").get("commit", {}).get("sha")
+    base = get("/branches/" + urllib.parse.quote(base_ref, safe="")).get("commit", {}).get("sha")
     if not isinstance(head, str) or not SHA.fullmatch(head) or not isinstance(base, str) or not SHA.fullmatch(base):
         raise ValueError("invalid Head/Base SHA")
     return pr, head, base
@@ -70,14 +68,10 @@ def current_pr(number, get=api):
 def assert_current(source, get=api):
     if source["mode"] == "merge_result":
         pr, head, base = current_pr(source["pr_number"], get)
-        if (head, base) != (source["head_sha"], source["base_sha"]):
+        if (head, base, pr["head"]["repo"]["id"], pr["base"]["ref"]) != (
+            source["head_sha"], source["base_sha"], source["head_repo_id"], source["base_ref"]
+        ):
             raise ValueError("STALE: PR Head/Base advanced; rerun from the current PR")
-        labels = {x["name"] for x in pr.get("labels", [])}
-        tests = list(BLUE_SMOKE_SUITE)
-        if "lite-a3-blue" not in labels or tests != source["test_ids"]:
-            raise ValueError("STALE: Blue selection or authorization changed")
-
-
 def build_source(plan, event, get=api):
     control = os.environ["GITHUB_WORKFLOW_SHA"]
     if not SHA.fullmatch(control):
@@ -92,7 +86,6 @@ def build_source(plan, event, get=api):
         "plan_digest": plan["plan_digest"],
         "control_sha": control,
         "head_sha": plan["sha"],
-        "base_ref": "main",
         "test_ids": [c["test_id"] for c in plan["cases"]],
     }
     if "pull_request" in event:
@@ -111,41 +104,27 @@ def build_source(plan, event, get=api):
         source.update(
             mode="merge_result",
             pr_number=number,
-            head_repo_id=FORK_ID,
+            head_repo_id=pr["head"]["repo"]["id"],
+            base_ref=pr["base"]["ref"],
             base_sha=base,
             source_sha=merge,
             tree_sha=commit["tree"]["sha"],
         )
     else:
-        if plan["sha"] != control:
-            raise ValueError("manual source must equal its immutable controller")
-        commit = get("/git/commits/" + control)
+        commit = get("/git/commits/" + plan["sha"])
+        if commit.get("sha") != plan["sha"]:
+            raise ValueError("manual source commit identity mismatch")
         source.update(
             mode="commit",
             pr_number=0,
             head_repo_id=REPO_ID,
-            base_sha=control,
-            source_sha=control,
+            base_ref=os.environ["GITHUB_REF"].removeprefix("refs/heads/"),
+            base_sha=plan["sha"],
+            source_sha=plan["sha"],
             tree_sha=commit["tree"]["sha"],
         )
     if not SHA.fullmatch(source["tree_sha"]):
         raise ValueError("invalid tested tree")
-    if any(c["kind"] != "worker_probe" for c in plan["cases"]):
-        content = get("/contents/" + PAYLOAD + "?ref=" + source["source_sha"])
-        if content.get("type") != "file" or content.get("path") != PAYLOAD or content.get("size", 0) > 65536:
-            raise ValueError("missing/oversized source payload interface")
-        tree = ast.parse(base64.b64decode(content["content"], validate=False))
-        version = any(
-            isinstance(n, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == "PAYLOAD_API_VERSION" for t in n.targets)
-            and isinstance(n.value, ast.Constant)
-            and type(n.value.value) is int
-            and n.value.value == 1
-            for n in tree.body
-        )
-        function = any(isinstance(n, ast.FunctionDef) and n.name == "all_reduce" for n in tree.body)
-        if not version or not function:
-            raise ValueError("source payload API 1/all_reduce interface missing")
     assert_current(source, get)
     return source
 

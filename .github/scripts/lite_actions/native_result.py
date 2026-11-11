@@ -7,14 +7,19 @@ import os
 import urllib.request
 from pathlib import Path
 
+from blue_catalog import BLUE_SMOKE_SUITE
 from native_source import REPO, api, assert_current
 
-CONTEXT = "Lite-Actions-Blue-Merge"
+
+def context(pr_number):
+    if type(pr_number) is not int or pr_number < 1:
+        raise ValueError("invalid PR number")
+    return f"Lite-Actions-Blue-Merge-PR-{pr_number}"
 
 
-def description(base_sha, test_ids):
+def description(base_sha, test_ids, base_ref):
     spec = hashlib.sha256(
-        json.dumps(test_ids, separators=(",", ":")).encode()
+        json.dumps([base_ref, test_ids], separators=(",", ":")).encode()
     ).hexdigest()[:12]
     return f"Versioned test B={base_sha} S={spec}; not atomic merge permission"
 
@@ -52,6 +57,8 @@ def publish(source, state):
         raise ValueError("invalid test state")
     if source["mode"] != "merge_result":
         return
+    if source["test_ids"] != list(BLUE_SMOKE_SUITE):
+        return  # A single selected case must not publish a full-suite status.
     assert_current(source)
     run = api(f"/actions/runs/{source['run_id']}")
     if (
@@ -65,8 +72,8 @@ def publish(source, state):
         "/statuses/" + source["head_sha"],
         {
             "state": state,
-            "context": CONTEXT,
-            "description": description(source["base_sha"], source["test_ids"]),
+            "context": context(source["pr_number"]),
+            "description": description(source["base_sha"], source["test_ids"], source["base_ref"]),
             "target_url": f"https://github.com/{REPO}/actions/runs/{source['run_id']}/attempts/{source['attempt']}",
         },
     )
