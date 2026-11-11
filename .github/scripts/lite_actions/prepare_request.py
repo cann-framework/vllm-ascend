@@ -28,22 +28,21 @@ def selectors(event, payload, value):
         ):
             raise ValueError("invalid PR source or target repository")
         sha = head["sha"]
-        ids = list(BLUE_SMOKE_SUITE)
     elif event == "workflow_dispatch":
         if not os.environ.get("GITHUB_REF", "").startswith("refs/heads/"):
             raise ValueError("manual run requires a branch")
-        sha = os.environ["GITHUB_SHA"]
-        if not value:
-            ids = list(BLUE_SMOKE_SUITE)
-        else:
-            values = json.loads(value)
-            if not isinstance(values, list) or not 1 <= len(values) <= 256:
-                raise ValueError("invalid smoke test selection")
-            if any(not isinstance(x, dict) or set(x) != {"test_id"} for x in values):
-                raise ValueError("only fixed test_id selectors supported")
-            ids = [x["test_id"] for x in values]
+        sha = os.environ.get("CI_COMMIT") or os.environ["GITHUB_SHA"]
     else:
         raise ValueError("unsupported GitHub event")
+    if not value:
+        ids = list(BLUE_SMOKE_SUITE)
+    else:
+        values = json.loads(value)
+        if not isinstance(values, list) or not 1 <= len(values) <= 256:
+            raise ValueError("invalid smoke test selection")
+        if any(not isinstance(x, dict) or set(x) != {"test_id"} for x in values):
+            raise ValueError("only fixed test_id selectors supported")
+        ids = [x["test_id"] for x in values]
     if not isinstance(sha, str) or not re.fullmatch("[0-9a-f]{40}", sha):
         raise ValueError("invalid source SHA")
     if not ids or len(ids) > 256 or any(x not in CASES for x in ids):
@@ -110,23 +109,25 @@ def main():
     payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     effective_event = os.environ["GITHUB_EVENT_NAME"]
     source_pr = os.environ.get("CI_SOURCE_PR", "")
+    commit = os.environ.get("CI_COMMIT", "")
+    test_case = os.environ.get("CI_TEST_CASE", "")
+    if source_pr and commit:
+        raise ValueError("choose either a PR or a commit")
+    if test_case and test_case not in BLUE_SMOKE_SUITE:
+        raise ValueError("unknown dispatch Smoke case")
     if source_pr:
         if effective_event != "workflow_dispatch" or not re.fullmatch(r"[1-9][0-9]{0,8}", source_pr):
             raise ValueError("invalid native PR recheck")
         from native_source import current_pr
 
-        pr, head, base = current_pr(int(source_pr))
-        if (head, base) != (
-            os.environ.get("CI_EXPECTED_HEAD"),
-            os.environ.get("CI_EXPECTED_BASE"),
-        ):
-            raise ValueError("STALE_RECHECK_INTENT")
+        pr, _, _ = current_pr(int(source_pr))
         payload = {"pull_request": pr}
         effective_event = "pull_request_target"
+    selection = json.dumps([{"test_id": test_case}]) if test_case else os.environ.get("CI_TEST_CASES", "")
     plan = create_plan(
         effective_event,
         payload,
-        os.environ.get("CI_TEST_CASES", ""),
+        selection,
         int(os.environ["GITHUB_RUN_ID"]),
         int(os.environ["GITHUB_RUN_ATTEMPT"]),
     )

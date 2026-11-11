@@ -57,6 +57,8 @@ def publish(source, state):
         raise ValueError("invalid test state")
     if source["mode"] != "merge_result":
         return
+    if source["test_ids"] != list(BLUE_SMOKE_SUITE):
+        return  # A single selected case must not publish a full-suite status.
     assert_current(source)
     run = api(f"/actions/runs/{source['run_id']}")
     if (

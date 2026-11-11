@@ -1,30 +1,20 @@
 name: Dispatcher-Smoke
 run-name: >-
-  ${{ github.event_name == 'pull_request_target' && format('lite-vllm-pr-{0}-{1}-{2}', github.event.pull_request.number, github.event.pull_request.head.sha, github.workflow_sha) || (inputs.source_pr && format('lite-vllm-recheck-{0}-{1}-{2}', inputs.source_pr, github.workflow_sha, inputs.bridge_nonce)) || format('lite-vllm-manual-{0}', github.workflow_sha) }}
+  ${{ inputs.pr && format('lite-vllm-recheck-{0}-{1}-00000000000000000000000000000000', inputs.pr, github.workflow_sha) || (inputs.commit && format('lite-vllm-commit-{0}-{1}', inputs.commit, github.workflow_sha)) || format('lite-vllm-manual-{0}', github.workflow_sha) }}
 
 on:
-  pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review, edited]
   workflow_dispatch:
     inputs:
-      test_cases:
-        description: 'JSON test_id selectors; empty runs the shared Blue Smoke suite'
+      test_case:
+        description: 'Optional test ID; leave empty to run all dispatch Smoke cases'
         required: false
         type: string
-      source_pr:
-        description: 'Trusted Blue reconciler PR number; leave empty for a commit smoke'
+      pr:
+        description: 'Optional PR number; tests its verified merge commit'
         required: false
         type: string
-      expected_head_sha:
-        description: 'Exact expected Head for a Blue PR recheck'
-        required: false
-        type: string
-      expected_base_sha:
-        description: 'Exact expected Base for a Blue PR recheck'
-        required: false
-        type: string
-      bridge_nonce:
-        description: '32-character trusted recheck intent digest'
+      commit:
+        description: 'Optional full commit SHA; empty uses the selected branch latest commit'
         required: false
         type: string
 
@@ -36,15 +26,13 @@ permissions:
 
 concurrency:
   group: >-
-    ${{ github.event_name == 'pull_request_target' && github.event.action == 'edited' && !github.event.changes.base.ref.from && format('lite-vllm-ignored-{0}', github.run_id) || format('lite-vllm-{0}', github.event.pull_request.number || inputs.source_pr || github.run_id) }}
+    ${{ format('lite-vllm-{0}', inputs.pr || github.run_id) }}
   cancel-in-progress: true
 
 jobs:
   prepare:
     if: >-
-      github.repository == 'cann-framework/vllm-ascend' &&
-      (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request_target') &&
-      (github.event_name != 'pull_request_target' || github.event.action != 'edited' || github.event.changes.base.ref.from)
+      github.repository == 'cann-framework/vllm-ascend'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -58,20 +46,13 @@ jobs:
           repository: cann-framework/vllm-ascend
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
-      - name: Invalidate the previous target result
-        if: github.event_name == 'pull_request_target' && github.event.action == 'edited' && github.event.changes.base.ref.from
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CI_PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/native_result.py --pending-pr "$CI_PR_NUMBER" --state pending
       - name: Create trusted smoke plan and immutable Blue merge source
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
-          CI_TEST_CASES: ${{ inputs.test_cases }}
-          CI_SOURCE_PR: ${{ inputs.source_pr }}
-          CI_EXPECTED_HEAD: ${{ inputs.expected_head_sha }}
-          CI_EXPECTED_BASE: ${{ inputs.expected_base_sha }}
+          CI_TEST_CASE: ${{ inputs.test_case }}
+          CI_SOURCE_PR: ${{ inputs.pr }}
+          CI_COMMIT: ${{ inputs.commit }}
         run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/prepare_request.py
       - name: Publish versioned Blue pending status
         if: steps.plan.outputs.native_source == 'true'

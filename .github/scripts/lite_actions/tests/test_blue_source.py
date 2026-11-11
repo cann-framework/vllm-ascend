@@ -63,6 +63,23 @@ class BlueSourceTests(unittest.TestCase):
         self.assertEqual(len({c["case_id"] for c in cases}), 4)
         self.assertEqual(cases[1]["test_id"], cases[3]["test_id"])
 
+    def test_single_case_on_pr_keeps_merge_identity_without_full_suite_status(self):
+        selection = json.dumps([{"test_id": "dispatch_smoke_8p"}])
+        self.plan = prepare_request.create_plan("pull_request_target", self.event, selection, 123, 1)
+        source = self.build()
+        self.assertEqual(source["test_ids"], ["dispatch_smoke_8p"])
+        self.assertEqual(source["source_sha"], "d" * 40)
+        with patch.object(native_result, "post") as post:
+            native_result.publish(source, "success")
+            post.assert_not_called()
+
+    def test_manual_explicit_commit_is_pinned_separately_from_controller(self):
+        with patch.dict(os.environ, GITHUB_REF="refs/heads/main", GITHUB_SHA="c" * 40, CI_COMMIT="a" * 40):
+            plan = prepare_request.create_plan("workflow_dispatch", {}, "", 123, 1)
+            source = native_source.build_source(plan, {}, self.get)
+        self.assertEqual(source["control_sha"], "c" * 40)
+        self.assertEqual((plan["sha"], source["source_sha"]), ("a" * 40, "a" * 40))
+
     def test_arbitrary_fork_source_is_bound_to_true_merge(self):
         source = self.build()
         self.assertEqual(source["head_repo_id"], 987)
