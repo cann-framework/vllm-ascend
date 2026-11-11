@@ -370,9 +370,23 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             )
         if True in flashmla_choices:
             impl = static_forward_context[layer_names[0]].impl
-            self.flashmla_state = FlashMLAMetadataBuilder(
-                impl, device, scheduler_config.max_num_seqs, self.attn_mask_builder.get_splitfuse_attn_mask()
+            custom_params = getattr(vllm_config.model_config, "custom_params", {}) or {}
+            # The model hook starts the shared build before the layer loop, so
+            # resolving the switch here keeps the operator modules untouched.
+            enable_metadata_stream = bool(
+                get_ascend_config().enable_multi_streams or custom_params.get("enable_multi_streams", False)
             )
+            self.flashmla_state = FlashMLAMetadataBuilder(
+                impl,
+                device,
+                scheduler_config.max_num_seqs,
+                self.attn_mask_builder.get_splitfuse_attn_mask(),
+                enable_async=enable_metadata_stream,
+            )
+            # Every layer in the group shares one schedule; expose the builder
+            # so the model-level hook and the decode path can start/wait it.
+            for name in layer_names:
+                static_forward_context[name].impl.flash_mla_metadata_builder = self.flashmla_state
 
     def _build_external_flashmla(self, common_prefix_len, common, *, retain_for_graph: bool = False):
         """Keep FIA prefill metadata, but build decode inputs from device state."""
@@ -1056,6 +1070,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.mlapo_weight_quant_mode = 3
         self._mlapo_uses_native_weights = False
         self.use_flashmla: bool = self._can_use_flashmla()
+        self.flash_mla_metadata_builder: FlashMLAMetadataBuilder | None = None
         self._flashmla_writer_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
     def _can_use_flashmla(self) -> bool:
@@ -1079,6 +1094,24 @@ class AscendMLAImpl(MLAAttentionImpl):
         if not supports_component_major_mla_pd(config) or enable_sfa(config):
             return False
         return get_flashmla_ops() is not None
+
+    def start_flash_mla_metadata(self, attn_metadata: M) -> None:
+        """Launch the shared FlashMLA schedule build before the layer loop."""
+        flash = attn_metadata.external_flashmla
+        if flash is None or self.flash_mla_metadata_builder is None:
+            return
+        if _EXTRA_CTX.capturing:
+            # The warmup forward may have recorded an earlier fork/join; the
+            # captured graph needs its own pair inside the capture region.
+            flash.metadata_started = False
+        self.flash_mla_metadata_builder.start_metadata(flash)
+
+    def wait_flash_mla_metadata(self, attn_metadata: M) -> None:
+        """Order this stream after the side-stream FlashMLA schedule build."""
+        flash = attn_metadata.external_flashmla
+        if flash is None or self.flash_mla_metadata_builder is None:
+            return
+        self.flash_mla_metadata_builder.wait_metadata(flash)
 
     @staticmethod
     def update_graph_params(
@@ -3074,6 +3107,11 @@ class AscendMLAImpl(MLAAttentionImpl):
         # so replay reuses its address.
         flash.query[..., : self.kv_lora_rank].copy_(preprocessed.ql_nope)
         flash.query[..., self.kv_lora_rank :].copy_(preprocessed.q_pe)
+        if flash.metadata_async and not flash.metadata_started:
+            # No model-level hook (e.g. a direct caller): start here; the wait
+            # below still orders the operator after the side-stream build.
+            self.start_flash_mla_metadata(metadata)
+        self.wait_flash_mla_metadata(metadata)
         record_attention_compute_start()
         latent, _ = flash.adapter.attention(
             flash.query,

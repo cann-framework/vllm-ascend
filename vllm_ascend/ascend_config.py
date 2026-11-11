@@ -434,6 +434,7 @@ class AscendConfig:
         {
             "refresh": false,
             "enable_cpu_binding": true,
+            "enable_multi_streams": false,
             "multistream_dsv4_dsa_overlap": true,
             "multistream_engram_overlap": true,
             "enable_prefill_mc2": false,
@@ -576,6 +577,11 @@ class AscendConfig:
 
     # ---- user-input switches: bool/int/list/str, auto type validation ----
     enable_cpu_binding: bool = True
+    # Build FlashMLA metadata on a dedicated NPU stream and synchronize it
+    # with the main attention stream. Default False. Full-graph capture records
+    # the stream fork/join inside the graph so replay rebuilds it there; DCP
+    # keeps the synchronous build.
+    enable_multi_streams: bool = False
     multistream_dsv4_dsa_overlap: bool = True
     # Prepare Engram hashes, lookups and DP/TP exchanges on an auxiliary stream;
     # FULL graphs wait on descriptor-specific external events at consumers.
