@@ -200,10 +200,16 @@ class TestDecodeDependencies(unittest.TestCase):
                 self.name = name
 
             def record_event(self):
-                return last[self.name]
+                self.assert_current_stream()
+                return op("record")
 
             def wait_event(self, event):
+                self.assert_current_stream()
                 op("wait", (event,))
+
+            def assert_current_stream(self):
+                if current[0] != self.name:
+                    raise AssertionError(f"Event for {self.name} submitted on {current[0]}")
 
         streams = {name: Stream(name) for name in last}
 
@@ -219,11 +225,13 @@ class TestDecodeDependencies(unittest.TestCase):
         @contextmanager
         def scope(name, enabled):
             if enabled:
+                op("scope_begin")
                 active_scopes.append(name)
             try:
                 yield
             finally:
                 if enabled:
+                    op("scope_end")
                     self.assertEqual(active_scopes.pop(), name)
 
         limits = []
@@ -310,6 +318,8 @@ class TestDecodeDependencies(unittest.TestCase):
                 op("add")
         torch.testing.assert_close(actual, x * 2 + 3)
         self.assertEqual(active_scopes, [])
+        for stream_name in ("shared", "comm"):
+            self.assertEqual(nodes[last[stream_name]][1], "record", stream_name)
 
         for name in ("shared_prepare", "gate_up", "shared_situ", "shared_down", "shared_rs", "add"):
             self.assertEqual(observed_scopes[name], None if superkernel else "unmarked", name)

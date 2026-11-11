@@ -53,14 +53,12 @@ class KimiDecodeSchedule:
             raise RuntimeError("Shared Gate/Up must be submitted at the Dispatch boundary")
         main = torch.npu.current_stream()
         dispatch_done = main.record_event()
-        with (
-            npu_stream_switch(shared_experts_calculation_stream()),
-            moe_superkernel_scope(None, self.enable_superkernel),
-        ):
-            torch.npu.current_stream().wait_event(dispatch_done)
-            # PR51 releases GMM1 after SiTU alone. Keep Down's input
-            # quantization in its registered linear, after GMM1 completes.
-            self.down_input = self.shared.apply_activation(self.submitted.gate_up)
+        with npu_stream_switch(shared_experts_calculation_stream()):
+            with moe_superkernel_scope(None, self.enable_superkernel):
+                torch.npu.current_stream().wait_event(dispatch_done)
+                # PR51 releases GMM1 after SiTU alone. Keep Down's input
+                # quantization in its registered linear, after GMM1 completes.
+                self.down_input = self.shared.apply_activation(self.submitted.gate_up)
             activation_done = torch.npu.current_stream().record_event()
         # Both BF16 and MXFP shared paths release GMM1 only after SiTU.
         main.wait_event(activation_done)
@@ -69,12 +67,10 @@ class KimiDecodeSchedule:
         if self.down_input is None:
             raise RuntimeError("Shared SiTU must be submitted before routed GMM1")
         gmm1_done = torch.npu.current_stream().record_event()
-        with (
-            npu_stream_switch(shared_experts_calculation_stream()),
-            moe_superkernel_scope(None, self.enable_superkernel),
-        ):
-            torch.npu.current_stream().wait_event(gmm1_done)
-            self.output = self.shared.part2(self.submitted.hidden_states, self.down_input)
+        with npu_stream_switch(shared_experts_calculation_stream()):
+            with moe_superkernel_scope(None, self.enable_superkernel):
+                torch.npu.current_stream().wait_event(gmm1_done)
+                self.output = self.shared.part2(self.submitted.hidden_states, self.down_input)
             down_done = torch.npu.current_stream().record_event()
             self.output.record_stream(self.comm_stream)
         # Dedicated communication stream waits only for its producer, never
