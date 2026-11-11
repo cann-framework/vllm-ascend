@@ -207,6 +207,8 @@ class MoECommMethod(ABC):
         if shared_activation_overlap_start_evt is None:
             shared_activation_overlap_start_evt = before_gmm2_evt
 
+        if fused_experts_input.shared_expert_schedule is not None:
+            fused_experts_input.shared_expert_schedule.before_combine()
         before_combine_evt = torch.npu.current_stream().record_event()
         routed_out = self.token_dispatcher.token_combine(
             hidden_states=mlp_output,

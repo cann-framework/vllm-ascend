@@ -84,7 +84,12 @@ these scopes. Other models retain their generic 0.30 policy.
 
 Named scopes cover Router/latent down through routed Combine and latent
 norm/up. Nested exclusions keep shared AllGather, shared ReduceScatter, the
-final join and Add outside fusion. The owning ACL graph is optimized once
+final join and Add outside fusion. Shared Gate/Up, SiTU and Down remain inside
+the named scope. All MoE layers reuse one Router stream per model. Dispatch is
+submitted before shared Gate/Up, which still waits only for dispatch readiness
+and shared input readiness. Shared ReduceScatter is submitted after routed
+GMM2 and before Combine, and waits only for shared Down completion. The owning
+ACL graph is optimized once
 after successful capture with `dcci_disable_on_kernel=[".*"]` and
 `auto_op_parallel=1`; replay never repeats optimization. Capture tracking is
 local to the forward context for V1 and to the owning `UpdatableGraph` capture
@@ -119,20 +124,22 @@ The sequence is:
    TopK may execute. Both branches can overlap AllGather.
 2. Join shared AllGather before submitting routed EP communication, preserving
    0.30's cross-process-group ordering.
-3. Join TopK after latent down and the original MC2 prepare. Submit shared
-   Gate/Up against the event immediately before Dispatch, so Gate/Up and
-   Dispatch share a release point. Gate/Up preparation/quantization remains
-   outside the projection core limit.
+3. Join TopK after latent down and the original MC2 prepare. Record readiness,
+   submit Dispatch, then submit shared Gate/Up against that pre-Dispatch event.
+   Gate/Up and Dispatch share a release point without a completion dependency
+   between them. Gate/Up preparation/quantization remains outside the projection
+   core limit.
 4. Dispatch completion releases shared SiTU.
 5. Shared activation completion releases routed GMM1.
 6. GMM1 completion releases shared Down input quantization and projection, which may overlap routed activation,
    output quantization and GMM2.
-7. Submit shared ReduceScatter on the communication stream, waiting only for
-   shared Down's completion event. It can overlap routed activation, GMM2 and
-   Combine. After latent up, the main stream waits for that invocation's RS
-   completion event before Add.
+7. After submitting routed GMM2, submit shared ReduceScatter on the
+   communication stream, waiting only for shared Down's completion event.
+   It has no device dependency on GMM2 completion and can overlap Combine.
+   After latent up, the main stream waits for that invocation's RS completion
+   event before Add.
 
-Early shared ReduceScatter applies only to the validated MC2 Decode ladder;
+This shared ReduceScatter submission order applies only to the MC2 Decode ladder;
 all other paths retain 0.30's collective ordering. Shared input AllGather still
 joins before routed EP communication. Multi-rank capture/replay must validate
 the new overlap; CPU dependency tests do not establish HCCL deadlock freedom.

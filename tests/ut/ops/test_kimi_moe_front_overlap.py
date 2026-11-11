@@ -272,6 +272,7 @@ class TestKimiFrontOverlap(unittest.TestCase):
             self.assertEqual(graph.nodes[graph.index(name)][0], "shared")
             self.assertIn(ag, graph.ancestors(graph.index(name)))
         self.assertNotIn(graph.index("dispatch"), graph.ancestors(graph.index("shared_gate_up")))
+        self.assertLess(graph.index("dispatch"), graph.index("shared_gate_up"))
         self.assertIn(graph.index("dispatch"), graph.ancestors(graph.index("shared_situ")))
         self.assertIn(graph.index("shared_situ"), graph.ancestors(graph.index("gmm1")))
 
@@ -376,11 +377,18 @@ class TestKimiFrontOverlap(unittest.TestCase):
         layer.moe_config = object()
         layer.shared_activation_overlaps_routed_gmm1 = False
         schedule = NS(
-            before_dispatch=lambda e: (self.assertIs(e, event), order.append("gate_up")),
-            after_dispatch=lambda: order.append("situ"),
+            before_dispatch=lambda e: (self.assertIs(e, event), order.append("dispatch_ready")),
+            after_dispatch=lambda: order.extend(("gate_up", "situ")),
+            before_combine=lambda: order.append("shared_rs"),
         )
         layer.fused_experts(NS(hidden_states=torch.ones(1), shared_expert_schedule=schedule), object())
-        self.assertEqual(order, ["prepare_dispatch", "gate_up", "dispatch", "situ", "gmm", "combine"])
+        self.assertEqual(
+            order,
+            ["prepare_dispatch", "dispatch_ready", "dispatch", "gate_up", "situ", "gmm", "shared_rs", "combine"],
+        )
+        order.clear()
+        layer.fused_experts(NS(hidden_states=torch.ones(1), shared_expert_schedule=None), object())
+        self.assertEqual(order, ["prepare_dispatch", "dispatch", "gmm", "combine"])
 
 
 if __name__ == "__main__":
