@@ -98,7 +98,12 @@ def find_result(
         ref = r.get('attachment_ref')
         if ref is not None:
             log_repo = os.environ.get('LITE_CI_PUBLIC_LOG_REPO', '')
-            url = ref.get('url','') if isinstance(ref,dict) else ''
+            if (not isinstance(ref, dict) or type(ref.get("bytes")) is not int
+                    or ref["bytes"] < 0 or type(ref.get("truncated")) is not bool
+                    or not isinstance(ref.get("url"), str)):
+                invalid = True
+                continue
+            url = ref["url"]
             if not log_repo or not re.fullmatch(r'https://github\.com/' + re.escape(log_repo) + r'/releases/download/[A-Za-z0-9_.-]+/lite-ci-[a-f0-9]{64}\.log', url) or not re.fullmatch(r'[a-f0-9]{64}',str(ref.get('sha256'))):
                 invalid = True
                 continue
@@ -292,7 +297,8 @@ def main():
                     f.write(f"- SHA: `{sha}`\n- Status: **{result['status']}**\n")
                     if result.get('attachment_ref'):
                         ref=result['attachment_ref']
-                        f.write(f"- [Public diagnostic log]({ref['url']}) · SHA-256 `{ref['sha256']}`\n")
+                        f.write(f"- [Public diagnostic log]({ref['url']}) · bytes={ref['bytes']} · "
+                                f"truncated={str(ref['truncated']).lower()} · SHA-256 `{ref['sha256']}`\n")
                     if native_source is not None:
                         f.write(
                             "- Test source: `"

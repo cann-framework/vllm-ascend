@@ -311,6 +311,8 @@ class BlueSourceTests(unittest.TestCase):
             last_20_lines=[],
             native_source=source,
         )
+        result["attachment_ref"] = {"url": "https://github.com/example/logs/releases/download/test/lite-ci-" + "a"*64 + ".log",
+                                    "sha256": "b"*64, "bytes": 4194304, "truncated": True}
         comments = [{"user": {"login": "worker"}, "body": f"Lite-CI-V3 123:1:{case['case_id']}\n" + json.dumps(result)}]
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
@@ -338,6 +340,8 @@ class BlueSourceTests(unittest.TestCase):
                 CI_WORKFLOW=prepare_request.WORKFLOW,
                 CI_NATIVE_SOURCE=str(folder / "source.json"),
                 GH_TOKEN="fake",
+                GITHUB_STEP_SUMMARY=str(folder / "summary"),
+                LITE_CI_PUBLIC_LOG_REPO="example/logs",
                 MOCK_RESPONSES=json.dumps(
                     {"artifacts": {"artifacts": [{"name": "lite-ci-request-1"}]}, "comments": comments}
                 ),
@@ -352,6 +356,11 @@ class BlueSourceTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("PASS", completed.stdout)
+            summary = (folder / "summary").read_text()
+            self.assertIn("bytes=4194304", summary)
+            self.assertIn("truncated=true", summary)
+            self.assertIn(result["attachment_ref"]["url"], summary)
+            self.assertIn(result["attachment_ref"]["sha256"], summary)
 
 
 
