@@ -7,7 +7,9 @@
 """Consume only identity-matched results; never upload training logs."""
 
 import datetime as dt
+import hashlib
 import json
+import re
 import os
 import time
 import urllib.error
@@ -78,33 +80,37 @@ def find_result(
         if any(k not in r or not same_json_value(r[k], v) for k, v in expected.items()):
             invalid = True
             continue
-        if native_source is not None and not same_json_value(r.get("native_source"), native_source):
+        if native_source is not None:
+            source_digest = hashlib.sha256(json.dumps(native_source, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+            if "native_source" in r and not same_json_value(r["native_source"], native_source):
+                invalid = True
+                continue
+            if "source_digest" in r and r["source_digest"] != source_digest:
+                invalid = True
+                continue
+            if not ({"native_source", "source_digest"} & r.keys()):
+                invalid = True
+                continue
+        lines = r.get("diagnostics", r.get("last_20_lines"))
+        if not isinstance(r.get("status"),str) or r.get("status") not in STATUS or not isinstance(lines,list) or any(not isinstance(x,str) for x in lines):
             invalid = True
             continue
-        lines = r.get("last_20_lines")
-        if (
-            not isinstance(r.get("status"), str)
-            or r.get("status") not in STATUS
-            or not isinstance(lines, list)
-            or len(lines) > 20
-            or any(
-                not isinstance(s, str) or len(s) > 180 or any(ord(c) < 32 for c in s)
-                for s in lines
-            )
-        ):
-            invalid = True
-            continue
+        ref = r.get('attachment_ref')
+        if ref is not None:
+            log_repo = os.environ.get('LITE_CI_PUBLIC_LOG_REPO', '')
+            if (not isinstance(ref, dict) or type(ref.get("bytes")) is not int
+                    or ref["bytes"] < 0 or type(ref.get("truncated")) is not bool
+                    or not isinstance(ref.get("url"), str)):
+                invalid = True
+                continue
+            url = ref["url"]
+            if not log_repo or not re.fullmatch(r'https://github\.com/' + re.escape(log_repo) + r'/releases/download/[A-Za-z0-9_.-]+/lite-ci-[a-f0-9]{64}\.log', url) or not re.fullmatch(r'[a-f0-9]{64}',str(ref.get('sha256'))):
+                invalid = True
+                continue
         if r["status"] == "PASS" and (
             type(r.get("exit_code")) is not int
             or r["exit_code"] != 0
             or r.get("cleanup_verified") is not True
-        ):
-            invalid = True
-            continue
-        if (
-            len(c["body"].encode()) > 6100
-            or len(json.dumps({"body": c["body"]}, separators=(",", ":")).encode())
-            > 7000
         ):
             invalid = True
             continue
@@ -277,14 +283,22 @@ def main():
             print(
                 f"CASE {item['test_id']}: {result['status']} rc={result['exit_code']}"
             )
-            for line in result["last_20_lines"]:
-                print(line)
+            for line in result.get('diagnostics',result.get('last_20_lines',[])):
+                print('LOG '+json.dumps(line,ensure_ascii=True))
+            if 'log_locator' in result:
+                print('FULL_LOG '+json.dumps(result['log_locator'],ensure_ascii=True))
+            if result.get('attachment_status') == 'unavailable':
+                print('Diagnostic attachment unavailable; see the internal full-log locator.')
             if os.environ.get("GITHUB_STEP_SUMMARY"):
                 with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
                     f.write("### " + item["test_id"] + "\n\n")
                     for k in ["worker", "target_pool", "docker", "resources"]:
                         f.write(f"- {k}: `{item[k]}`\n")
                     f.write(f"- SHA: `{sha}`\n- Status: **{result['status']}**\n")
+                    if result.get('attachment_ref'):
+                        ref=result['attachment_ref']
+                        f.write(f"- [Public diagnostic log]({ref['url']}) · bytes={ref['bytes']} · "
+                                f"truncated={str(ref['truncated']).lower()} · SHA-256 `{ref['sha256']}`\n")
                     if native_source is not None:
                         f.write(
                             "- Test source: `"

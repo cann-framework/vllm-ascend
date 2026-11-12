@@ -53,8 +53,8 @@ def create_plan(event, payload, value, run_id, attempt):
         overrides = test.ci_overrides or {}
         if not isinstance(overrides, dict) or set(overrides) - {"worker", "target_pool", "docker"}:
             raise ValueError("unknown case override")
-        if kind == "worker_probe" and set(overrides) & {"target_pool", "docker"}:
-            raise ValueError("probe cannot request resources")
+        if kind != "npu_smoke":
+            raise ValueError("model plans may only request NPU smoke")
         config = {**defaults, **overrides}
         items.append(
             {
@@ -64,9 +64,9 @@ def create_plan(event, payload, value, run_id, attempt):
                 "label": label,
                 "kind": kind,
                 "worker": config["worker"],
-                "target_pool": config["target_pool"] if kind != "worker_probe" else None,
+                "target_pool": config["target_pool"],
                 "resources": {"nodes": nodes, "devices_per_node": ngpu},
-                "docker": config["docker"] if kind != "worker_probe" else None,
+                "docker": config["docker"],
                 "execution_timeout_seconds": timeout,
             }
         )

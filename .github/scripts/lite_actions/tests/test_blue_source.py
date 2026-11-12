@@ -56,11 +56,11 @@ class BlueSourceTests(unittest.TestCase):
         cases = self.plan["cases"]
         self.assertEqual(
             [c["test_id"] for c in cases],
-            ["worker_os_blue", "dispatch_smoke_8p", "dispatch_smoke_16p", "dispatch_smoke_8p"],
+            ["dispatch_smoke_8p", "dispatch_smoke_16p", "dispatch_smoke_8p"],
         )
-        self.assertEqual([c["resources"]["nodes"] for c in cases], [0, 1, 2, 1])
-        self.assertEqual(len({c["case_id"] for c in cases}), 4)
-        self.assertEqual(cases[1]["test_id"], cases[3]["test_id"])
+        self.assertEqual([c["resources"]["nodes"] for c in cases], [1, 2, 1])
+        self.assertEqual(len({c["case_id"] for c in cases}), 3)
+        self.assertEqual(cases[0]["test_id"], cases[2]["test_id"])
 
     def test_single_case_on_pr_keeps_merge_identity_without_full_suite_status(self):
         selection = "dispatch_smoke_8p"
@@ -161,15 +161,15 @@ class BlueSourceTests(unittest.TestCase):
         )
         with patch.dict(prepare_request.BLUE_CASES, {case.test_name: case}):
             plan = prepare_request.create_plan("pull_request_target", self.event, "", 123, 1)
-        for item in (plan["cases"][1], plan["cases"][3]):
+        for item in (plan["cases"][0], plan["cases"][2]):
             self.assertEqual(
                 (item["worker"], item["target_pool"], item["docker"]),
                 ("blue", "another_pool", "another_container"),
             )
-        probe = replace(prepare_request.BLUE_CASES["worker_os_blue"], ci_overrides={"target_pool": "another_pool"})
+        probe = replace(prepare_request.BLUE_CASES["dispatch_smoke_8p"], ci_kind="worker_probe", nnodes=0, ngpu=0)
         with (
             patch.dict(prepare_request.BLUE_CASES, {probe.test_name: probe}),
-            self.assertRaisesRegex(ValueError, "probe cannot request resources"),
+            self.assertRaisesRegex(ValueError, "model plans may only request NPU smoke"),
         ):
             prepare_request.create_plan("pull_request_target", self.event, "", 123, 1)
 
@@ -209,7 +209,7 @@ class BlueSourceTests(unittest.TestCase):
             )
             self.assertEqual(
                 json.loads(result.stdout),
-                ["worker_os_blue", "dispatch_smoke_8p", "dispatch_smoke_16p", "new_smoke_8p", "dispatch_smoke_8p"],
+                ["dispatch_smoke_8p", "dispatch_smoke_16p", "new_smoke_8p", "dispatch_smoke_8p"],
             )
 
     def test_plan_rejects_source_that_changed_after_checkout(self):
@@ -270,6 +270,12 @@ class BlueSourceTests(unittest.TestCase):
             )
 
         self.assertEqual(find(result), result)
+        import hashlib
+        new = {k:v for k,v in result.items() if k != 'native_source'}
+        new['source_digest']=hashlib.sha256(json.dumps(source,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
+        new['diagnostics']=['x'*500]*201
+        self.assertEqual(find(new),new)
+        self.assertIsNone(find(dict(new,source_digest='0'*64)))
         wrong = copy.deepcopy(result)
         wrong["native_source"]["source_sha"] = "f" * 40
         self.assertIsNone(find(wrong))
@@ -305,6 +311,8 @@ class BlueSourceTests(unittest.TestCase):
             last_20_lines=[],
             native_source=source,
         )
+        result["attachment_ref"] = {"url": "https://github.com/example/logs/releases/download/test/lite-ci-" + "a"*64 + ".log",
+                                    "sha256": "b"*64, "bytes": 4194304, "truncated": True}
         comments = [{"user": {"login": "worker"}, "body": f"Lite-CI-V3 123:1:{case['case_id']}\n" + json.dumps(result)}]
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
@@ -332,6 +340,8 @@ class BlueSourceTests(unittest.TestCase):
                 CI_WORKFLOW=prepare_request.WORKFLOW,
                 CI_NATIVE_SOURCE=str(folder / "source.json"),
                 GH_TOKEN="fake",
+                GITHUB_STEP_SUMMARY=str(folder / "summary"),
+                LITE_CI_PUBLIC_LOG_REPO="example/logs",
                 MOCK_RESPONSES=json.dumps(
                     {"artifacts": {"artifacts": [{"name": "lite-ci-request-1"}]}, "comments": comments}
                 ),
@@ -346,6 +356,11 @@ class BlueSourceTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("PASS", completed.stdout)
+            summary = (folder / "summary").read_text()
+            self.assertIn("bytes=4194304", summary)
+            self.assertIn("truncated=true", summary)
+            self.assertIn(result["attachment_ref"]["url"], summary)
+            self.assertIn(result["attachment_ref"]["sha256"], summary)
 
 
 

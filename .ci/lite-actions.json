@@ -1,0 +1,44 @@
+{
+  "cases": {
+    "dispatch_smoke_16p": {
+      "ci_overrides": {
+        "docker": "cann_master_torchtitan_master_xyj",
+        "target_pool": "a3_shared_blue",
+        "worker": "blue"
+      },
+      "env_vars": {
+        "ASCEND_SET_ENV_PATH": "/usr/local/Ascend/ascend-toolkit/set_env.sh"
+      },
+      "kind": "npu_smoke",
+      "label": "Lite Actions dispatch smoke: 2 node(s), 16P HCCL/DP handshake",
+      "ngpu": 8,
+      "nnodes": 2,
+      "test_id": "dispatch_smoke_16p",
+      "timeout": 75
+    },
+    "dispatch_smoke_8p": {
+      "ci_overrides": {
+        "docker": "cann_master_torchtitan_master_xyj",
+        "target_pool": "a3_shared_blue",
+        "worker": "blue"
+      },
+      "env_vars": {
+        "ASCEND_SET_ENV_PATH": "/usr/local/Ascend/ascend-toolkit/set_env.sh"
+      },
+      "kind": "npu_smoke",
+      "label": "Lite Actions dispatch smoke: 1 node(s), 8P HCCL/DP handshake",
+      "ngpu": 8,
+      "nnodes": 1,
+      "test_id": "dispatch_smoke_8p",
+      "timeout": 75
+    }
+  },
+  "suites": {
+    "dispatch_smoke": [
+      "dispatch_smoke_8p",
+      "dispatch_smoke_16p",
+      "dispatch_smoke_8p"
+    ]
+  },
+  "version": 1
+}

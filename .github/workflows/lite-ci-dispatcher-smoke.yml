@@ -29,6 +29,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  worker_os:
+    if: github.repository == 'cann-framework/vllm-ascend' && inputs.test_case == ''
+    uses: depeng1994/lite-actions/.github/workflows/worker-cpu-probe.yml@main
+    permissions:
+      actions: read
+      contents: read
   prepare:
     if: >-
       github.repository == 'cann-framework/vllm-ascend'
@@ -115,13 +121,14 @@ jobs:
           CI_RESULT_AUTHOR: ${{ vars.LITE_CI_RESULT_ACTOR || 'depeng1994' }}
           CI_PLAN_DIGEST: ${{ needs.prepare.outputs.plan_digest }}
           CI_CASE: ${{ toJSON(matrix) }}
+          LITE_CI_PUBLIC_LOG_REPO: ${{ vars.LITE_CI_PUBLIC_LOG_REPO }}
           CI_WORKFLOW: lite-ci-dispatcher-smoke.yml
           CI_NATIVE_SOURCE: ${{ needs.prepare.outputs.native_source == 'true' && '.ci-source/source.json' || '' }}
         run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/wait_result.py
 
   result:
     if: always() && needs.prepare.result != 'skipped'
-    needs: [prepare, smoke]
+    needs: [prepare, smoke, worker_os]
     runs-on: ubuntu-latest
     name: Lite-Actions-Smoke
     steps:
@@ -148,11 +155,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SMOKE: ${{ needs.smoke.result }}
+          CPU: ${{ needs.worker_os.result }}
+          SELECTED: ${{ inputs.test_case }}
         run: |
           state=failure
-          if test "$SMOKE" = success; then state=success; fi
+          if test "$SMOKE" = success && { test "$CPU" = success || { test -n "$SELECTED" && test "$CPU" = skipped; }; }; then state=success; fi
           PYTHONPATH="$PWD/.lite-ci-source" python3 .github/scripts/lite_actions/native_result.py --source .ci-source/source.json --state "$state"
       - env:
           PREPARE: ${{ needs.prepare.result }}
           SMOKE: ${{ needs.smoke.result }}
-        run: test "$PREPARE" = success && test "$SMOKE" = success
+          CPU: ${{ needs.worker_os.result }}
+          SELECTED: ${{ inputs.test_case }}
+        run: |
+          test "$PREPARE" = success && test "$SMOKE" = success
+          test "$CPU" = success || { test -n "$SELECTED" && test "$CPU" = skipped; }
