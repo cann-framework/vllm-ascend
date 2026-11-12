@@ -25,32 +25,6 @@ from vllm_ascend.models.kimi_k3_dspark import (
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
 
 
-@pytest.mark.parametrize(
-    "module,model_cls", [(kimi_k3, AscendKimiLinearModel), (kimi_k3_dspark, AscendK3DSparkModel)]
-)
-def test_kimi_starts_each_flash_metadata_once_per_forward(module, model_cls, monkeypatch):
-    flashes = [SimpleNamespace(metadata_async=True), SimpleNamespace(metadata_async=True)]
-    metadata = {}
-    layers = []
-    calls = []
-    for index, flash in enumerate((flashes[0], flashes[0], flashes[1])):
-        name = str(index)
-        layer_metadata = SimpleNamespace(
-            num_decode_tokens=1, get_external_flashmla=lambda layout, flash=flash: flash
-        )
-        metadata[name] = layer_metadata
-        impl = SimpleNamespace(
-            layer_name=None,
-            flash_mla_layout="pa_nz",
-            start_flash_mla_metadata=lambda value, name=name: calls.append(name),
-        )
-        layers.append(SimpleNamespace(self_attn=SimpleNamespace(impl=impl, layer_name=name)))
-    monkeypatch.setattr(module, "is_forward_context_available", lambda: True)
-    monkeypatch.setattr(module, "get_forward_context", lambda: SimpleNamespace(attn_metadata=metadata))
-    model_cls._start_flash_mla_metadata(SimpleNamespace(layers=layers))
-    assert calls == ["0", "2"]
-
-
 @pytest.mark.parametrize("uses_mixed_projection", [False, True])
 def test_kimi_kda_marks_only_mixed_qkv_for_gmm_layout(uses_mixed_projection):
     def fake_backend_init(attention, _config, _vllm_config, _prefix):
@@ -623,8 +597,6 @@ def test_kimi_model_allocates_attention_residual_after_sp_shard(monkeypatch):
     model.layers = nn.ModuleList([layer])
     model.use_sequence_parallel = True
     model.aux_hidden_state_layers = set()
-    stream_order = []
-    model._start_flash_mla_metadata = MethodType(lambda self: stream_order.append("metadata"), model)
     model.output_attn_res_proj = SimpleNamespace(weight=torch.ones(1, 2))
     model.output_attn_res_norm = SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-5)
     model._maybe_add_hidden_state = MethodType(
@@ -640,10 +612,7 @@ def test_kimi_model_allocates_attention_residual_after_sp_shard(monkeypatch):
     monkeypatch.setattr(
         kimi_k3,
         "sp_shard",
-        lambda hidden_states: (
-            stream_order.append("sp_shard")
-            or torch.nn.functional.pad(hidden_states, (0, 0, 0, 1))[:2]
-        ),
+        lambda hidden_states: torch.nn.functional.pad(hidden_states, (0, 0, 0, 1))[:2],
     )
     monkeypatch.setattr(
         kimi_k3,
@@ -667,7 +636,6 @@ def test_kimi_model_allocates_attention_residual_after_sp_shard(monkeypatch):
 
     assert layer.residual_shape == torch.Size([2, 1, 2])
     assert output.shape == torch.Size([3, 2])
-    assert stream_order[0] == "metadata"
 
 
 def test_kimi_model_selects_materialized_or_raw_dspark_aux_stream(monkeypatch):

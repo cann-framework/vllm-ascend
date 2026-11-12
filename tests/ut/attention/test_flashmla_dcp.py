@@ -107,7 +107,7 @@ def runtime(monkeypatch):
         return scatter_current(**kwargs)
 
     class Stream:
-        def __init__(self, name="metadata"):
+        def __init__(self, name):
             self.name = name
 
         def record_event(self):
@@ -118,7 +118,6 @@ def runtime(monkeypatch):
             events.append(("wait", self.name, event))
 
     main_stream, attn_stream = Stream("main"), Stream("attn")
-    metadata_stream = [Stream("metadata")]
 
     @contextmanager
     def on_stream(stream):
@@ -130,16 +129,7 @@ def runtime(monkeypatch):
             active_stream[0] = previous
 
     monkeypatch.setattr(
-        torch,
-        "npu",
-        SimpleNamespace(
-            current_stream=lambda: {"main": main_stream, "attn": attn_stream}.get(
-                active_stream[0], metadata_stream[0]
-            ),
-            stream=on_stream,
-            Stream=lambda: metadata_stream[0],
-        ),
-        raising=False,
+        torch, "npu", SimpleNamespace(current_stream=lambda: main_stream, stream=on_stream), raising=False
     )
     monkeypatch.setattr(torch.Tensor, "record_stream", lambda tensor, stream: recorded_streams.append((tensor, stream)))
 
@@ -191,19 +181,7 @@ def runtime(monkeypatch):
         classmethod(lambda cls, config: cls(config, attention_op, metadata_op)),
     )
 
-    def builder(
-        *,
-        size=8,
-        rank=0,
-        interleave=1,
-        heads=8,
-        dtype=torch.float16,
-        use_rope=False,
-        speculative=True,
-        layout="pa_bbnd",
-        enable_async=False,
-        router_stream=None,
-    ):
+    def builder(*, size=8, rank=0, interleave=1, heads=8, dtype=torch.float16, use_rope=False, speculative=True):
         impl = SimpleNamespace(
             num_heads=heads,
             scale=0.125,
@@ -211,19 +189,13 @@ def runtime(monkeypatch):
             use_mla_rope=use_rope,
             dcp_size=size,
             dcp_rank=rank,
-            flash_mla_layout=layout,
             vllm_config=SimpleNamespace(
-                _kimi_router_stream=router_stream,
                 parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=interleave),
                 speculative_config=SimpleNamespace(method="dspark") if speculative else None,
             ),
         )
         return api.FlashMLAMetadataBuilder(
-            impl,
-            torch.device("cpu"),
-            8,
-            torch.triu(torch.ones(2048, 2048, dtype=torch.int8), diagonal=1),
-            enable_async=enable_async,
+            impl, torch.device("cpu"), 8, torch.triu(torch.ones(2048, 2048, dtype=torch.int8), diagonal=1)
         )
 
     class AttentionKind(Enum):
@@ -268,8 +240,6 @@ def runtime(monkeypatch):
             setattr(impl, name, MethodType(method, impl))
         impl._forward_decode_split_attention = Mock(wraps=impl._forward_decode_split_attention)
         impl._run_dcp_mtp_split_attention_op = Mock(side_effect=AssertionError("FlashMLA must not call FIA"))
-        impl.start_flash_mla_metadata = Mock()
-        impl.wait_flash_mla_metadata = Mock()
         return impl
 
     return SimpleNamespace(
@@ -387,118 +357,6 @@ def test_metadata_refresh_reuses_device_rank(runtime, monkeypatch, causal, rank)
     assert all(tensor is rank_tensors[0] for tensor in rank_tensors)
 
 
-def test_metadata_side_stream_records_inputs_and_waits_before_use(runtime):
-    builder = runtime.builder(enable_async=True)
-    flash = builder.build(common([35, 130], [2, 2], tokens=4), 2, 4, False, retain_for_graph=True)
-    runtime.events.clear()
-    runtime.recorded_streams.clear()
-
-    builder.start_metadata(flash)
-    builder.wait_metadata(flash)
-
-    assert runtime.events == [
-        ("record", "main"),
-        ("wait", "metadata", "main"),
-        ("record", "metadata"),
-        ("wait", "main", "metadata"),
-    ]
-    assert {id(tensor) for tensor, stream in runtime.recorded_streams if stream.name == "metadata"} == {
-        id(flash.schedule),
-        id(flash.cache_lens),
-        id(flash.cu),
-        id(flash.used_q),
-        id(flash.current.schedule),
-    }
-
-
-def test_metadata_wait_uses_the_event_for_each_flash(runtime, monkeypatch):
-    builder = runtime.builder(enable_async=True)
-    first = builder.build(common([35], [1]), 1, 1, False, retain_for_graph=True)
-    second = builder.build(common([35], [2]), 1, 2, False, retain_for_graph=True)
-    stream = builder.metadata_stream
-    produced = iter((object(), object()))
-    monkeypatch.setattr(stream, "record_event", lambda: next(produced))
-    builder.start_metadata(first)
-    builder.start_metadata(second)
-    assert first.metadata_ready is not second.metadata_ready
-    runtime.events.clear()
-    builder.wait_metadata(first)
-    builder.wait_metadata(second)
-    assert runtime.events == [
-        ("wait", "main", first.metadata_ready),
-        ("wait", "main", second.metadata_ready),
-    ]
-
-
-def test_metadata_stream_avoids_router_stream(runtime, monkeypatch):
-    router = object()
-    metadata = object()
-    candidates = iter((router, metadata))
-    monkeypatch.setattr(torch.npu, "Stream", lambda: next(candidates))
-    builder = runtime.builder(enable_async=True, router_stream=router)
-    assert builder.metadata_stream is metadata
-
-
-def test_metadata_stream_rejects_persistent_router_collision(runtime, monkeypatch):
-    router = object()
-    monkeypatch.setattr(torch.npu, "Stream", lambda: router)
-    with pytest.raises(RuntimeError, match="distinct from the Kimi MoE streams"):
-        runtime.builder(enable_async=True, router_stream=router)
-
-
-def test_eager_metadata_starts_before_remaining_batch_refresh(runtime, monkeypatch):
-    builder = runtime.builder(enable_async=True)
-    inputs = common([35, 130], [2, 2], tokens=4)
-    order = []
-    original_schedule = builder._refresh_schedule
-    original_copy = torch.Tensor.copy_
-
-    def schedule(flash):
-        order.append("schedule")
-        original_schedule(flash)
-
-    def copy_tensor(destination, source, *args, **kwargs):
-        if source.untyped_storage().data_ptr() == inputs.block_table_tensor.untyped_storage().data_ptr():
-            order.append("block_table")
-        return original_copy(destination, source, *args, **kwargs)
-
-    monkeypatch.setattr(builder, "_refresh_schedule", schedule)
-    monkeypatch.setattr(torch.Tensor, "copy_", copy_tensor)
-    flash = builder.build(inputs, 2, 4, False)
-    assert flash.metadata_started
-    assert order == ["schedule", "block_table"]
-
-
-def test_graph_buffer_schedule_is_not_submitted_during_replay_input_refresh(runtime, monkeypatch):
-    builder = runtime.builder(enable_async=True)
-    inputs = common([35, 130], [2, 2], tokens=4)
-    refresh = Mock(wraps=builder._refresh_schedule)
-    monkeypatch.setattr(builder, "_refresh_schedule", refresh)
-    flash = builder.build(inputs, 2, 4, False, retain_for_graph=True)
-    assert not flash.metadata_started
-    refresh.assert_not_called()
-    builder.start_metadata(flash)
-    refresh.assert_called_once()
-    refresh.reset_mock()
-    assert builder.build(inputs, 2, 4, False) is flash
-    assert not flash.metadata_started
-    refresh.assert_not_called()
-
-
-def test_dcp_bbnd_waits_for_metadata_before_attention(runtime):
-    calls = []
-    flash = SimpleNamespace(metadata_async=True, metadata_started=False)
-    metadata = SimpleNamespace(external_flashmla=flash)
-    impl = SimpleNamespace(
-        start_flash_mla_metadata=lambda _: calls.append("start"),
-        wait_flash_mla_metadata=lambda _: calls.append("wait"),
-        _forward_decode_split_attention=lambda *args: calls.append("attention"),
-    )
-    preprocessed = SimpleNamespace(ql_nope=None, q_pe=None, current_k_nope=None, current_k_pe=None)
-    runtime.forward(impl, preprocessed, torch.empty(1, 128), metadata)
-    assert calls == ["start", "wait", "attention"]
-
-
 @pytest.mark.parametrize("speculative,rank", [(False, 0), (True, 7)])
 def test_single_token_replay_keeps_configured_split_and_buffer_addresses(runtime, monkeypatch, speculative, rank):
     builder = runtime.builder(rank=rank, speculative=speculative, use_rope=True)
@@ -549,48 +407,6 @@ def test_current_pages_cross_physical_blocks_and_eager_does_not_retain(runtime):
     assert flash.current.slots.tolist() == list(range(130)) + list(range(256, 385))
     assert flash.current.block_table[:2, :2].tolist() == [[0, 1], [2, 3]]
     assert builder.buffers == {}
-
-
-def test_pa_nz_copy_indices_are_batch_metadata_and_replay_stable(runtime, monkeypatch):
-    """PA_NZ tile addresses are built once and reused by every MLA layer."""
-
-    def load_pa_nz(cls, config):
-        return runtime.api.FlashMLAImpl(config, runtime.attention_op, runtime.metadata_op)
-
-    monkeypatch.setattr(runtime.api.PaNzFlashMLAImpl, "load", classmethod(load_pa_nz))
-    builder = runtime.builder(layout="pa_nz", rank=3, speculative=True)
-    inputs = common([130, 0], [2, 1], tokens=3)
-    inputs.slot_mapping.copy_(torch.tensor([256, 257, -1]))
-    flash = builder.build(inputs, 2, 3, False, retain_for_graph=True)
-
-    block_size = runtime.api.FLASHMLA_BLOCK_SIZE
-    tile_count = runtime.api.PA_NZ_TILE_COUNT
-    assert flash.pa_nz_tile_offsets.tolist() == [block_size * tile for tile in range(tile_count)]
-    assert flash.pa_nz_current_slots.tolist() == [0, 1, 384]
-    assert flash.pa_nz_history_slots.tolist() == [256, 257, 0]
-    expected_src = []
-    expected_dst = []
-    for source, destination in zip(flash.pa_nz_current_slots.tolist(), flash.pa_nz_history_slots.tolist()):
-        source_block, source_offset = divmod(source, block_size)
-        destination_block, destination_offset = divmod(destination, block_size)
-        expected_src.extend(
-            source_block * tile_count * block_size + tile * block_size + source_offset for tile in range(tile_count)
-        )
-        expected_dst.extend(
-            destination_block * tile_count * block_size + tile * block_size + destination_offset
-            for tile in range(tile_count)
-        )
-    assert flash.pa_nz_copy_src_indices.tolist() == expected_src
-    assert flash.pa_nz_copy_dst_indices.tolist() == expected_dst
-
-    pointers = addresses(flash)
-    inputs.seq_lens.copy_(torch.tensor([131, 0]))
-    inputs.slot_mapping.copy_(torch.tensor([384, -1, -1]))
-    same = builder.build(inputs, 2, 3, False)
-    assert same is flash
-    assert addresses(flash) == pointers
-    assert flash.pa_nz_current_slots.tolist() == [0, 1, 384]
-    assert flash.pa_nz_history_slots.tolist() == [384, 0, 0]
 
 
 @pytest.mark.parametrize("causal", [True, False])
