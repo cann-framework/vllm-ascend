@@ -130,15 +130,20 @@ The sequence is:
 5. Shared activation completion releases routed GMM1.
 6. GMM1 completion releases shared Down input quantization and projection, which may overlap routed activation,
    output quantization and GMM2.
-7. Submit shared ReduceScatter on the communication stream, waiting only for
-   shared Down's completion event. It can overlap routed activation, GMM2 and
-   Combine. After latent up, the main stream waits for that invocation's RS
+7. After submitting routed GMM2, submit shared ReduceScatter on the
+   communication stream before Combine, matching the recipes exclusion
+   placement. It waits only for shared Down, not GMM2 completion.
+   After latent up, the main stream waits for that invocation's RS
    completion event before Add.
 
-Early shared ReduceScatter applies only to the validated MC2 Decode ladder;
+This ReduceScatter submission placement applies only to the MC2 Decode ladder;
 all other paths retain 0.30's collective ordering. Shared input AllGather still
 joins before routed EP communication. Multi-rank capture/replay must validate
 the new overlap; CPU dependency tests do not establish HCCL deadlock freedom.
+Router reuse with the original early ReduceScatter submission was reported
+to produce no Decode SuperKernel. Moving only the ReduceScatter exclusion
+after GMM2 is a diagnostic revision; NPU profiling must verify actual fusion
+and checkpoint accuracy. Gate/Up retains its baseline pre-Dispatch submission.
 
 ## Model Runner V2 validation
 

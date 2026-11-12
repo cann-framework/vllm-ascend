@@ -378,9 +378,13 @@ class TestKimiFrontOverlap(unittest.TestCase):
         schedule = NS(
             before_dispatch=lambda e: (self.assertIs(e, event), order.append("gate_up")),
             after_dispatch=lambda: order.append("situ"),
+            before_combine=lambda: order.append("shared_rs"),
         )
         layer.fused_experts(NS(hidden_states=torch.ones(1), shared_expert_schedule=schedule), object())
-        self.assertEqual(order, ["prepare_dispatch", "gate_up", "dispatch", "situ", "gmm", "combine"])
+        self.assertEqual(order, ["prepare_dispatch", "gate_up", "dispatch", "situ", "gmm", "shared_rs", "combine"])
+        order.clear()
+        layer.fused_experts(NS(hidden_states=torch.ones(1), shared_expert_schedule=None), object())
+        self.assertEqual(order, ["prepare_dispatch", "dispatch", "gmm", "combine"])
 
 
 if __name__ == "__main__":

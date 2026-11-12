@@ -183,12 +183,15 @@ class TestDecodeDependencies(unittest.TestCase):
 
     def check_dependency_graph(self, quantized, superkernel):
         nodes = []
+        active_scopes = []
+        observed_scopes = {}
         last = {"main": None, "shared": None, "comm": None}
         current = ["main"]
 
         def op(name, deps=()):
             idx = len(nodes)
             nodes.append((current[0], name, [d for d in (last[current[0]], *deps) if d is not None]))
+            observed_scopes[name] = active_scopes[-1] if active_scopes else "unmarked"
             last[current[0]] = idx
             return idx
 
@@ -197,7 +200,9 @@ class TestDecodeDependencies(unittest.TestCase):
                 self.name = name
 
             def record_event(self):
-                return last[self.name]
+                if current[0] != self.name:
+                    raise AssertionError("Event recorded on the wrong stream")
+                return op("record")
 
             def wait_event(self, event):
                 op("wait", (event,))
@@ -213,6 +218,18 @@ class TestDecodeDependencies(unittest.TestCase):
             finally:
                 current[0] = old
 
+        @contextmanager
+        def scope(name, enabled):
+            if enabled:
+                op("scope_begin")
+                active_scopes.append(name)
+            try:
+                yield
+            finally:
+                if enabled:
+                    op("scope_end")
+                    active_scopes.pop()
+
         limits = []
         npu = NS(current_stream=lambda: streams[current[0]])
         ns = dict(
@@ -226,6 +243,7 @@ class TestDecodeDependencies(unittest.TestCase):
             ),
             npu_stream_switch=switch,
             shared_experts_calculation_stream=lambda: streams["shared"],
+            moe_superkernel_scope=scope,
         )
         load(
             "vllm_ascend/ops/fused_moe/kimi_decode_schedule.py",
@@ -275,17 +293,28 @@ class TestDecodeDependencies(unittest.TestCase):
         schedule.after_dispatch()
         op("gmm1")
         with patch.object(torch.Tensor, "record_stream") as comm_record:
-            schedule.after_gmm1()
+            with scope("layer_1.moe", superkernel):
+                schedule.after_gmm1()
+                self.assertIsNone(schedule.output_done)
+                self.assertFalse(any(name == "shared_rs" for _, name, _ in nodes))
+                with self.assertRaisesRegex(RuntimeError, "ReduceScatter"):
+                    schedule.finalize()
+                op("routed_situ")
+                op("gmm2")
+                schedule.before_combine()
+                op("combine")
         comm_record.assert_called_once_with(streams["comm"])
-        op("routed_situ")
-        op("gmm2")
-        op("combine")
         with patch.object(torch.Tensor, "record_stream") as record_stream:
             actual = schedule.finalize()
         record_stream.assert_called_once_with(streams["main"])
         npu.current_stream().wait_event(schedule.output_done)
         op("add")
         torch.testing.assert_close(actual, x * 2 + 3)
+        self.assertEqual(active_scopes, [])
+        for name in ("shared_down", "routed_situ", "gmm2", "combine"):
+            self.assertEqual(observed_scopes[name], "layer_1.moe" if superkernel else "unmarked", name)
+        self.assertEqual(observed_scopes["shared_rs"], None if superkernel else "unmarked")
+        self.assertEqual(nodes[last["comm"]][1], "record")
 
         def ancestors(i):
             return set(nodes[i][2]).union(*(ancestors(d) for d in nodes[i][2]))
@@ -305,11 +334,27 @@ class TestDecodeDependencies(unittest.TestCase):
         self.assertNotIn(ids["dispatch"], ancestors(ids["gate_up"]))
         self.assertEqual(nodes[ids["shared_rs"]][0], "comm")
         self.assertNotIn(ids["combine"], ancestors(ids["shared_rs"]))
-        self.assertLess(ids["shared_rs"], ids["routed_situ"])
+        self.assertLess(ids["gate_up"], ids["dispatch"])
+        self.assertLess(ids["gmm2"], ids["shared_rs"])
+        self.assertLess(ids["shared_rs"], ids["combine"])
+        self.assertNotIn(ids["gmm2"], ancestors(ids["shared_rs"]))
         shared._prepare_linear_input_for_overlap.assert_not_called()
         if quantized:
             self.assertIn(ids["gmm1"], ancestors(ids["shared_down_quant"]))
         self.assertEqual(limits, [("shared", (16, 32) if quantized else (32, 1))])
+
+
+    def test_reduce_scatter_requires_shared_down_before_submission(self):
+        shared = Mock()
+        shared.prepare_for_router_overlap.return_value = object()
+        ns = dict(shared_experts_calculation_stream=lambda: object())
+        load("vllm_ascend/ops/fused_moe/kimi_decode_schedule.py", {"KimiDecodeSchedule"}, ns)
+        schedule = ns["KimiDecodeSchedule"](shared, object(), object())
+        with self.assertRaisesRegex(RuntimeError, "Down"):
+            schedule.before_combine()
+        with self.assertRaisesRegex(RuntimeError, "ReduceScatter"):
+            schedule.finalize()
+        shared._pad_and_reduce_scatter.assert_not_called()
 
 
 class TestRouterStreamReuse(unittest.TestCase):
