@@ -84,7 +84,10 @@ these scopes. Other models retain their generic 0.30 policy.
 
 Named scopes cover Router/latent down through routed Combine and latent
 norm/up. Nested exclusions keep shared AllGather, shared ReduceScatter, the
-final join and Add outside fusion. The owning ACL graph is optimized once
+final join and Add outside fusion. MoE layers sharing one model
+configuration reuse one Router stream, matching the recipes model context.
+Disabling shared multistream creates no Router stream. The owning ACL
+graph is optimized once
 after successful capture with `dcci_disable_on_kernel=[".*"]` and
 `auto_op_parallel=1`; replay never repeats optimization. Capture tracking is
 local to the forward context for V1 and to the owning `UpdatableGraph` capture

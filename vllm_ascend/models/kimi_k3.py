@@ -343,6 +343,14 @@ def is_moe_layer_idx(config, layer_idx: int) -> bool:
     )
 
 
+def _get_kimi_router_stream(vllm_config: VllmConfig) -> torch.npu.Stream | None:
+    if not get_ascend_config().multistream_overlap_shared_expert:
+        return None
+    if not hasattr(vllm_config, "_kimi_router_stream"):
+        vllm_config._kimi_router_stream = torch.npu.Stream()
+    return vllm_config._kimi_router_stream
+
+
 class AscendKimiMoE(nn.Module):
     """Kimi K3 MoE assembled from the standard vLLM MoE interfaces."""
 
@@ -479,7 +487,7 @@ class AscendKimiMoE(nn.Module):
         object.__setattr__(
             self.experts,
             "_kimi_router_stream",
-            torch.npu.Stream() if get_ascend_config().multistream_overlap_shared_expert else None,
+            _get_kimi_router_stream(vllm_config),
         )
         if self.shared_experts is not None and get_ascend_config().multistream_overlap_shared_expert:
             # Share a communication stream across this model's MoE layers;
