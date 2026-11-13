@@ -547,3 +547,41 @@ def test_pcp_global_plan_keeps_local_fragment_mapping():
     assert result.padded_local_cu_seq_lens_lst == [[0, 3, 7], [0, 0, 2]]
     assert result.kv_rank_offsets == [[0, 14, 7, 21], [0, 4, 2, 6]]
     assert builder.num_prefills == 3 and builder.num_decodes == 0
+
+
+def test_dcp_c8_chunk_reader_matches_builder_local_metadata(chunk_metadata_on_cpu):
+    from vllm_ascend.attention.mla_v1 import _get_c8_prefill_chunk_lengths_and_starts
+
+    config = _chunk_config(block_size=1536, dcp_size=8, interleave=1536)
+    builder = _dcp_chunk_builder(config, [0, 131072, 12289], workspace_size=49152)
+    metadata = builder.build_chunked_metadata(0, SimpleNamespace(num_reqs=3))
+    assert builder.num_chunks > 1 and metadata.starts_cpu is not None
+    for index in range(builder.num_chunks):
+        lengths, starts = _get_c8_prefill_chunk_lengths_and_starts(metadata, index)
+        assert lengths.tolist() == metadata.padded_local_chunk_seq_lens[index]
+        assert int(lengths.sum()) == metadata.seq_tot[index]
+        assert starts.device.type == "cpu"
+        torch.testing.assert_close(starts, metadata.starts[index])
+        assert starts.tolist() == [index * metadata.chunk_size] * 3
+    assert metadata.starts_cpu[1, 1] < builder.max_context_chunk
+    assert metadata.chunk_seq_lens[0, 1] > metadata.padded_local_chunk_seq_lens[0][1]
+
+
+@pytest.mark.parametrize("with_pcp", [False, True])
+def test_single_query_fragment_avoids_pack_copy(with_pcp):
+    from vllm_ascend.attention.context_parallel.common_cp import DCPImplMixin
+
+    impl = DCPImplMixin.__new__(DCPImplMixin)
+    impl.dcp_size = 8
+    impl.pcp_group = SimpleNamespace(world_size=2 if with_pcp else 1)
+    impl.tp_group = SimpleNamespace(all_gather=Mock(side_effect=lambda q, dim: q))
+    impl._dcp_all_gather = Mock(side_effect=lambda q, dim: q)
+    query = torch.ones(2, 12, 576, dtype=torch.uint8)
+    with patch(
+        "vllm_ascend.attention.context_parallel.common_cp.torch.cat", side_effect=AssertionError("redundant pack")
+    ):
+        (actual,) = impl._dcp_all_gather_fragments(query, dim=1)
+    assert actual.data_ptr() == query.data_ptr()
+    selected = impl.tp_group.all_gather if with_pcp else impl._dcp_all_gather
+    selected.assert_called_once()
+    assert selected.call_args.args[0] is query

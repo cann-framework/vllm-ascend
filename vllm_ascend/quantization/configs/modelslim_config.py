@@ -777,7 +777,12 @@ class AscendModelSlimConfig(QuantizationConfig):
                 return True
         return False
 
-    def enabling_fa_quant(self, vllm_config, layer_name) -> bool:
+    def enabling_fa_quant(self, vllm_config, layer_name, *, static_c8: bool = False) -> bool:
+        if static_c8:
+            # The explicit Kimi path has its own geometry/backend loader
+            # checks. Here validate the checkpoint's actual per-layer recipe,
+            # independently of legacy FIA and global cache dtype selection.
+            return self.quant_description.get("fa_quant_type") == "FAKQuant" and self.is_fa_quant_layer(layer_name)
         is_decode_instance = (
             vllm_config.kv_transfer_config is not None
             and vllm_config.kv_transfer_config.is_kv_consumer

@@ -134,7 +134,21 @@ class MooncakeBaseConnectorScheduler:
                 # state, not a prompt-aligned attention-block sequence.
                 transfer_block_ids.append(blocks)
             elif any(isinstance(spec, MambaSpec) for spec in group_specs):
-                if self.num_speculative_tokens > 0:
+                mamba_spec = next(spec for spec in group_specs if isinstance(spec, MambaSpec))
+                if mamba_spec.mamba_cache_mode == "align":
+                    # Aligned Mamba state is position-indexed and prefix-cacheable.
+                    # Publish exactly the state block containing the last P token;
+                    # the receiver must not infer it from the global draft-token
+                    # count or from the tail of an unhashed suffix.
+                    state_blocks = cdiv(prompt_len, block_size)
+                    if state_blocks <= 0 or state_blocks > len(blocks):
+                        raise RuntimeError(
+                            "Invalid aligned Mamba state block metadata: "
+                            f"prompt_len={prompt_len}, block_size={block_size}, "
+                            f"required_block_count={state_blocks}, available_block_count={len(blocks)}"
+                        )
+                    transfer_block_ids.append(blocks[state_blocks - 1 : state_blocks])
+                elif self.num_speculative_tokens > 0:
                     transfer_block_ids.append(blocks[: -self.num_speculative_tokens])
                 else:
                     transfer_block_ids.append(blocks)

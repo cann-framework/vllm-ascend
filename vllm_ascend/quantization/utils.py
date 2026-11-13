@@ -265,24 +265,29 @@ def maybe_auto_detect_quantization(vllm_config) -> None:
     vllm_config.quant_config = _VllmConfig._get_quantization_config(model_config, vllm_config.load_config)
 
 
-def enable_fa_quant(vllm_config, layer_name=None) -> bool:
+def enable_fa_quant(vllm_config, layer_name=None, *, static_c8: bool = False) -> bool:
     model_config = getattr(vllm_config, "model_config", None)
     if model_config is None or not model_config.use_mla:
         return False
     if enable_sfa(vllm_config):
         return False
-    cache_config = getattr(vllm_config, "cache_config", None)
-    if cache_config is None or cache_config.cache_dtype not in ["fp8", "int8"]:
-        return False
-    is_kv_consumer = vllm_config.kv_transfer_config is not None and vllm_config.kv_transfer_config.is_kv_consumer
-    if not is_kv_consumer and not get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION):
-        return False
+    if not static_c8:
+        cache_config = getattr(vllm_config, "cache_config", None)
+        if cache_config is None or cache_config.cache_dtype not in ["fp8", "int8"]:
+            return False
+        is_kv_consumer = vllm_config.kv_transfer_config is not None and vllm_config.kv_transfer_config.is_kv_consumer
+        if not is_kv_consumer and not get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION):
+            return False
     if vllm_config.quant_config is not None and getattr(vllm_config.quant_config, "enable_fa_quant", False):
         if layer_name is not None:
             # Determine whether quantization is enabled at each layer.
+            if static_c8:
+                return vllm_config.quant_config.enabling_fa_quant(vllm_config, layer_name, static_c8=True)
             return vllm_config.quant_config.enabling_fa_quant(vllm_config, layer_name)
         else:
             return True
+    if static_c8:
+        raise ValueError("mla_cache_mode=C8 requires a checkpoint with per-layer FAKQuant MLA scales")
     raise ValueError(
         "The current MLA‑related models adopt static quantization. "
         "KV quantization is configured via `--kv‑cache‑dtype` upon service startup, "
