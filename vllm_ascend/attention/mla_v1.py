@@ -1096,8 +1096,6 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.use_flashmla_pa_nz = self.flash_mla_layout == "pa_nz"
         self.flash_mla_metadata_builder: FlashMLAMetadataBuilder | None = None
         self._flashmla_writer_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
-        self.flash_total_heads = 0
-        self.flash_local_head_start = 0
         self.flash_weight_uq_qr: torch.Tensor | None = None
         self.flash_weight_uk: torch.Tensor | None = None
         self.flash_gamma_qa: torch.Tensor | None = None
@@ -1560,31 +1558,24 @@ class AscendMLAImpl(MLAAttentionImpl):
             self._prepare_prolog_v3_weights()
 
     def _prepare_flash_mla_bf16_weights(self) -> None:
-        """Gather the full-head weights the BF16 PA_NZ prolog validates."""
-        import torch.distributed as dist
-        from vllm.distributed import (
-            get_tensor_model_parallel_rank,
-            get_tensor_model_parallel_world_size,
-            get_tp_group,
-        )
-
+        """Prepare unpadded TP-local weights for the BF16 PA_NZ prolog."""
         assert self.q_proj is not None
-        tp_size = get_tensor_model_parallel_world_size()
-        local_heads = self.num_heads
-        total_heads = local_heads * tp_size
-
-        def gather_cat_dim0(local: torch.Tensor) -> torch.Tensor:
-            if tp_size == 1:
-                return local
-            shards = [torch.empty_like(local) for _ in range(tp_size)]
-            dist.all_gather(shards, local, group=get_tp_group().device_group)
-            return torch.cat(shards, dim=0).contiguous()
-
-        qb_full = gather_cat_dim0(self.q_proj.weight.data)
-        self.flash_weight_uq_qr = torch_npu.npu_format_cast(qb_full.T.contiguous(), ACL_FORMAT_FRACTAL_NZ)
-        self.flash_weight_uk = gather_cat_dim0(self.W_UK_T)
-        self.flash_total_heads = total_heads
-        self.flash_local_head_start = local_heads * get_tensor_model_parallel_rank()
+        qb_local = self.q_proj.weight.data
+        if qb_local.shape != (self.num_heads * self.qk_head_dim, self.q_lora_rank):
+            raise ValueError("PA_NZ Prolog requires the TP-local Q-B projection weight")
+        if self.W_UK_T.shape != (self.num_heads, self.qk_nope_head_dim, self.kv_lora_rank):
+            raise ValueError("PA_NZ Prolog requires the TP-local W_UK weight")
+        # V4 infers its head count from these weights. Gathering them across TP
+        # would make every rank compute all heads before discarding most of Q.
+        # Use the unpadded source weight: the legacy MLAPO weight is padded to a
+        # power of two, which would also introduce unnecessary head computation.
+        replace_parameter(
+            self,
+            "flash_weight_uq_qr",
+            torch_npu.npu_format_cast(qb_local.T.contiguous(), ACL_FORMAT_FRACTAL_NZ),
+            prefer_copy=True,
+        )
+        replace_parameter(self, "flash_weight_uk", self.W_UK_T.contiguous(), prefer_copy=True)
 
     def _load_fa_quant_scales(self):
         layer = self.vllm_config.compilation_config.static_forward_context[self.layer_name]
@@ -3446,9 +3437,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             prolog_slots,
             self.q_a_layernorm.variance_epsilon,
         )
-        q = q.view(num_decode_tokens, self.flash_total_heads, -1)
-        head_start = self.flash_local_head_start
-        q = q[:, head_start : head_start + self.num_heads, :]
+        q = q.view(num_decode_tokens, self.num_heads, FLASHMLA_QK_DIM)
         self.wait_flash_mla_metadata(attn_metadata)
         if self.dcp_enabled:
             split_attention = getattr(self, "_forward_decode_split_attention", None)

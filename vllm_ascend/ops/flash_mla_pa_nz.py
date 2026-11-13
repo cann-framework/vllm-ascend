@@ -165,7 +165,9 @@ def mla_prolog_no_rope(
     """Return ``(q, descale_q, qr)`` and update the PA_NZ cache in place.
 
     The current ``mla_prolog_v2`` takes nine positional tensors and keyword
-    attributes. NZ projection weights retain logical ``[K, O]`` shapes.
+    attributes. NZ projection weights retain logical ``[K, O]`` shapes;
+    Q-B and W_UK contain only this TP rank's unpadded heads, so the operator
+    infers and computes the local head count without a separate TP argument.
     In A16C16/NO_ROPE mode, q already contains the auxiliary 64 dimensions;
     query quantization and the separate QR output are disabled.
     """
