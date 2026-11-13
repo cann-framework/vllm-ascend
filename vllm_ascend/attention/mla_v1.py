@@ -1,5 +1,5 @@
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import lcm
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
@@ -45,6 +45,7 @@ from vllm_ascend.attention.flashmla import (
     get_flashmla_ops,
     split_flashmla_requests,
 )
+from vllm_ascend.attention.mla_prefill_qfa import MlaPrefillQfa
 from vllm_ascend.attention.utils import (
     ATTENTION_UPDATE_MAX_INPUTS,
     MLA_FLASH_SUPPORTED_Q_HEADS,
@@ -196,6 +197,7 @@ class AscendMLAPrefillMetadata:
     cos: torch.Tensor = None
     actual_seq_lengths_q: list[int] | None = None
     pcp_local_num_input_tokens: int | None = None
+    qfa_helpers: dict[tuple, MlaPrefillQfa] = field(default_factory=dict)
 
 
 @dataclass
@@ -981,6 +983,7 @@ class AscendMLAImpl(MLAAttentionImpl):
     dequant_scale_w_dkv_kr: torch.Tensor
     dequant_scale_w_uq_qr: torch.Tensor
     _dcp_current_kv_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+    use_mla_prefill_qfa: bool = False
 
     def __init__(
         self,
@@ -1037,6 +1040,13 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         self.speculative_config = self.vllm_config.speculative_config
         self.is_draft_model = self.vllm_config.model_config.runner_type == "draft"
+        self.use_mla_prefill_qfa = (
+            ascend_config.enable_mla_prefill_qfa
+            and self.support_fp8_attention
+            and self.qk_head_dim == 192
+            and self.v_head_dim == 128
+            and not (self.pcp_enabled or self.dcp_enabled or self.is_draft_model)
+        )
         self.enable_mlapo = not self.is_draft_model and enabling_mlapo(self.vllm_config)
 
         self.layer_name = kwargs.get("layer_name")
@@ -1555,6 +1565,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_metadata: AscendMLAMetadata,
         prefix_output: torch.Tensor,
         prefix_lse: torch.Tensor,
+        qfa: MlaPrefillQfa | None = None,
+        quant_query: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         assert len(kv_c_and_k_pe_cache) > 1
         prefill_metadata = attn_metadata.prefill
@@ -1587,8 +1599,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         lse_anchor = None
         has_context = False
 
-        if self.head_padding > 0:
-            query = torch.cat((q_nope, q_pe), dim=-1)
+        query = None
 
         common_kwargs = {
             "num_heads": self.num_heads,
@@ -1650,21 +1661,24 @@ class AscendMLAImpl(MLAAttentionImpl):
             actual_seq_lengths_kv = prefill_metadata.chunked_context.chunk_actual_seq_lengths_kv_list[i]
             common_kwargs["actual_seq_lengths_kv"] = actual_seq_lengths_kv
 
-            if self.head_padding > 0:
-                key = torch.cat((k_nope, k_pe), dim=-1)
+            if qfa is not None and qfa.supports(actual_seq_lengths_kv):
+                chunk_out, chunk_lse = qfa(
+                    quant_query, k_nope, k_pe, v, actual_seq_lengths_q, actual_seq_lengths_kv, 0, None
+                )
             else:
-                # mla_nope_chunked_ctx: with qk_rope_head_dim == 0 the rope
-                # operands are empty and FIA rejects them, same as the decode
-                # and non-chunked prefill paths.
-                if self.qk_rope_head_dim > 0:
-                    common_kwargs["query_rope"] = q_pe
-                    common_kwargs["key_rope"] = k_pe.contiguous()
-                query = q_nope
-                key = k_nope
-
-            chunk_out, chunk_lse = torch_npu.npu_fused_infer_attention_score(
-                query, key.contiguous(), v.contiguous(), **common_kwargs
-            )
+                if self.head_padding > 0:
+                    if query is None:
+                        query = torch.cat((q_nope, q_pe), dim=-1)
+                    key = torch.cat((k_nope, k_pe), dim=-1)
+                else:
+                    # Zero-width auxiliary operands must not be passed to FIA.
+                    if self.qk_rope_head_dim > 0:
+                        common_kwargs["query_rope"] = q_pe
+                        common_kwargs["key_rope"] = k_pe.contiguous()
+                    query, key = q_nope, k_nope
+                chunk_out, chunk_lse = torch_npu.npu_fused_infer_attention_score(
+                    query, key.contiguous(), v.contiguous(), **common_kwargs
+                )
 
             if chunk_lse.dim() == 2:
                 chunk_lse = chunk_lse.transpose(0, 1).unsqueeze(-1)
@@ -1737,21 +1751,50 @@ class AscendMLAImpl(MLAAttentionImpl):
         }
         record_attention_compute_start()
 
-        if self.head_padding > 0:
-            query = torch.cat((q_nope, q_pe), dim=-1)
-            key = torch.cat((k_nope, k_pe), dim=-1)
-        else:
-            if self.qk_rope_head_dim > 0:
-                common_kwargs["query_rope"] = q_pe
-                common_kwargs["key_rope"] = k_pe.contiguous()
-            query, key = q_nope, k_nope
+        qfa = None
+        quant_query = None
+        if self.use_mla_prefill_qfa:
+            signature = (self.num_heads, self.qk_head_dim, self.v_head_dim, self.scale, q_nope.device)
+            qfa = prefill_meta.qfa_helpers.get(signature)
+            if qfa is None:
+                qfa = MlaPrefillQfa(*signature)
+                prefill_meta.qfa_helpers[signature] = qfa
+            quant_query = qfa.prepare_query(q_nope, q_pe)
 
-        attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(
-            query, key.contiguous(), value.contiguous(), **common_kwargs
-        )
+        if qfa is not None and qfa.supports(actual_seq_lengths_kv):
+            attn_output, attn_lse = qfa(
+                quant_query,
+                k_nope,
+                k_pe,
+                value,
+                actual_seq_lengths_q,
+                actual_seq_lengths_kv,
+                3,
+                prefill_meta.attn_mask,
+            )
+        else:
+            if self.head_padding > 0:
+                query = torch.cat((q_nope, q_pe), dim=-1)
+                key = torch.cat((k_nope, k_pe), dim=-1)
+            else:
+                if self.qk_rope_head_dim > 0:
+                    common_kwargs["query_rope"] = q_pe
+                    common_kwargs["key_rope"] = k_pe.contiguous()
+                query, key = q_nope, k_nope
+            attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(
+                query, key.contiguous(), value.contiguous(), **common_kwargs
+            )
 
         attn_output, attn_lse = self._compute_prefill_context(
-            q_nope, q_pe, kv_c_and_k_pe_cache, self.qk_rope_head_dim, attn_metadata, attn_output, attn_lse
+            q_nope,
+            q_pe,
+            kv_c_and_k_pe_cache,
+            self.qk_rope_head_dim,
+            attn_metadata,
+            attn_output,
+            attn_lse,
+            qfa=qfa,
+            quant_query=quant_query,
         )
 
         attn_output = attn_output.reshape([num_tokens, self.num_heads * self.v_head_dim])

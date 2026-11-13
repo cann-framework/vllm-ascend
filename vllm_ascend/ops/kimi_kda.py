@@ -52,9 +52,10 @@ from vllm_ascend.ops.kimi_mega_kda import (
     MegaKDAWeights,
     ensure_mega_kda_bf16,
     ensure_mega_kda_nd,
-    load_mega_kda_operator,
     load_commit_recurrent_kda_operator,
+    load_mega_kda_operator,
     mega_kda_nz_operand,
+    mega_kda_projection_weight,
     run_commit_recurrent_kda,
     run_mega_recurrent_kda,
 )
@@ -857,13 +858,13 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
 
     def _build_mega_weights(self) -> MegaKDAWeights:
         """Prepare the external operator operands once after weight loading."""
-        o_proj_weight = ensure_mega_kda_nd(self.o_proj.weight.detach())
+        o_proj_weight = mega_kda_projection_weight(self.o_proj)
         o_norm_weight = self.o_norm.weight.detach()
         if o_norm_weight.dtype != torch.float32:
             o_norm_weight = o_norm_weight.to(torch.float32)
         conv = ensure_mega_kda_bf16(ensure_mega_kda_nd(self.get_parameter(_PACKED_CONV_WEIGHT_NAME).detach()))
         if self.uses_mixed_projection:
-            weight = ensure_mega_kda_nd(self.in_proj_qkvgfab.weight.detach())
+            weight = mega_kda_projection_weight(self.in_proj_qkvgfab)
             fused = self.fused_bfg_proj
             fused_weight = ensure_mega_kda_nd(fused.weight.detach())
             output_dim = getattr(fused.weight, "output_dim", 0)
@@ -877,7 +878,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 self.local_projection_size,
             )
         else:
-            weight = ensure_mega_kda_nd(self.in_proj_qkvgfab.weight.detach())
+            weight = mega_kda_projection_weight(self.in_proj_qkvgfab)
             local_projection = self.local_projection_size
             qkv_end = 3 * local_projection
             gate_end = qkv_end + local_projection
@@ -886,7 +887,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             gate_src = weight[qkv_end:gate_end]
             f_a_src = weight[gate_end:f_a_end]
             beta_src = weight[f_a_end : f_a_end + self.local_num_heads]
-            f_b_src = ensure_mega_kda_nd(self.f_b_proj.weight.detach())
+            f_b_src = mega_kda_projection_weight(self.f_b_proj)
         return MegaKDAWeights(
             qkv=mega_kda_nz_operand(qkv_src),
             f_a=mega_kda_nz_operand(f_a_src),
@@ -917,15 +918,27 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             self.gate_lower_bound is None
             or getattr(self.conv1d, "bias", None) is not None
             or any(
-                not isinstance(layer.quant_method, UnquantizedLinearMethod)
-                or layer.weight.dtype != torch.bfloat16
-                or layer.weight.ndim != 2
+                not (
+                    (
+                        isinstance(layer.quant_method, UnquantizedLinearMethod)
+                        and layer.weight.dtype == torch.bfloat16
+                        and layer.weight.ndim == 2
+                    )
+                    or (
+                        isinstance(
+                            getattr(layer.quant_method, "quant_method", layer.quant_method),
+                            AscendW8A8MXFP8DynamicLinearMethod,
+                        )
+                        and getattr(layer, "_mxfp8_transformed", False)
+                        and layer.weight.dtype == torch.float8_e4m3fn
+                    )
+                )
                 or getattr(layer, "bias", None) is not None
                 for layer in layers
             )
         ):
             logger.warning_once(
-                "MegaKDA requires bias-free, unquantized BF16 KDA projections and a bounded gate; "
+                "MegaKDA requires bias-free BF16 or finalized MXFP8 KDA projections and a bounded gate; "
                 "using the existing KDA path."
             )
             return False
@@ -950,6 +963,10 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         Returns the number of device bytes freed.
         """
         released = 0
+        # MXFP8 Linear finalizers retain buffer aliases. Keep their quantized
+        # operands/scales intact for fallback and subsequent weight reloads.
+        if any(param.dtype != torch.bfloat16 for param in self._released_mega_nd_params()):
+            return released
         for param in self._released_mega_nd_params():
             released += param.numel() * param.element_size()
             param.data = torch.empty(0, dtype=param.dtype, device=param.device)
@@ -983,6 +1000,9 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             weights.extend((self.fused_bfg_proj.weight, self.fused_bfg_proj.f_a_weight, self.fused_bfg_proj.f_b_weight))
         else:
             weights.append(self.f_b_proj.weight)
+        projections = [self.in_proj_qkvgfab, self.o_proj]
+        projections += [self.fused_bfg_proj] if self.uses_mixed_projection else [self.f_b_proj]
+        weights.extend(layer.weight_scale for layer in projections if hasattr(layer, "weight_scale"))
         signature = []
         for weight in weights:
             try:

@@ -600,6 +600,8 @@ class AscendConfig:
     # This is an Ascend-specific switch and is intentionally independent of
     # vLLM's generic cache_config.use_replayssm setting.
     enable_mega_kda_replayssm: bool = False
+    # Native MXFP8 QFA for 192/128 non-absorbed MLA prefill on A5 (TP only).
+    enable_mla_prefill_qfa: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
     # value (e.g. 4 = MXFP float8_e4m3 communication quantization) regardless of the
     # model's quant_type, 0 means disabled (use the model's own quant).
@@ -1010,7 +1012,8 @@ class AscendConfig:
         )
         if not is_kimi or not isinstance(linear_attn, dict) or "num_heads" not in linear_attn:
             raise ValueError(
-                "additional_config.enable_mega_kda_replayssm requires a Kimi K3 model with linear_attn_config.num_heads."
+                "additional_config.enable_mega_kda_replayssm requires a Kimi K3 model "
+                "with linear_attn_config.num_heads."
             )
         if not linear_attn.get("use_full_rank_gate", False):
             raise ValueError(
