@@ -16,8 +16,8 @@ class KimiDecodeSchedule:
     """One invocation's shared tensors/events; never retained by a communicator.
 
     Dispatch -> shared SiTU -> routed GMM1 -> shared Down.
-    MC2 Decode submits shared Gate/Up before Dispatch and shared ReduceScatter
-    after GMM2, preserving their original producer events.
+    MC2 Decode submits shared ReduceScatter after shared Down, overlapping
+    routed activation/quantization/GMM2. Other paths keep the 0.30 schedule.
     """
 
     def __init__(self, shared, prepared_input, router_ready, *, enable_superkernel=False, comm_stream=None):
@@ -29,7 +29,6 @@ class KimiDecodeSchedule:
         self.submitted = None
         self.down_input = None
         self.output = None
-        self.down_done = None
         self.output_done = None
 
     def before_dispatch(self, dispatch_ready):
@@ -67,19 +66,17 @@ class KimiDecodeSchedule:
         with npu_stream_switch(shared_experts_calculation_stream()):
             torch.npu.current_stream().wait_event(gmm1_done)
             self.output = self.shared.part2(self.submitted.hidden_states, self.down_input)
-            self.down_done = torch.npu.current_stream().record_event()
+            down_done = torch.npu.current_stream().record_event()
             self.output.record_stream(self.comm_stream)
-
-    def before_combine(self):
-        if self.output is None or self.down_done is None:
-            raise RuntimeError("Shared Down must be submitted before routed Combine")
+        # Dedicated communication stream waits only for its producer, never
+        # for routed Combine. The final join consumes this invocation's event.
         with moe_superkernel_scope(None, self.enable_superkernel), npu_stream_switch(self.comm_stream):
-            torch.npu.current_stream().wait_event(self.down_done)
+            torch.npu.current_stream().wait_event(down_done)
             self.output = self.shared._pad_and_reduce_scatter(self.output)
             self.output_done = torch.npu.current_stream().record_event()
 
     def finalize(self):
         if self.output is None or self.output_done is None:
-            raise RuntimeError("Shared ReduceScatter must be submitted before finalization")
+            raise RuntimeError("Routed MLP did not publish its GMM1 completion")
         self.output.record_stream(torch.npu.current_stream())
         return self.output
