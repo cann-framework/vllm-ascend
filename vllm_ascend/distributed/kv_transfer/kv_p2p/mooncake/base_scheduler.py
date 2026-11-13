@@ -148,8 +148,8 @@ class MooncakeBaseConnectorScheduler:
                             f"required_block_count={state_blocks}, available_block_count={len(blocks)}"
                         )
                     transfer_block_ids.append(blocks[state_blocks - 1 : state_blocks])
-                elif self.num_speculative_tokens > 0:
-                    transfer_block_ids.append(blocks[: -self.num_speculative_tokens])
+                elif mamba_spec.num_speculative_blocks > 0:
+                    transfer_block_ids.append(blocks[: -mamba_spec.num_speculative_blocks])
                 else:
                     transfer_block_ids.append(blocks)
             else:
