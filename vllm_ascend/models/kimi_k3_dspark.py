@@ -83,6 +83,13 @@ class AscendK3DSparkDecoderLayer(UpstreamK3DSparkDecoderLayer):
             prefix,
             f"layers.{start_layer_id + layer_idx}",
         )
+        # DSpark retains the target VllmConfig while using independent draft
+        # quantization. Register this role before the upstream NoPE-first
+        # constructor creates the attention impl; RoPE is installed only later.
+        draft_prefix = f"{layer_prefix}.self_attn"
+        draft_prefixes = getattr(vllm_config, "_kimi_c8_draft_layer_prefixes", ())
+        if draft_prefix not in draft_prefixes:
+            vllm_config._kimi_c8_draft_layer_prefixes = (*draft_prefixes, draft_prefix)
         self.self_attn = AscendKimiMLAAttention(
             config=config,
             hidden_size=config.hidden_size,

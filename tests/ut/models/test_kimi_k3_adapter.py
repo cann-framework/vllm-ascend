@@ -844,3 +844,22 @@ def test_k3_dspark_pp_mapper_keeps_frozen_embed_but_drops_heads(monkeypatch):
         "context_proj.weight",
     ):
         assert pp_mapper._map_name(name) == upstream_mapper._map_name(name)
+
+
+@pytest.mark.parametrize("order", [("kda", "c8"), ("c8", "kda"), ("kda", "c16")])
+def test_c8_metadata_binds_to_preceding_kda_only(order):
+    model = AscendKimiLinearModel.__new__(AscendKimiLinearModel)
+    nn.Module.__init__(model)
+    kda = kimi_k3.AscendKimiK3DeltaAttention.__new__(kimi_k3.AscendKimiK3DeltaAttention)
+    nn.Module.__init__(kda)
+    launch = MagicMock()
+    model.layers = [
+        SimpleNamespace(
+            self_attn=kda
+            if kind == "kda"
+            else SimpleNamespace(impl=SimpleNamespace(kimi_c8_mode=kind == "c8", _prelaunch_kimi_c8_metadata=launch))
+        )
+        for kind in order
+    ]
+    model._bind_c8_metadata_prelaunch()
+    assert getattr(kda, "_kimi_c8_metadata_prelaunch", None) is (launch if order == ("kda", "c8") else None)

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -247,3 +248,14 @@ def test_base_scheduler_on_new_request_truncates_only_stateful_producer(need_tru
     assert request._all_token_ids == request.prompt_token_ids
     assert request.num_prompt_tokens == (2 if truncated else 3)
     assert request.max_tokens == (1 if truncated else 8)
+
+
+@pytest.mark.parametrize("global_tail,spec_tail", [(3, 0), (0, 3), (3, 3)])
+def test_mamba_publication_uses_actual_spec_tail(global_tail, spec_tail):
+    scheduler = MooncakeBaseConnectorScheduler.__new__(MooncakeBaseConnectorScheduler)
+    scheduler.num_speculative_tokens = global_tail
+    scheduler.group_block_size = [16]
+    scheduler.group_unique_specs = [[replace(make_mamba_spec(), num_speculative_blocks=spec_tail)]]
+    # RecoverSSM has one live state even when speculative decoding is enabled.
+    blocks = [10] + list(range(11, 11 + spec_tail))
+    assert scheduler._get_transfer_block_ids((blocks,), prompt_len=8) == ([10],)

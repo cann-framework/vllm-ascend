@@ -609,6 +609,10 @@ class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
     def kv_cache(self):
         return self._attention_layer.kv_cache
 
+    @kv_cache.setter
+    def kv_cache(self, value):
+        self._attention_layer.kv_cache = value
+
     @property
     def kv_cache_dtype(self):
         return self._attention_layer.kv_cache_dtype
@@ -1006,6 +1010,20 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
 
         world_size = get_tensor_model_parallel_world_size()
         assert config.num_attention_heads % world_size == 0, "num_attention_heads must be divisible by world_size"
+        self._bind_c8_metadata_prelaunch()
+
+    def _bind_c8_metadata_prelaunch(self) -> None:
+        # Bind once; launch inside KDA's existing eager-break, never traced Python.
+        first_kda = None
+        for layer in self.layers:
+            attention = getattr(layer, "self_attn", None)
+            if isinstance(attention, AscendKimiK3DeltaAttention) and first_kda is None:
+                first_kda = attention
+            impl = getattr(attention, "impl", None)
+            if getattr(impl, "kimi_c8_mode", False):
+                if first_kda is not None:
+                    first_kda._kimi_c8_metadata_prelaunch = impl._prelaunch_kimi_c8_metadata
+                return
 
     def _cache_aux_pp_layout(self) -> None:
         super()._cache_aux_pp_layout()

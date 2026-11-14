@@ -1358,6 +1358,9 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             return
 
         assert isinstance(attn_metadata_raw, dict)
+        prelaunch = getattr(self, "_kimi_c8_metadata_prelaunch", None)
+        if prelaunch is not None:
+            prelaunch(attn_metadata_raw)
         attn_metadata = attn_metadata_raw[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 

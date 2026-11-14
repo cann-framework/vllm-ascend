@@ -1,8 +1,10 @@
 import torch
 from vllm.config import get_current_vllm_config
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.logger import logger
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
 from ..base import AscendAttentionScheme
@@ -34,6 +36,9 @@ class AscendFAQuantAttentionMethod:
         config = vllm_config.model_config.hf_config
         self.kv_lora_rank = getattr(config, "kv_lora_rank", 0)
         self.qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
+        self.is_kimi_k3 = getattr(config, "model_type", "") in ("kimi_linear", "kimi_k3") or "Kimi" in str(
+            getattr(config, "architectures", "")
+        )
 
     def create_weights(self, layer: torch.nn.Module) -> None:
         extra_module_names = ["fa_q", "fa_k", "fa_v"]
@@ -58,6 +63,39 @@ class AscendFAQuantAttentionMethod:
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         fa_k_scale = torch.squeeze(layer.fa_k.scale).unsqueeze(0)
+        static_c8 = (
+            getattr(get_ascend_config(), "mla_cache_mode", "C16") == "C8"
+            and getattr(getattr(layer, "impl", None), "kimi_c8_mode", False) is True
+        )
+        if static_c8 and not (
+            self.kv_lora_rank == 512 and self.qk_rope_head_dim == 64 and getattr(self, "is_kimi_k3", False)
+        ):
+            raise ValueError("MLA cache mode C8 requires Kimi K3 with latent/aux geometry 512/64")
+        if static_c8:
+            if not get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION):
+                raise ValueError("Kimi static C8 requires FP8_ATTENTION hardware support")
+            config = get_current_vllm_config()
+            graph_mode = config.compilation_config.cudagraph_mode
+            if graph_mode not in (CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY):
+                raise ValueError("Kimi static C8 supports NONE or FULL_DECODE_ONLY Graph mode; prefill stays eager")
+            if graph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
+                transfer = getattr(config, "kv_transfer_config", None)
+                if transfer is not None and getattr(transfer, "is_kv_producer", False):
+                    raise ValueError("Kimi static C8 prefill producer must use eager execution")
+                parallel = getattr(config, "parallel_config", None)
+                if getattr(parallel, "prefill_context_parallel_size", 1) != 1:
+                    raise ValueError("Kimi static C8 decode Graph requires PCP=1")
+            if fa_k_scale.numel() != 1:
+                raise ValueError(f"Kimi K3 C8 requires one static MLA KV scale; got shape={tuple(fa_k_scale.shape)}")
+            if not bool(torch.isfinite(fa_k_scale).all()) or bool((fa_k_scale <= 0).any()):
+                raise ValueError("Kimi K3 C8 MLA KV scale must be finite and positive")
+            if bool((layer.fa_k.offset != 0).any()):
+                raise ValueError("Kimi static FP8 C8 requires zero fa_k.offset; INT8 offsets cannot be reused")
+            layer.kimi_c8_static_fp8 = True
+            layer.kimi_c8_graph = graph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+            layer.kv_cache_torch_dtype = torch.float8_e4m3fn
+        elif getattr(layer, "kimi_c8_static_fp8", False):
+            raise ValueError("static C8 marker requires explicit mla_cache_mode=C8")
         layer.fak_descale_float = torch.nn.Parameter(fa_k_scale.to(torch.float), requires_grad=False)
         layer.fak_descale = torch.nn.Parameter(fa_k_scale, requires_grad=False)
         if get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION):

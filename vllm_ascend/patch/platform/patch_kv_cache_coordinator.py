@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import sys
 from collections.abc import Mapping
 from math import lcm
 
 import vllm
+from vllm.logger import logger
 import vllm.envs as envs_vllm
 import vllm.v1.core.kv_cache_coordinator as vllm_kv_cache_coordinator
 from vllm.utils.math_utils import cdiv
@@ -566,3 +568,82 @@ vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator = get_kv_cache_coordi
 _kv_cache_manager = sys.modules.get("vllm.v1.core.kv_cache_manager")
 if _kv_cache_manager is not None:
     _kv_cache_manager.get_kv_cache_coordinator = get_kv_cache_coordinator  # type: ignore[attr-defined]
+
+
+# Optional diagnosis for hybrid admission. Disabled by default so normal
+# scheduling has no extra logging or manager calls.
+if _kv_cache_manager is not None and not hasattr(_kv_cache_manager.KVCacheManager, "_ascend_kv_admission_debug"):
+    _kv_orig_allocate_slots = _kv_cache_manager.KVCacheManager.allocate_slots
+
+    def _ascend_allocate_slots_with_admission_debug(self, request, num_new_tokens, *args, **kwargs):
+        result = _kv_orig_allocate_slots(self, request, num_new_tokens, *args, **kwargs)
+        if result is not None or os.environ.get("ASCEND_KV_ADMISSION_DEBUG") != "1":
+            return result
+
+        coordinator = getattr(self, "coordinator", None)
+        managers = getattr(coordinator, "single_type_managers", ())
+        pool = getattr(self, "block_pool", None)
+        free_blocks = pool.get_num_free_blocks() if pool is not None else None
+        num_new_computed_tokens = kwargs.get("num_new_computed_tokens", 0)
+        new_computed_blocks = kwargs.get("new_computed_blocks")
+        new_groups = (
+            new_computed_blocks.blocks
+            if new_computed_blocks is not None
+            else getattr(getattr(self, "empty_kv_cache_blocks", None), "blocks", ())
+        )
+        num_external = kwargs.get("num_external_computed_tokens", 0)
+        num_lookahead = kwargs.get("num_lookahead_tokens", 0)
+        num_local = request.num_computed_tokens + num_new_computed_tokens
+        total = min(num_local + num_external, self.max_model_len)
+        need_tokens = min(total + num_new_tokens + num_lookahead, self.max_model_len)
+        group_rows = []
+        for gid, manager in enumerate(managers):
+            try:
+                group_blocks = new_groups[gid] if gid < len(new_groups) else ()
+                required = manager.get_num_blocks_to_allocate(
+                    request.request_id,
+                    need_tokens,
+                    group_blocks,
+                    total,
+                    num_local,
+                    need_tokens,
+                    apply_admission_cap=True,
+                )
+                current = len(manager.req_to_blocks.get(request.request_id, ()))
+                group_spec = self.kv_cache_config.kv_cache_groups[gid]
+                group_rows.append({
+                    "gid": gid,
+                    "layers": list(group_spec.layer_names[:3]),
+                    "manager": type(manager).__name__,
+                    "block_size": getattr(manager, "block_size", None),
+                    "page_size": getattr(group_spec.kv_cache_spec, "page_size_bytes", None),
+                    "page_size_padded": getattr(group_spec.kv_cache_spec, "page_size_padded", None),
+                    "current": current,
+                    "required": required,
+                })
+            except Exception as exc:  # pragma: no cover - diagnosis must not affect admission
+                group_rows.append({"gid": gid, "error": type(exc).__name__})
+        required_total = sum(row.get("required", 0) for row in group_rows if "required" in row)
+        logger.warning(
+            "ASCEND_KV_ADMISSION blocked request=%s status=%s free_blocks=%s total_blocks=%s "
+            "required_total=%s new_tokens=%s computed=%s external=%s lookahead=%s "
+            "reserved=%s watermark=%s full_fit=%s coordinator=%s groups=%s",
+            request.request_id,
+            getattr(request, "status", None),
+            free_blocks,
+            getattr(pool, "num_gpu_blocks", None),
+            required_total,
+            num_new_tokens,
+            request.num_computed_tokens,
+            num_external,
+            num_lookahead,
+            kwargs.get("reserved_blocks", 0),
+            getattr(self, "watermark_blocks", None),
+            kwargs.get("full_sequence_must_fit", False),
+            type(coordinator).__name__ if coordinator is not None else None,
+            group_rows,
+        )
+        return result
+
+    _kv_cache_manager.KVCacheManager.allocate_slots = _ascend_allocate_slots_with_admission_debug
+    _kv_cache_manager.KVCacheManager._ascend_kv_admission_debug = True
