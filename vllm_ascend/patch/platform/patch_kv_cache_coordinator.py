@@ -616,21 +616,31 @@ if _kv_cache_manager is not None and not hasattr(_kv_cache_manager.KVCacheManage
                     "layers": list(group_spec.layer_names[:3]),
                     "manager": type(manager).__name__,
                     "block_size": getattr(manager, "block_size", None),
+                    "page_size": getattr(group_spec.kv_cache_spec, "page_size_bytes", None),
+                    "page_size_padded": getattr(group_spec.kv_cache_spec, "page_size_padded", None),
                     "current": current,
                     "required": required,
                 })
             except Exception as exc:  # pragma: no cover - diagnosis must not affect admission
                 group_rows.append({"gid": gid, "error": type(exc).__name__})
+        required_total = sum(row.get("required", 0) for row in group_rows if "required" in row)
         logger.warning(
-            "ASCEND_KV_ADMISSION blocked request=%s free_blocks=%s new_tokens=%s "
-            "computed=%s external=%s lookahead=%s full_fit=%s groups=%s",
+            "ASCEND_KV_ADMISSION blocked request=%s status=%s free_blocks=%s total_blocks=%s "
+            "required_total=%s new_tokens=%s computed=%s external=%s lookahead=%s "
+            "reserved=%s watermark=%s full_fit=%s coordinator=%s groups=%s",
             request.request_id,
+            getattr(request, "status", None),
             free_blocks,
+            getattr(pool, "num_gpu_blocks", None),
+            required_total,
             num_new_tokens,
             request.num_computed_tokens,
             num_external,
             num_lookahead,
+            kwargs.get("reserved_blocks", 0),
+            getattr(self, "watermark_blocks", None),
             kwargs.get("full_sequence_must_fit", False),
+            type(coordinator).__name__ if coordinator is not None else None,
             group_rows,
         )
         return result
