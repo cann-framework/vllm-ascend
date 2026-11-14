@@ -1,21 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
-
 import torch
 
 from vllm_ascend.attention.kimi_c8_metadata import build_quant_mla_metadata_kwargs
 from vllm_ascend.attention.kimi_c8_static import FP8_E4M3_MAX
 
 
-@dataclass
-class KimiC8StepMetadata:
-    cache: dict[tuple, torch.Tensor] = field(default_factory=dict)
-
-
 def build_step_metadata(
-    step: KimiC8StepMetadata,
     op: Callable,
     cache_seqlens: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
@@ -26,11 +18,11 @@ def build_step_metadata(
     max_seqlen_kv: int,
     host_metadata_key: tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]] | None = None,
 ) -> torch.Tensor:
-    """Reuse the latest schedule, using existing host lengths when supplied.
+    """Build one metadata tensor for the caller's already-keyed step.
 
-    The host key contains cache_seqlens, cu_seqlens_q and seqused_q values, in
-    that order. Callers build it alongside the matching device tensors so this
-    layer does not synchronize the device merely to identify a schedule.
+    The MLA implementation owns the outer per-step cache. Keeping another
+    cache object here only created a fresh cache on every miss and never
+    reused it across layers or steps.
     """
     if host_metadata_key is None:
         host_metadata_key = (
@@ -43,27 +35,15 @@ def build_step_metadata(
         for values, tensor in zip(host_metadata_key, (cache_seqlens, cu_seqlens_q, seqused_q))
     ):
         raise ValueError("host_metadata_key must contain the three matching metadata value tuples")
-    key = (
-        num_heads_q,
-        max_seqlen_q,
-        max_seqlen_kv,
-        *(tuple(values) for values in host_metadata_key),
+    kwargs = build_quant_mla_metadata_kwargs(
+        cache_seqlens,
+        cu_seqlens_q,
+        seqused_q,
+        num_heads_q=num_heads_q,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_kv=max_seqlen_kv,
     )
-    metadata = step.cache.get(key)
-    if metadata is None:
-        kwargs = build_quant_mla_metadata_kwargs(
-            cache_seqlens,
-            cu_seqlens_q,
-            seqused_q,
-            num_heads_q=num_heads_q,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_kv=max_seqlen_kv,
-        )
-        metadata = op(**kwargs)
-        step.cache.clear()
-        step.cache[key] = metadata
-    return metadata
-
+    return op(**kwargs)
 
 def run_quant_mla(
     q: torch.Tensor,

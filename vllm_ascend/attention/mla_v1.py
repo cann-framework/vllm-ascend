@@ -1598,7 +1598,7 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         from vllm_ascend.attention.kimi_c8_dcp import build_c8_dcp_query_plan
         from vllm_ascend.attention.kimi_c8_graph import build_c8_graph_query_plan, prepare_c8_graph_metadata
-        from vllm_ascend.attention.kimi_c8_quant import KimiC8StepMetadata, build_step_metadata
+        from vllm_ascend.attention.kimi_c8_quant import build_step_metadata
 
         if start_step:
             layer_name = self.layer_name
@@ -1714,7 +1714,6 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
         else:
             metadata = build_step_metadata(
-                KimiC8StepMetadata(),
                 launch,
                 plan.cache_seqlens,
                 plan.cu_seqlens_q,
