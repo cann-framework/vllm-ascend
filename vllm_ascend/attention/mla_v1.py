@@ -1732,9 +1732,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         cache[key] = result
         return result
 
-    def _run_kimi_c8_decode(self, hidden_states, kv_cache, attn_metadata, projection=None):
+    def _run_kimi_c8_decode(self, hidden_states, kv_cache, attn_metadata, *, projection):
         """Quantized rank-local attention; merge DCP contributions before V up-projection."""
-        from vllm_ascend.attention.kimi_c8_decode import project_and_write_kimi_c8, project_and_write_kimi_c8_prolog
         from vllm_ascend.attention.kimi_c8_quant import run_quant_mla
         from vllm_ascend.attention.kimi_c8_static import pa_nz_prolog_view
 
@@ -1749,33 +1748,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             raise RuntimeError("Kimi C8 decode requires query offsets and sequence lengths")
         plan, metadata, producer = self._prepare_kimi_c8_step(attn_metadata)
         if projection is None:
-            slots = self._kimi_c8_physical_slots(attn_metadata.slot_mapping[: attn_metadata.num_decode_tokens])
-            is_graph = getattr(self, "kimi_c8_graph", False) and getattr(attn_metadata, "num_prefills", 0) == 0
-            projection = project_and_write_kimi_c8_prolog(
-                self,
-                hidden_states,
-                raw,
-                slots,
-                num_decode_tokens=attn_metadata.num_decode_tokens,
-                is_graph=is_graph,
-            )
-            if projection is None:
-                writer = None
-                if is_graph:
-                    from vllm_ascend.device.kimi_c8_cache_write import write_static_fp8_cache_graph
-
-                    writer = write_static_fp8_cache_graph
-                projection = project_and_write_kimi_c8(
-                    self,
-                    hidden_states,
-                    raw,
-                    slots,
-                    self.fak_descale_float,
-                    num_decode_tokens=attn_metadata.num_decode_tokens,
-                    cos=decode.cos,
-                    sin=decode.sin,
-                    cache_writer=writer,
-                )
+            raise RuntimeError("C8 decode requires a prepared projection")
         q, q_descale = projection if isinstance(projection, tuple) else (projection.q, projection.q_descale)
         if q is None or q_descale is None:
             raise RuntimeError("C8 decode projections must contain Q and its descale")

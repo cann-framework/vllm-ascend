@@ -8,10 +8,6 @@ PA_NZ_BLOCK_SIZE = 128
 K3_MLA_CACHE_WIDTH = 576
 
 
-def static_fp8_scale(x: torch.Tensor) -> torch.Tensor:
-    return (torch.clamp(x.detach().float().abs().amax(), min=1e-8) / FP8_E4M3_MAX).reshape(1)
-
-
 def quantize_static_fp8(x: torch.Tensor, scale: torch.Tensor | float) -> torch.Tensor:
     s = torch.as_tensor(scale, device=x.device, dtype=torch.float32)
     if s.numel() != 1 or not bool(torch.isfinite(s).all()) or bool((s <= 0).any()):
@@ -97,23 +93,6 @@ def pa_nz_prolog_view(cache: torch.Tensor) -> torch.Tensor:
     ):
         raise ValueError("C8 Prolog requires contiguous [blocks,1,18,128,32] PA_NZ cache")
     return cache.view(torch.float8_e4m3fn).view(cache.shape[0], PA_NZ_BLOCK_SIZE, 1, K3_MLA_CACHE_WIDTH)
-
-
-def expand_pa_nz_block_table(block_table: torch.Tensor, block_size: int) -> torch.Tensor:
-    """Translate manager block IDs to all constituent 128-token block IDs.
-
-    Slots need no translation: manager_id * block_size + offset is identical
-    to kernel_id * 128 + kernel_offset. Negative block IDs remain invalid.
-    """
-    ratio = _kernel_blocks_per_manager(block_size)
-    if block_table.ndim != 2 or block_table.dtype not in (torch.int32, torch.int64):
-        raise ValueError("C8 block table must be a rank-2 integer tensor")
-    if ratio == 1:
-        return block_table
-    offsets = torch.arange(ratio, dtype=block_table.dtype, device=block_table.device)
-    expanded = block_table.unsqueeze(-1) * ratio + offsets
-    expanded = torch.where(block_table.unsqueeze(-1) >= 0, expanded, block_table.unsqueeze(-1))
-    return expanded.flatten(1)
 
 
 def read_static_fp8_cache(
