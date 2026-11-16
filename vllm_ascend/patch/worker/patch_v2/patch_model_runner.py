@@ -8,6 +8,8 @@ from vllm.v1.worker.gpu import model_runner as upstream
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp as _dispatch_cg_and_sync_dp
 
 from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_sharding_enabled
+from vllm_ascend.core.kv_cache_interface import is_sliding_window_gqa_draft_group
+from vllm_ascend.worker.block_table import max_num_blocks_per_req_for_group
 from vllm_ascend.worker.utils import copy_kv_cache_blocks_inplace
 
 
@@ -46,6 +48,9 @@ def initialize_kv_cache(
 
     block_sizes = []
     max_num_blocks_per_group = []
+    cp_sizes = []
+    cp_ranks = []
+    cp_interleaves = []
     slot_mapping_enabled = []
     for kv_cache_group in kv_cache_config.kv_cache_groups:
         spec = kv_cache_group.kv_cache_spec
@@ -54,7 +59,21 @@ def initialize_kv_cache(
         slot_mapping_enabled.append(layer_spec.uses_slot_mapping)
         # Let each cache type account for CP. Attention KV is DCP-sharded,
         # while Mamba/GDN recurrent state is replicated across DCP ranks.
-        max_num_blocks = spec.max_num_blocks_per_req(self.vllm_config, block_table_max_model_len)
+        is_replicated_window = is_sliding_window_gqa_draft_group(kv_cache_group)
+        if is_replicated_window:
+            max_num_blocks = max_num_blocks_per_req_for_group(
+                spec,
+                self.vllm_config,
+                block_table_max_model_len,
+                kv_cache_group,
+            )
+        else:
+            max_num_blocks = spec.max_num_blocks_per_req(
+                self.vllm_config, block_table_max_model_len
+            )
+        cp_sizes.append(1 if is_replicated_window else self.dcp_size)
+        cp_ranks.append(0 if is_replicated_window else self.dcp_rank)
+        cp_interleaves.append(1 if is_replicated_window else self.cp_interleave)
         # Preserve each cache type's alignment requirements after applying
         # its topology-aware block-table width.
         max_num_blocks = upstream.get_block_table_width(
@@ -113,6 +132,9 @@ def initialize_kv_cache(
         cp_size=self.dcp_size,
         cp_rank=self.dcp_rank,
         cp_interleave=self.cp_interleave,
+        cp_sizes=cp_sizes,
+        cp_ranks=cp_ranks,
+        cp_interleaves=cp_interleaves,
     )
     self.pcp_manager = upstream.pcp.maybe_build_pcp_manager(
         self.vllm_config,

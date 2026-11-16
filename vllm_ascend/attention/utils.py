@@ -317,10 +317,21 @@ def requires_contiguous_pa_kv_cache(layer, vllm_config: VllmConfig, spec: FullAt
     )
 
 
-@lru_cache(maxsize=1)
 def enable_dcp():
+    """Return whether the currently active model config enables DCP.
+
+    The target and DSpark draft are constructed under different VllmConfigs
+    in one worker.  Caching this value globally makes a target DCP=8 result
+    leak into a Window-GQA draft whose local config deliberately uses DCP=1.
+    """
     parallel_config = get_current_vllm_config().parallel_config
     return parallel_config.decode_context_parallel_size > 1
+
+
+# Keep the compatibility hook used by attention unit tests and older callers
+# that cleared the former one-entry lru cache. The value is now resolved from
+# the active config on every call, so clearing is intentionally a no-op.
+enable_dcp.cache_clear = lambda: None
 
 
 def enable_pcp():

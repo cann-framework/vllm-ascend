@@ -249,6 +249,33 @@ def test_eagle3_gqa_pcp_dcp_skips_tp_only_head_limit():
     _validate_draft_decode_context_parallel_config(vllm_config)
 
 
+def test_dspark_gqa_dcp_skips_generic_head_sharding_validation():
+    draft_model_config = SimpleNamespace(
+        use_mla=False,
+        model_arch_config=SimpleNamespace(total_num_attention_heads=64),
+        get_total_num_kv_heads=lambda: 16,
+    )
+    speculative_config = SimpleNamespace(
+        method="dspark",
+        num_speculative_tokens_per_batch_size=None,
+        draft_model_config=draft_model_config,
+        draft_parallel_config=None,
+        draft_tensor_parallel_size=8,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=speculative_config,
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=8,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=8,
+        ),
+    )
+
+    # DSpark's DCP metadata path does not use the ordinary GQA head-sharding
+    # topology, so TP8/DCP8 with 16 KV heads is valid here.
+    _validate_draft_decode_context_parallel_config(vllm_config)
+
+
 @pytest.mark.parametrize("model_role", ["target", "draft", "alias", "non_speculative"])
 def test_sfa_dcp_validation_only_bypasses_separate_draft(model_role):
     target = object()

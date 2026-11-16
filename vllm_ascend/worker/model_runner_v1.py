@@ -232,6 +232,7 @@ from vllm_ascend.worker.dcp_utils import (
     DCPDummyRunMetadata,
     DCPManager,
 )
+from vllm_ascend.worker.block_table import max_num_blocks_per_req_for_group
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataExecutor,
     DeviceMetadataTask,
@@ -6146,9 +6147,11 @@ class NPUModelRunner(GPUModelRunner):
         max_num_blocks = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         for kv_cache_group in non_encoder_groups:
-            max_num_blocks_per_req = kv_cache_group.kv_cache_spec.max_num_blocks_per_req(
+            max_num_blocks_per_req = max_num_blocks_per_req_for_group(
+                kv_cache_group.kv_cache_spec,
                 self.vllm_config,
                 max_model_len,
+                kv_cache_group,
             )
             max_num_blocks.append(max_num_blocks_per_req)
 

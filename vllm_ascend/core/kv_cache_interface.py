@@ -52,6 +52,38 @@ def is_circular_kv_cache_spec(kv_cache_spec: KVCacheSpec) -> bool:
     return isinstance(kv_cache_spec, CircularBufferSpec) or getattr(kv_cache_spec, "is_circular", False)
 
 
+def is_sliding_window_gqa_spec(kv_cache_spec: KVCacheSpec) -> bool:
+    """Return whether a cache spec is ordinary (non-MLA) sliding-window GQA.
+
+    ``SlidingWindowMLASpec`` and circular indexer-tail specs also inherit from
+    ``SlidingWindowSpec``.  They have different cache layouts and must not be
+    treated as the Window-GQA draft cache that is replicated when target MLA
+    uses DCP.
+    """
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        specs = tuple(kv_cache_spec.kv_cache_specs.values())
+        return bool(specs) and all(is_sliding_window_gqa_spec(spec) for spec in specs)
+    return (
+        isinstance(kv_cache_spec, SlidingWindowSpec)
+        and not isinstance(kv_cache_spec, SlidingWindowMLASpec)
+        and not is_circular_kv_cache_spec(kv_cache_spec)
+    )
+
+
+def is_sliding_window_gqa_draft_group(kv_cache_group) -> bool:
+    """Return whether a cache group is a speculative Window-GQA group.
+
+    Ordinary sliding-window attention remains unsupported with worker-wide
+    DCP.  The only exception is a speculative draft group, whose cache is
+    deliberately replicated on every rank and therefore uses a local DCP
+    size of one.  ``is_eagle_group`` is preserved by vLLM when projecting
+    groups to workers and when building the scheduler-side copy.
+    """
+    return bool(getattr(kv_cache_group, "is_eagle_group", False)) and is_sliding_window_gqa_spec(
+        kv_cache_group.kv_cache_spec
+    )
+
+
 def is_prefix_cacheable(kv_cache_spec: KVCacheSpec) -> bool:
     """Resolve cacheability through uniform wrappers.
 
