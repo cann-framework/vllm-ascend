@@ -16,6 +16,7 @@
 # This file is a part of the vllm-ascend project.
 #
 from collections.abc import Mapping, Sequence
+from copy import copy
 from typing import Any, cast
 
 import numpy as np
@@ -274,6 +275,15 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         target_input_buffers: Any,
         target_attn_groups: Any,
     ) -> None:
+        if self._window_gqa_dcp_fallback:
+            # Upstream input preparation and metadata construction read the
+            # scalar CP tuple, not AscendBlockTables' per-group tuples. Give
+            # this draft its own topology view while sharing the runner's
+            # persistent block-table/slot tensors (also used by graph replay).
+            block_tables = copy(block_tables)
+            block_tables.cp_size = 1
+            block_tables.cp_rank = 0
+            block_tables.cp_interleave = 1
         # Initialize the draft attention backend with its PCP=1 config.
         with set_current_vllm_config(self.attn_vllm_config):
             super().set_attn(
