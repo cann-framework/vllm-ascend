@@ -582,10 +582,12 @@ class AscendConfig:
     # FULL graphs wait on descriptor-specific external events at consumers.
     # Default to overlap on A5 only; explicit settings override this policy.
     multistream_engram_overlap: bool = dataclasses.field(
-        default_factory=lambda: get_current_hardware_profile().device_adaptor_family
-        == DeviceAdaptorFamily.FP8_OPTIMIZED
+        default_factory=lambda: (
+            get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+        )
     )
     enable_prefill_mc2: bool = False
+    enable_multi_streams: bool = False
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
@@ -1010,12 +1012,12 @@ class AscendConfig:
         )
         if not is_kimi or not isinstance(linear_attn, dict) or "num_heads" not in linear_attn:
             raise ValueError(
-                "additional_config.enable_mega_kda_replayssm requires a Kimi K3 model with linear_attn_config.num_heads."
+                "additional_config.enable_mega_kda_replayssm requires a Kimi K3 model "
+                "with linear_attn_config.num_heads."
             )
         if not linear_attn.get("use_full_rank_gate", False):
             raise ValueError(
-                "additional_config.enable_mega_kda_replayssm requires "
-                "linear_attn_config.use_full_rank_gate=true."
+                "additional_config.enable_mega_kda_replayssm requires linear_attn_config.use_full_rank_gate=true."
             )
 
     @property

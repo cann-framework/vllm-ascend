@@ -10,8 +10,8 @@ in preflight tests: the decode hot path must not copy lengths or tables to the C
 """
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -29,6 +29,26 @@ FLASHMLA_BLOCK_SIZE = 128
 FLASHMLA_SUPPORTED_BLOCK_SIZES = tuple(range(FLASHMLA_BLOCK_SIZE, 1024 + 1, FLASHMLA_BLOCK_SIZE))
 FLASHMLA_MASK_SIZE = 2048
 FLASHMLA_MAX_BATCH_SIZE = 65535
+PA_NZ_TILE_WIDTH = 16
+PA_NZ_TILE_COUNT = FLASHMLA_QK_DIM // PA_NZ_TILE_WIDTH
+FLASHMLA_STREAM_ALLOCATION_ATTEMPTS = 64
+
+
+def _pa_nz_tile_indices(
+    slots: torch.Tensor,
+    block_size: int,
+    tile_offsets: torch.Tensor,
+    tile_count: int,
+) -> torch.Tensor:
+    """Build flattened PA_NZ tile rows from already-sanitized token slots.
+
+    The geometry tensors are owned by ``FlashMLADecode`` and reused for every
+    MLA layer.  Only the request-dependent block and in-block offsets are
+    calculated during metadata refresh.
+    """
+    block_ids = torch.div(slots, block_size, rounding_mode="floor")
+    offsets = torch.remainder(slots, block_size)
+    return (block_ids[:, None] * (tile_count * block_size) + tile_offsets[None, :] + offsets[:, None]).reshape(-1)
 
 
 def prepare_flashmla_batch_req_state(
@@ -111,8 +131,8 @@ class FlashMLAConfig:
             raise ValueError(f"FlashMLA requires one of {MLA_FLASH_SUPPORTED_Q_HEADS} Q heads, got {self.num_heads}")
         if self.mask_mode not in (0, 3, 4):
             raise ValueError("FlashMLA mask_mode must be 0, 3 or 4")
-        if self.layout_kv != "PA_BBND":
-            raise ValueError("FlashMLA layout_kv must be PA_BBND")
+        if self.layout_kv not in ("PA_BBND", "PA_NZ"):
+            raise ValueError("FlashMLA layout_kv must be PA_BBND or PA_NZ")
         if self.cache_block_size not in FLASHMLA_SUPPORTED_BLOCK_SIZES:
             raise ValueError(f"FlashMLA cache block size must be in {FLASHMLA_SUPPORTED_BLOCK_SIZES}")
         if self.mask_mode != 4 and (self.win_left != -1 or self.win_right != -1):
@@ -257,6 +277,10 @@ class FlashMLAImpl:
         window_args = (
             {"win_left": self.config.win_left, "win_right": self.config.win_right} if self.config.mask_mode == 4 else {}
         )
+        if self.config.layout_kv == "PA_NZ":
+            from vllm_ascend.ops.flash_mla_pa_nz import pa_nz_cache_view  # noqa: PLC0415
+
+            k_cache = pa_nz_cache_view(k_cache)
         output, lse = self.attention_op(
             q,
             k_cache,
@@ -302,6 +326,8 @@ class FlashMLAImpl:
         cache_tail = (self.config.cache_block_size, 1, FLASHMLA_QK_DIM)
         if k_cache.ndim != len(cache_tail) + 1 or k_cache.shape[1:] != cache_tail or k_cache.shape[0] == 0:
             raise ValueError(f"FlashMLA {self.config.layout_kv} cache must have shape (pages, {cache_tail})")
+        if self.config.layout_kv == "PA_NZ" and (k_cache.dtype != torch.bfloat16 or not k_cache.is_contiguous()):
+            raise ValueError("PA_NZ FlashMLA requires a dense BF16 cache")
         if k_cache.dtype != q.dtype:
             raise ValueError("FlashMLA q and k_cache must have the same dtype")
         if block_table.ndim != 2 or block_table.shape[0] != batch_size or block_table.shape[1] == 0:
@@ -339,6 +365,20 @@ class FlashMLADecode:
     cos: torch.Tensor | None
     sin: torch.Tensor | None
 
+    metadata_builder: Any = None
+    metadata_started: bool = False
+    metadata_async: bool = False
+    metadata_start: Any = None
+    metadata_ready: Any = None
+    metadata_capture_started: bool = False
+    metadata_capture_events: list[tuple[Any, Any]] = field(default_factory=list)
+    prolog_slots: torch.Tensor | None = None
+    pa_nz_current_cache: torch.Tensor | None = None
+    pa_nz_current_slots: torch.Tensor | None = None
+    pa_nz_copy_src_indices: torch.Tensor | None = None
+    pa_nz_copy_dst_indices: torch.Tensor | None = None
+    pa_nz_tile_offsets: torch.Tensor | None = None
+
 
 class FlashMLAMetadataBuilder:
     def __init__(
@@ -349,9 +389,28 @@ class FlashMLAMetadataBuilder:
         attn_mask: torch.Tensor,
         *,
         cache_block_size: int = FLASHMLA_BLOCK_SIZE,
+        enable_async: bool = False,
     ):
         self.dcp_size = getattr(impl, "dcp_size", 1)
         self.dcp_rank = getattr(impl, "dcp_rank", 0)
+        self.enable_async = bool(enable_async)
+        self.metadata_stream = None
+        if self.enable_async:
+            # Stream() can draw from a runtime pool: distinct Python objects
+            # alone do not establish isolation from the Kimi router stream.
+            reserved_streams = (
+                torch.npu.current_stream(),
+                getattr(impl.vllm_config, "_kimi_router_stream", None),
+                getattr(impl.vllm_config, "_kimi_shared_comm_stream", None),
+                getattr(impl.vllm_config, "_kimi_shared_compute_stream", None),
+            )
+            for _ in range(FLASHMLA_STREAM_ALLOCATION_ATTEMPTS):
+                stream = torch.npu.Stream()
+                if all(reserved is None or stream != reserved for reserved in reserved_streams):
+                    self.metadata_stream = stream
+                    break
+            if self.metadata_stream is None:
+                raise RuntimeError("Unable to allocate a FlashMLA stream distinct from the Kimi MoE streams")
         # Materialize once: an integer rank would trigger a blocking H2D copy
         # inside get_dcp_local_seq_lens on every metadata refresh.
         self.dcp_rank_tensor = (
@@ -371,6 +430,7 @@ class FlashMLAMetadataBuilder:
                 # shard. The output exchange restores this rank's local heads.
                 impl.num_heads * self.dcp_size,
                 impl.scale,
+                layout_kv="PA_NZ" if getattr(impl, "flash_mla_layout", "pa_bbnd") == "pa_nz" else "PA_BBND",
                 mask_mode=0 if dcp else 3,
                 # DCP produces only the local attention and local statistics; the
                 # caller owns the inter-rank reduction.
@@ -437,6 +497,33 @@ class FlashMLAMetadataBuilder:
             cos=torch.empty(rope_shape, dtype=self.dtype, device=self.device) if self.use_rope else None,
             sin=torch.empty(rope_shape, dtype=self.dtype, device=self.device) if self.use_rope else None,
         )
+        if adapter.config.layout_kv == "PA_NZ":
+            flash.prolog_slots = torch.zeros(tokens, dtype=torch.int64, device=self.device)
+            if self.dcp_size > 1 or adapter.config.cache_block_size != FLASHMLA_BLOCK_SIZE:
+                # Keep the Prolog writer on its 128-token page contract.
+                # DCP also needs private rows for tokens owned by other ranks.
+                # Copy only addressed rows into the native reader pages.
+                flash.pa_nz_current_cache = torch.empty(
+                    (
+                        (tokens + FLASHMLA_BLOCK_SIZE - 1) // FLASHMLA_BLOCK_SIZE,
+                        FLASHMLA_BLOCK_SIZE,
+                        1,
+                        FLASHMLA_QK_DIM,
+                    ),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                flash.pa_nz_current_slots = torch.arange(tokens, dtype=torch.int64, device=self.device)
+                flash.pa_nz_tile_offsets = torch.arange(PA_NZ_TILE_COUNT, dtype=torch.int64, device=self.device)
+                flash.pa_nz_copy_src_indices = _pa_nz_tile_indices(
+                    flash.pa_nz_current_slots,
+                    FLASHMLA_BLOCK_SIZE,
+                    flash.pa_nz_tile_offsets * FLASHMLA_BLOCK_SIZE,
+                    PA_NZ_TILE_COUNT,
+                )
+                flash.pa_nz_copy_dst_indices = torch.zeros(
+                    tokens * PA_NZ_TILE_COUNT, dtype=torch.int64, device=self.device
+                )
         return flash
 
     def build(
@@ -450,6 +537,7 @@ class FlashMLAMetadataBuilder:
         rows = num_decodes + 1 if has_prefill else max(num_decodes, min(tokens, self.max_num_reqs)) + 1
         columns = common.block_table_tensor.shape[1]
         key = tokens, rows, columns, common.causal
+        start_during_refresh = self.enable_async and not retain_for_graph and (has_prefill or key not in self.buffers)
         if has_prefill:
             if retain_for_graph:
                 raise ValueError("FlashMLA graph buffers require a decode-only batch")
@@ -463,7 +551,12 @@ class FlashMLAMetadataBuilder:
             else:
                 flash = cached_flash
 
+        flash.metadata_builder = self
+        flash.metadata_async = self.enable_async
+
         def refresh():
+            flash.metadata_started = False
+            flash.metadata_capture_started = False
             # The extra zero-used request owns physical graph/SP padding.
             flash.cu.fill_(tokens)
             flash.cu[: num_decodes + 1].copy_(common.query_start_loc[: num_decodes + 1].clamp_max(num_decode_tokens))
@@ -513,11 +606,72 @@ class FlashMLAMetadataBuilder:
                 flash.cos.copy_(cos)
                 flash.sin.copy_(sin)
 
-            flash.schedule.copy_(
-                flash.adapter.build_metadata(flash.cache_lens, flash.cu, flash.used_q, flash.global_cache_lens)
-            )
+            if flash.prolog_slots is not None:
+                flash.prolog_slots.copy_(torch.where(flash.token_live & (flash.slots >= 0), flash.slots, 0))
+            if flash.pa_nz_copy_dst_indices is not None:
+                assert flash.pa_nz_tile_offsets is not None and flash.prolog_slots is not None
+                flash.pa_nz_copy_dst_indices.copy_(
+                    _pa_nz_tile_indices(
+                        flash.prolog_slots,
+                        flash.adapter.config.cache_block_size,
+                        flash.pa_nz_tile_offsets * flash.adapter.config.cache_block_size,
+                        PA_NZ_TILE_COUNT,
+                    )
+                )
+            if start_during_refresh:
+                self.start_metadata(flash)
 
         # Refresh on the caller's stream before return; captured buffer caching
         # preserves the addresses used by graph replay.
         refresh()
+        if not flash.metadata_async:
+            self._refresh_schedule(flash)
         return flash
+
+    def _refresh_schedule(self, flash: FlashMLADecode) -> None:
+        flash.schedule.copy_(
+            flash.adapter.build_metadata(
+                flash.cache_lens,
+                flash.cu,
+                flash.used_q,
+                flash.global_cache_lens,
+            )
+        )
+
+    def start_metadata(self, flash: FlashMLADecode) -> None:
+        """Build this step's schedule before the layer loop."""
+        if not flash.metadata_async or flash.metadata_started:
+            return
+        if self.metadata_stream is None:
+            flash.metadata_async = False
+            self._refresh_schedule(flash)
+            flash.metadata_started = True
+            return
+        main_stream = torch.npu.current_stream()
+        if self.metadata_stream == main_stream:
+            raise RuntimeError("FlashMLA metadata stream aliases the current execution stream")
+        flash.metadata_start = main_stream.record_event()
+        self.metadata_stream.wait_event(flash.metadata_start)
+        self._record_metadata_stream(flash)
+        with torch.npu.stream(self.metadata_stream):
+            self._refresh_schedule(flash)
+            flash.metadata_ready = torch.npu.current_stream().record_event()
+        flash.metadata_started = True
+
+    def _record_metadata_stream(self, flash: FlashMLADecode) -> None:
+        """Keep side-stream schedule inputs alive until the fork/join completes."""
+        if self.metadata_stream is None:
+            return
+        # PA_NZ copy slots/indices are refreshed and consumed on the caller
+        # stream; they are deliberately not part of the side-stream schedule
+        # build and therefore do not need a metadata-stream lifetime record.
+        for tensor in (flash.schedule, flash.cache_lens, flash.cu, flash.used_q, flash.global_cache_lens):
+            if tensor is not None:
+                tensor.record_stream(self.metadata_stream)
+
+    def wait_metadata(self, flash: FlashMLADecode) -> None:
+        """Make the main stream wait for an in-flight async schedule build."""
+        if not flash.metadata_async or not flash.metadata_started:
+            return
+        assert flash.metadata_ready is not None
+        torch.npu.current_stream().wait_event(flash.metadata_ready)

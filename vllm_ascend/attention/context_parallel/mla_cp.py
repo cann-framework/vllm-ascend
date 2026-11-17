@@ -560,7 +560,7 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
         )
 
     def _decode_requires_current_kv(self, attn_metadata: AscendMLAMetadata) -> bool:
-        if attn_metadata.external_flashmla is not None:
+        if attn_metadata.get_external_flashmla(self.flash_mla_layout) is not None:
             # FlashMLA attends persistent history and this step's KV in one
             # operator call, so no replicated current chunk is staged.
             return False
@@ -572,9 +572,14 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
         )
 
     def _forward_external_flashmla(self, preprocessed, fused_cache, metadata):
-        assert metadata.external_flashmla is not None
+        flash = metadata.get_external_flashmla(self.flash_mla_layout)
+        assert flash is not None
         if not isinstance(fused_cache, torch.Tensor):
-            raise RuntimeError("DCP FlashMLA requires the original fused BBND cache")
+            raise RuntimeError("DCP FlashMLA requires the original fused cache")
+        if getattr(flash, "metadata_async", False):
+            if not flash.metadata_started:
+                self.start_flash_mla_metadata(metadata)
+            self.wait_flash_mla_metadata(metadata)
         record_attention_compute_start()
         # The framework owns stream ordering, exchange, reduction and V-up.
         return self._forward_decode_split_attention(
@@ -718,7 +723,7 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
         block_size: int,
         attn_metadata: AscendMLAMetadata,
     ) -> torch.Tensor:
-        flash = getattr(attn_metadata, "external_flashmla", None)
+        flash = attn_metadata.get_external_flashmla(self.flash_mla_layout)
         decode_meta = attn_metadata.decode
         if flash is None:
             assert isinstance(decode_meta, AscendMLADCPDecodeMetadata)
@@ -890,7 +895,7 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
     ) -> torch.Tensor:
         # FlashMLA keeps its own entry: one operator call covers the whole decode
         # range and never falls into the framework attention.
-        if getattr(attn_metadata, "external_flashmla", None) is not None or self._decode_requires_current_kv(
+        if attn_metadata.get_external_flashmla(self.flash_mla_layout) is not None or self._decode_requires_current_kv(
             attn_metadata
         ):
             return self._forward_decode_split_attention(
