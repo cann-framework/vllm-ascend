@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 import math
 from collections import defaultdict
+from copy import copy
 from dataclasses import replace
 
 import vllm.v1.core.kv_cache_utils
@@ -10,6 +11,7 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.kv_cache_utils import _approximate_gcd, may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -56,6 +58,7 @@ _orig_get_packed_kv_cache_groups = vllm.v1.core.kv_cache_utils._get_packed_kv_ca
 _orig_get_kv_cache_config_from_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
 _orig_max_memory_usage_bytes_from_groups = vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups
 _orig_pool_bytes_per_block = vllm.v1.core.kv_cache_utils._pool_bytes_per_block
+_orig_validate_block_size = VllmConfig.validate_block_size
 if UniformTypeKVCacheSpecs.max_num_blocks_per_req is KVCacheSpec.max_num_blocks_per_req:
 
     def _uniform_type_max_num_blocks_per_req(
@@ -761,9 +764,61 @@ def _get_glm5_next_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
+    # Reset on every global planning pass, including reinitialization. This
+    # runs before PP projection and before EngineCore replaces the global
+    # block size with the minimum across target, Mamba and draft groups.
+    vllm_config._ascend_window_gqa_dcp_block_sizes = ()
     if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
         return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
-    return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+    groups = _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+    if (
+        vllm_config.parallel_config.decode_context_parallel_size > 1
+        and getattr(getattr(vllm_config, "speculative_config", None), "method", None) == "dspark"
+        and _is_kimi_k3_dspark_window_kv_cache_config(groups)
+        and any(is_sliding_window_gqa_draft_group(group) for group in groups)
+    ):
+        # Validate every actual sharded attention size, not the CLI value or
+        # the minimum size of the replicated draft. Mamba state is replicated.
+        vllm_config._ascend_window_gqa_dcp_block_sizes = tuple(
+            sorted(
+                {
+                    spec.block_size
+                    for group in groups
+                    if not is_sliding_window_gqa_draft_group(group)
+                    for spec in (
+                        group.kv_cache_spec.kv_cache_specs.values()
+                        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                        else (group.kv_cache_spec,)
+                    )
+                    if isinstance(spec, AttentionSpec)
+                }
+            )
+        )
+    return groups
+
+
+def _ascend_validate_block_size(self: VllmConfig) -> None:
+    """Validate mixed Window-GQA DSpark using the DCP groups' actual sizes."""
+    block_sizes = getattr(self, "_ascend_window_gqa_dcp_block_sizes", ())
+    if not block_sizes or self.parallel_config.decode_context_parallel_size == 1:
+        return _orig_validate_block_size(self)
+
+    # Preserve the scheduler's global minimum and all group/cache layouts.
+    # Shallow copies avoid rerunning VllmConfig.__post_init__. The original
+    # validator still enforces DCP divisibility and Mamba/MM constraints, and
+    # its deprecated interleave alias normalization updates the shared config.
+    validation_config = copy(self)
+    validation_config.cache_config = copy(self.cache_config)
+    for block_size in block_sizes:
+        validation_config.cache_config.block_size = block_size
+        _orig_validate_block_size(validation_config)
+    logger.info(
+        "Kimi K3 Window-GQA DSpark DCP block validation: global minimum=%d, "
+        "sharded attention sizes=%s, CP interleave=%d; draft window cache uses DCP=1",
+        self.cache_config.block_size,
+        block_sizes,
+        self.parallel_config.cp_kv_cache_interleave_size,
+    )
 
 
 def _ascend_get_kv_cache_config_from_groups(
@@ -877,6 +932,7 @@ def _ascend_sliding_window_max_memory_usage_bytes(
 
 
 SlidingWindowSpec.max_memory_usage_bytes = _ascend_sliding_window_max_memory_usage_bytes
+VllmConfig.validate_block_size = _ascend_validate_block_size
 
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 assert _orig_get_packed_kv_cache_groups is not None
