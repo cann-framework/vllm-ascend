@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
@@ -41,6 +42,7 @@ from vllm_ascend.core.kv_cache_interface import (
 from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
     AscendHybridKVCacheCoordinator,
     _is_deepseek_v4_kv_cache_spec,
+    _manager_dcp_world_size,
     get_kv_cache_coordinator,
 )
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
@@ -746,6 +748,55 @@ def test_kimi_k3_gqa_mixed_groups_preserve_scheduler_and_mamba_contracts() -> No
     }
     assert scheduler_mamba_widths == worker_mamba_widths
     assert scheduler_config.needs_kv_cache_zeroing
+
+
+def test_kimi_k3_window_gqa_draft_gets_a_separate_cache_group() -> None:
+    specs = _make_kimi_k3_dspark_kv_cache_specs()
+    window_spec = SlidingWindowSpec(
+        block_size=384,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.bfloat16,
+        page_size_padded=488448,
+        sliding_window=4096,
+    )
+    for name in list(specs):
+        if name.startswith("model.layers."):
+            specs[name] = window_spec
+
+    groups = _get_kimi_k3_dspark_mixed_kv_cache_groups(specs)
+
+    assert groups is not None
+    assert len(groups) == 5
+    assert all(name.startswith("model.layers.") for name in groups[1].layer_names)
+    assert all(isinstance(spec, SlidingWindowSpec) for spec in groups[1].kv_cache_spec.kv_cache_specs.values())
+    assert groups[1].is_eagle_group
+    assert _manager_dcp_world_size(groups[1].kv_cache_spec, 8, groups[1]) == 1
+    assert _manager_dcp_world_size(groups[0].kv_cache_spec, 8, groups[0]) == 8
+
+
+def test_kimi_k3_window_gqa_memory_admission_does_not_use_sliding_dcp_assert() -> None:
+    specs = _make_kimi_k3_dspark_kv_cache_specs()
+    window_spec = SlidingWindowSpec(
+        block_size=384,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.bfloat16,
+        page_size_padded=488448,
+        sliding_window=4096,
+    )
+    for name in list(specs):
+        if name.startswith("model.layers."):
+            specs[name] = window_spec
+    groups = _get_kimi_k3_dspark_mixed_kv_cache_groups(specs)
+    assert groups is not None
+
+    config = _make_vllm_config(enable_prefix_caching=False, dcp=8, block_size=384)
+    config.model_config = SimpleNamespace(max_model_len=32768)
+    config.max_in_flight_tokens = 512
+    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=512)
+    needed = kv_cache_utils_patch._ascend_max_memory_usage_bytes_from_groups(config, groups)
+    assert needed > 0
 
 
 def test_kimi_k3_gqa_mixed_groups_use_expected_physical_layout(monkeypatch) -> None:

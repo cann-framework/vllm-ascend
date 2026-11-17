@@ -8,7 +8,12 @@ import torch
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import is_kv_cache_spec_uniform
 from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager, register_all_kvcache_specs
-from vllm.v1.kv_cache_interface import CircularBufferSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    SlidingWindowMLASpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 from vllm_ascend.core.kv_cache_interface import (
@@ -18,6 +23,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSlidingWindowMLASpec,
     get_kv_cache_compression_ratio,
     get_storage_block_size,
+    is_sliding_window_gqa_spec,
     register_ascend_kv_cache_specs,
     supports_component_major_mla_pd,
 )
@@ -75,6 +81,32 @@ def test_sliding_window_mla_storage_and_page_size():
     )
     assert spec.storage_block_size == 16
     assert spec.real_page_size_bytes == 16 * 128 * 2
+
+
+def test_sliding_window_gqa_detection_excludes_mla_and_grouped_mla():
+    gqa = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=64,
+    )
+    mla = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=64,
+    )
+
+    assert is_sliding_window_gqa_spec(gqa)
+    assert not is_sliding_window_gqa_spec(mla)
+    assert is_sliding_window_gqa_spec(
+        UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={"draft": gqa})
+    )
+    assert not is_sliding_window_gqa_spec(
+        UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={"mla": mla})
+    )
 
 
 @pytest.mark.parametrize("ascend", [False, True])

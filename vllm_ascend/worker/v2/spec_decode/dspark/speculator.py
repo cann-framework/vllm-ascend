@@ -16,6 +16,7 @@
 # This file is a part of the vllm-ascend project.
 #
 from collections.abc import Mapping, Sequence
+from copy import copy
 from typing import Any, cast
 
 import numpy as np
@@ -23,6 +24,7 @@ import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_dcp_group
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -39,6 +41,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context impor
     DSparkContextChunk,
     initialize_draft_context_chunk,
 )
+from vllm_ascend.spec_decode.dspark_proposer import _is_window_gqa_draft
 from vllm_ascend.utils import lmhead_tp_enable, lmhead_tp_max_num_logits
 from vllm_ascend.worker.dcp_utils import DCPManager
 from vllm_ascend.worker.v2.aclgraph_utils import _get_graph_update_backend
@@ -71,7 +74,32 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         self.input_batch: InputBatch | None = None
         self.attn_architecture: str | None = None
         self._draft_mla_uses_device_lengths = False
+        # The target Kimi model may use MLA+DCP while the Qwen3 DSpark draft
+        # owns an ordinary SlidingWindowSpec.  DCP metadata and slot mapping
+        # are invalid for that cache, so only the draft attention view falls
+        # back to DCP=1.  The target runner keeps the worker-wide DCP value.
+        self._window_gqa_dcp_fallback = _is_window_gqa_draft(self.draft_model_config.hf_config)
         self._init_dcp()
+
+    @property
+    def attn_vllm_config(self) -> VllmConfig:
+        """Use a local DCP=1 config for a replicated Window-GQA draft."""
+        if not getattr(self, "_window_gqa_dcp_fallback", False):
+            return super().attn_vllm_config
+        # This property is read before proposal and during metadata/replay.
+        # replace(VllmConfig, ...) reruns __post_init__ and platform setup on
+        # every read, stalling host submission between target and draft ops.
+        # Mirror DFlash's causality override with shallow copies: older vLLM
+        # versions also reconstruct VllmConfig in the parent property. Keep
+        # the other fields live, including compilation state and bound caches.
+        config = copy(self.vllm_config)
+        config.attention_config = copy(config.attention_config)
+        config.attention_config.use_non_causal = self.requires_non_causal
+        config.parallel_config = copy(config.parallel_config)
+        config.parallel_config.decode_context_parallel_size = 1
+        config.parallel_config.dcp_kv_cache_interleave_size = 1
+        config.parallel_config.cp_kv_cache_interleave_size = 1
+        return config
 
     def _init_dcp(self) -> None:
         self.use_dcp = self.attn_vllm_config.parallel_config.decode_context_parallel_size > 1
@@ -93,10 +121,27 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         target_model: torch.nn.Module,
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
-        with disable_profiling_chunk_for_draft(self.vllm_config):
-            model = super().load_draft_model(target_model, target_attn_layer_names)
-        if hasattr(model, "post_process"):
-            model.post_process(self.vllm_config)
+        draft_config = self.vllm_config
+        if self._window_gqa_dcp_fallback:
+            # ``load_dflash_model`` derives the draft model config from
+            # ``self.vllm_config``. Temporarily expose the draft's local
+            # DCP=1 view so its attention modules are constructed without the
+            # target MLA DCP backend.
+            target_vllm_config = self.vllm_config
+            draft_config = self.attn_vllm_config
+            self.vllm_config = draft_config
+            try:
+                with disable_profiling_chunk_for_draft(self.vllm_config):
+                    model = super().load_draft_model(target_model, target_attn_layer_names)
+                if hasattr(model, "post_process"):
+                    model.post_process(draft_config)
+            finally:
+                self.vllm_config = target_vllm_config
+        else:
+            with disable_profiling_chunk_for_draft(self.vllm_config):
+                model = super().load_draft_model(target_model, target_attn_layer_names)
+            if hasattr(model, "post_process"):
+                model.post_process(draft_config)
         if hasattr(model, "configure_target_aux_hidden_capture"):
             model.configure_target_aux_hidden_capture(target_model)
 
@@ -139,7 +184,18 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         if self.speculative_config.enforce_eager:
             cudagraph_mode = CUDAGraphMode.NONE
-        super().init_cudagraph_manager(cudagraph_mode)
+        if self._window_gqa_dcp_fallback:
+            # The ACL graph manager stores the config used by its replay path;
+            # expose the local DCP=1 view while constructing it so graph
+            # metadata updates cannot consult the target's DCP=8 config.
+            target_vllm_config = self.vllm_config
+            self.vllm_config = self.attn_vllm_config
+            try:
+                super().init_cudagraph_manager(cudagraph_mode)
+            finally:
+                self.vllm_config = target_vllm_config
+        else:
+            super().init_cudagraph_manager(cudagraph_mode)
         # The Ascend graph manager is patched onto the upstream module and
         # created by super().init_cudagraph_manager without a speculator ref.
         # It needs this speculator to update full-graph params, so set it here.
@@ -220,6 +276,15 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         target_input_buffers: Any,
         target_attn_groups: Any,
     ) -> None:
+        if self._window_gqa_dcp_fallback:
+            # Upstream input preparation and metadata construction read the
+            # scalar CP tuple, not AscendBlockTables' per-group tuples. Give
+            # this draft its own topology view while sharing the runner's
+            # persistent block-table/slot tensors (also used by graph replay).
+            block_tables = copy(block_tables)
+            block_tables.cp_size = 1
+            block_tables.cp_rank = 0
+            block_tables.cp_interleave = 1
         # Initialize the draft attention backend with its PCP=1 config.
         with set_current_vllm_config(self.attn_vllm_config):
             super().set_attn(
@@ -397,9 +462,33 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> torch.Tensor:
-        hidden_states = super()._run_model(
-            num_tokens, attn_metadata, slot_mappings, num_tokens_across_dp, cudagraph_runtime_mode
-        )
+        if self._window_gqa_dcp_fallback:
+            # Upstream DFlash uses ``self.vllm_config`` for forward context,
+            # which is the target's worker-wide DCP config.  Scope this one
+            # draft forward with the local DCP=1 attention config.
+            draft_vllm_config = self.attn_vllm_config
+            batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
+            with (
+                set_current_vllm_config(draft_vllm_config),
+                set_forward_context(
+                    attn_metadata,
+                    draft_vllm_config,
+                    num_tokens=num_tokens,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    slot_mapping=slot_mappings,
+                    batch_descriptor=batch_descriptor,
+                ),
+            ):
+                hidden_states = self.model(
+                    input_ids=self.input_buffers.input_ids[:num_tokens],
+                    positions=self.input_buffers.positions[:num_tokens],
+                    inputs_embeds=None,
+                )
+        else:
+            hidden_states = super()._run_model(
+                num_tokens, attn_metadata, slot_mappings, num_tokens_across_dp, cudagraph_runtime_mode
+            )
         # PCP replicas must propose identical tokens for the next joint target
         # verification. Share the backbone output before sequential Markov sampling.
         hidden_states, _ = AscendPCPManager.broadcast_replicated_hidden_states(

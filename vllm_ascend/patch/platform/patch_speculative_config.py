@@ -15,6 +15,22 @@ from vllm_ascend.utils import is_deepseek_v41, is_gqa_pcp_dcp_config
 _orig_post_init = SpeculativeConfig.__post_init__
 _orig_hf_config_override = SpeculativeConfig.hf_config_override
 
+
+def _is_redhat_window_gqa(hf_config: PretrainedConfig) -> bool:
+    architectures = getattr(hf_config, "architectures", ()) or ()
+    return (
+        getattr(hf_config, "model_type", None) in ("qwen3", "speculators")
+        and (
+            "Qwen3DSparkModel" in architectures
+            or "DSparkDraftModel" in architectures
+        )
+        and bool(getattr(hf_config, "use_sliding_window", False))
+        and bool(getattr(hf_config, "sample_from_anchor", False))
+        and getattr(hf_config, "block_size", None) == 8
+        and getattr(hf_config, "sliding_window", None) is not None
+    )
+
+
 # Transformers 5.14 inherited a hidden_size % num_heads check from Llama in
 # DeepseekV2Config. K3 MLA has independent projection/head dimensions (e.g.
 # hidden_size=7168, num_heads=96), so that MHA constraint does not apply.
@@ -87,15 +103,89 @@ def _normalize_legacy_qwen3_dspark_config(hf_config: PretrainedConfig) -> Pretra
     hf_config = _orig_hf_config_override(hf_config)
     _normalize_kimi_dflash_rope(hf_config)
     architectures = hf_config.architectures or ()
-    if hf_config.model_type == "qwen3" and "DSparkDraftModel" in architectures:
-        dflash_config = hf_config.dflash_config
-        hf_config.update(
-            {
-                "architectures": ["Qwen3DSparkModel"],
-                "mask_token_id": dflash_config["mask_token_id"],
-                "target_layer_ids": dflash_config["target_layer_ids"],
-            }
+    is_qwen3_dspark = (
+        hf_config.model_type == "qwen3"
+        and (
+            "DSparkDraftModel" in architectures
+            or "Qwen3DSparkModel" in architectures
         )
+        or hf_config.model_type == "speculators"
+        and (
+            "DSparkDraftModel" in architectures
+            or "Qwen3DSparkModel" in architectures
+        )
+    )
+    if is_qwen3_dspark:
+        # RedHat's Window-GQA checkpoint stores Qwen3 decoder fields in the
+        # nested transformer_layer_config. Expose them at the top level before
+        # the Qwen3 DSpark model is constructed.
+        outer_non_causal = getattr(hf_config, "sliding_window_non_causal", None)
+        transformer_config = getattr(hf_config, "transformer_layer_config", None)
+        if isinstance(transformer_config, dict):
+            hf_config.update(transformer_config)
+        if getattr(hf_config, "model_type", None) == "speculators":
+            hf_config.model_type = "qwen3"
+
+        dflash_config = dict(getattr(hf_config, "dflash_config", None) or {})
+        aux_layer_ids = getattr(hf_config, "aux_hidden_state_layer_ids", None)
+        if aux_layer_ids is None:
+            aux_layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+        target_layer_ids = dflash_config.get("target_layer_ids")
+        if target_layer_ids is None:
+            target_layer_ids = getattr(hf_config, "target_layer_ids", None)
+        if target_layer_ids is None and aux_layer_ids:
+            # RedHat stores auxiliary layer IDs as one-based values, while
+            # vLLM's target_layer_ids are zero-based.
+            target_layer_ids = [int(layer_id) - 1 for layer_id in aux_layer_ids]
+
+        normalized = {
+            "architectures": ["Qwen3DSparkModel"],
+            "mask_token_id": dflash_config.get(
+                "mask_token_id", getattr(hf_config, "mask_token_id", None)
+            ),
+        }
+        if target_layer_ids is not None:
+            normalized["target_layer_ids"] = list(target_layer_ids)
+            normalized["dspark_target_layer_ids"] = list(target_layer_ids)
+        if aux_layer_ids:
+            normalized["eagle_aux_hidden_state_layer_ids"] = [int(i) for i in aux_layer_ids]
+
+        non_causal = outer_non_causal
+        if non_causal is None and isinstance(transformer_config, dict):
+            non_causal = transformer_config.get("sliding_window_non_causal")
+        if non_causal is not None:
+            causal = not bool(non_causal)
+            normalized["is_causal"] = causal
+            dflash_config["causal"] = causal
+        elif (
+            bool(getattr(hf_config, "use_sliding_window", False))
+            and getattr(hf_config, "layer_types", None)
+            and all(layer_type == "sliding_attention" for layer_type in hf_config.layer_types)
+        ):
+            dflash_config.setdefault("causal", True)
+
+        # Native Window-GQA samples eight rows from one anchor. FIA's causal
+        # window is query-relative, so extend the pre-token span by seven rows;
+        # dspark_proposer still crops the actual block table to the W-token
+        # history window.
+        sliding_window = getattr(hf_config, "sliding_window", None)
+        native_width = getattr(hf_config, "block_size", None)
+        if (
+            sliding_window is not None
+            and bool(getattr(hf_config, "use_sliding_window", False))
+            and bool(getattr(hf_config, "sample_from_anchor", False))
+            and aux_layer_ids is not None
+            and native_width == 8
+        ):
+            dflash_config["use_swa"] = True
+            dflash_config["swa_window_size"] = int(sliding_window) + int(native_width) - 1
+        if target_layer_ids is not None:
+            dflash_config["target_layer_ids"] = list(target_layer_ids)
+        if normalized["mask_token_id"] is not None:
+            dflash_config.setdefault("mask_token_id", normalized["mask_token_id"])
+        if dflash_config:
+            normalized["dflash_config"] = dflash_config
+        hf_config.update(normalized)
     if hf_config.model_type in ("glm5_next", "glm5_next_text"):
         n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
         hf_config.model_type = "glm5_next_mtp"
@@ -194,11 +284,21 @@ def _temporarily_disable_dspark_dcp(self: SpeculativeConfig):
 
 def _dspark_post_init(self):
     # TODO: This block can be deleted after the upstream supports the overlay of mla dcp and dspark
+    draft_model_config = getattr(self, "draft_model_config", None)
+    draft_hf_config = getattr(draft_model_config, "hf_config", None)
     with _temporarily_disable_dspark_dcp(self):
         _orig_post_init(self)
+    # The draft config is normally created by the upstream post-init above.
+    draft_model_config = getattr(self, "draft_model_config", None)
+    draft_hf_config = getattr(draft_model_config, "hf_config", None)
+    # RedHat's native Window-GQA width is eight rows; the Ascend verify path
+    # exposes seven speculative tokens to the sampler and proposer.
+    if draft_hf_config is not None and _is_redhat_window_gqa(draft_hf_config):
+        if self.num_speculative_tokens == 8:
+            self.num_speculative_tokens = 7
+            if hasattr(draft_hf_config, "num_lookahead_tokens"):
+                draft_hf_config.num_lookahead_tokens = 7
     if self.use_dspark():
-        draft_model_config = getattr(self, "draft_model_config", None)
-        draft_hf_config = getattr(draft_model_config, "hf_config", None)
         _normalize_deepseek_dspark_draft(draft_model_config)
         # deepseek v4 dspark
         if getattr(draft_hf_config, "ptd_token_id", None) is None:  # type: ignore

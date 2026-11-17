@@ -36,7 +36,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
-from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
+from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer, _is_window_gqa_draft
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
 from vllm_ascend.worker.dcp_utils import DCPManager
 from vllm_ascend.worker.device_metadata import DeviceMetadataStage, DeviceMetadataTask
@@ -709,6 +709,54 @@ class TestDummySlotMappingCleanup(_DSparkProposerTestBase):
 
 class TestDSparkInitialization(_DSparkProposerTestBase):
     """Tests for DSpark initialization configuration."""
+
+    def test_window_gqa_draft_requests_local_dcp(self):
+        config = SimpleNamespace(
+            model_type="qwen3",
+            architectures=["Qwen3DSparkModel"],
+            use_sliding_window=True,
+            sliding_window=4096,
+            use_mla=False,
+        )
+        assert _is_window_gqa_draft(config)
+
+    def test_window_gqa_draft_reads_nested_transformer_config(self):
+        config = SimpleNamespace(
+            architectures=["DSparkDraftModel"],
+            transformer_layer_config={
+                "model_type": "qwen3",
+                "use_sliding_window": True,
+                "sliding_window": 2048,
+                "use_mla": False,
+            },
+        )
+        assert _is_window_gqa_draft(config)
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            SimpleNamespace(
+                model_type="qwen3",
+                architectures=["Qwen3DSparkModel"],
+                use_sliding_window=False,
+                use_mla=False,
+            ),
+            SimpleNamespace(
+                model_type="qwen3",
+                architectures=["Qwen3DSparkModel"],
+                use_sliding_window=True,
+                use_mla=True,
+            ),
+            SimpleNamespace(
+                model_type="k3_dspark",
+                architectures=["K3DSparkModel"],
+                use_sliding_window=True,
+                use_mla=False,
+            ),
+        ],
+    )
+    def test_non_window_or_mla_draft_keeps_global_dcp(self, config):
+        assert not _is_window_gqa_draft(config)
 
     @pytest.mark.parametrize(
         ("hf_config", "expected_sample_from_anchor", "expected_num_query_per_req", "draft_sample_method"),

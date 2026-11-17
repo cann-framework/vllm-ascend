@@ -23,8 +23,10 @@ import torch
 # import vllm.utils.cpu_triton_utils as cpu_tl
 from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
     KVCacheGroupSpec,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -500,6 +502,77 @@ class TestMultiGroupBlockTable(unittest.TestCase):
             r"max_num_blocks length \(1\) must match block_sizes length \(2\)",
         ):
             self._create(kernel_sizes=[128, 384], max_num_blocks=[4])
+
+
+class TestWindowGQADcpFallback(unittest.TestCase):
+    def test_window_group_uses_replicated_dcp_slot_layout(self):
+        from vllm_ascend.worker.block_table import BlockTable
+
+        spec = SlidingWindowSpec(
+            block_size=128,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=1024,
+        )
+        group = KVCacheGroupSpec(layer_names=["draft.attn"], kv_cache_spec=spec, is_eagle_group=True)
+        dcp_group = MagicMock(spec=GroupCoordinator)
+        dcp_group.world_size = 8
+        dcp_group.rank_in_group = 3
+        with patch("vllm_ascend.worker.block_table.get_dcp_group", return_value=dcp_group):
+            table = BlockTable(
+                block_size=128,
+                max_num_reqs=1,
+                max_num_blocks_per_req=16,
+                max_num_batched_tokens=8,
+                pin_memory=False,
+                device=torch.device("cpu"),
+                kv_cache_group=group,
+            )
+
+        assert table.dcp_world_size == 1
+        assert table.dcp_rank == 0
+        assert table.cp_kv_cache_interleave_size == 1
+
+    def test_full_attention_group_keeps_global_dcp_block_width(self):
+        from vllm_ascend.worker.block_table import max_num_blocks_per_req_for_group
+
+        spec = FullAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
+        config = SimpleNamespace(parallel_config=SimpleNamespace(decode_context_parallel_size=8))
+        assert max_num_blocks_per_req_for_group(spec, config, 1024) == 1
+
+    def test_unmarked_sliding_window_group_keeps_unsupported_global_dcp_shape(self):
+        from vllm_ascend.worker.block_table import BlockTable
+
+        spec = SlidingWindowSpec(
+            block_size=128,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=1024,
+        )
+        group = KVCacheGroupSpec(layer_names=["model.layers.0.attn"], kv_cache_spec=spec)
+        dcp_group = MagicMock(spec=GroupCoordinator)
+        dcp_group.world_size = 8
+        dcp_group.rank_in_group = 3
+        with patch("vllm_ascend.worker.block_table.get_dcp_group", return_value=dcp_group):
+            table = BlockTable(
+                block_size=128,
+                max_num_reqs=1,
+                max_num_blocks_per_req=2,
+                max_num_batched_tokens=8,
+                pin_memory=False,
+                device=torch.device("cpu"),
+                kv_cache_group=group,
+            )
+
+        assert table.dcp_world_size == 8
+        assert table.dcp_rank == 3
 
 
 if __name__ == "__main__":

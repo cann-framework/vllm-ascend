@@ -136,6 +136,9 @@ class ReqMeta:
     remote_block_size: int
     local_full_block_ids: BlockIds = tuple()
     do_virtual: bool = False
+    # Indexed by scheduler KV cache group, not Mooncake transfer group.
+    remote_block_sizes: tuple[int, ...] = tuple()
+    remote_block_start_indices: tuple[int, ...] = tuple()
 
 
 @dataclass(frozen=True)
@@ -1602,6 +1605,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             remote_block_size=kv_transfer_params.get("remote_block_size", 0),
             local_full_block_ids=local_full_block_ids or tuple(),
             do_virtual=kv_transfer_params.get("do_virtual", False),
+            remote_block_sizes=tuple(kv_transfer_params.get("remote_block_sizes", ())),
+            remote_block_start_indices=tuple(kv_transfer_params.get("remote_block_start_indices", ())),
         )
 
 
@@ -2044,6 +2049,7 @@ class MooncakeConnectorScheduler:
 
         num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
         computed_block_ids = self._get_transfer_block_ids(block_ids, len(request.prompt_token_ids))
+        prompt_block_counts = [len(blocks) for blocks in computed_block_ids]
         computed_block_ids = self._get_swa_transfer_block_ids(computed_block_ids)
         computed_block_lens = [len(block_id_list) for block_id_list in computed_block_ids]
         delay_free_blocks = sum(computed_block_lens) > 0
@@ -2066,6 +2072,12 @@ class MooncakeConnectorScheduler:
             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
             num_prompt_blocks=num_prompt_blocks,
             remote_block_size=self.block_size,
+            remote_block_sizes=tuple(group.kv_cache_spec.block_size for group in self.kv_cache_groups),
+            # SWA removes a prefix of obsolete/placeholder blocks. Preserve the
+            # sequence position of the remaining tail for D-side prefix hits.
+            remote_block_start_indices=tuple(
+                count - len(blocks) for count, blocks in zip(prompt_block_counts, computed_block_ids)
+            ),
         )
 
     def _port_offset_from_handshake_metadata(
@@ -2274,6 +2286,9 @@ class MooncakeConnectorWorker:
         serialized_kv_cache_spec = to_msgpackable(spec)
         if not isinstance(serialized_kv_cache_spec, dict):
             serialized_kv_cache_spec = {"repr": serialized_kv_cache_spec}
+        # A dtype can make to_msgpackable fall back to repr for the whole
+        # spec. Keep the logical block size available for index conversion.
+        serialized_kv_cache_spec["block_size"] = kv_cache_spec.block_size
         num_key_value_heads = MooncakeConnectorWorker._get_spec_num_key_value_heads(spec)
         if num_key_value_heads is not None:
             serialized_kv_cache_spec["num_kv_heads"] = num_key_value_heads
@@ -2885,26 +2900,63 @@ class MooncakeConnectorWorker:
         """No-CP per-group block ids at kernel granularity: (local, remote).
 
         Mamba state is not block-sharded, so its logical ids pass through unchanged.
-        Attention expands both sides to kernel blocks, skips the prefix-cached remote
-        kernels (already on D, located via num_computed_tokens), and trims both lists
-        to the shorter one so remote/local stay aligned.
+        Attention expands each group's logical blocks to kernel blocks and pairs
+        them by sequence position, accounting for SWA tails and local prefix hits.
+        Peers without per-group metadata retain the uniform-block-size path.
         """
         kv_cache_group_id = self._get_kv_cache_group_id(group_idx, group_spec)
         if group_spec["kv_cache_spec_type"] == "MambaSpec":
             return list(meta.local_block_ids[kv_cache_group_id]), list(meta.remote_block_ids[kv_cache_group_id])
+        if not meta.local_block_ids[kv_cache_group_id] or not meta.remote_block_ids[kv_cache_group_id]:
+            return [], []
 
-        remote_block_size = meta.remote_block_size or self.block_size
+        local_block_size = group_spec.get("kv_cache_spec", {}).get("block_size", self.block_size)
+        remote_block_sizes = getattr(meta, "remote_block_sizes", ())
+        remote_starts = getattr(meta, "remote_block_start_indices", ())
+        is_swa = group_spec["kv_cache_spec_type"] == "SlidingWindowSpec"
+        if is_swa and not (remote_block_sizes and remote_starts):
+            raise ValueError("SWA KV transfer requires per-group metadata. Update Mooncake on both P and D nodes.")
+        remote_block_size = (
+            remote_block_sizes[kv_cache_group_id] if remote_block_sizes else meta.remote_block_size or self.block_size
+        )
 
         # kernel_size is the shared (P==D) granularity; remote_scale is derived from it.
         local_scale = self._get_kernel_block_scale(layer_indices)
-        kernel_size = self.block_size // local_scale
+        assert local_block_size % local_scale == 0, (
+            f"group {kv_cache_group_id}: block_size({local_block_size}) not divisible by scale({local_scale})"
+        )
+        kernel_size = local_block_size // local_scale
         assert remote_block_size % kernel_size == 0, (
             f"remote_block_size({remote_block_size}) not divisible by kernel_size({kernel_size})"
         )
 
         remote_scale = remote_block_size // kernel_size
-        kernel_local = self._expand_block_ids(list(meta.local_block_ids[kv_cache_group_id]), local_scale)
         kernel_remote = self._expand_block_ids(list(meta.remote_block_ids[kv_cache_group_id]), remote_scale)
+        if is_swa:
+            # The remote list may be only the SWA tail, and the local unhashed
+            # list excludes null and prefix-cached blocks. Pair by absolute
+            # sequence position, not by the position in these compact lists.
+            if not getattr(meta, "local_full_block_ids", ()):
+                raise ValueError("SWA KV transfer requires full local block IDs to locate the window tail.")
+            full_local = meta.local_full_block_ids[kv_cache_group_id]
+            unhashed_local = set(meta.local_block_ids[kv_cache_group_id])
+            first_kernel = remote_starts[kv_cache_group_id] * remote_scale
+            prefix_kernels = meta.num_computed_tokens // (kernel_size * self._group_compress_ratio(group_spec))
+            kernel_local, matched_remote = [], []
+            for offset, remote_id in enumerate(kernel_remote):
+                sequence_kernel = first_kernel + offset
+                if sequence_kernel < prefix_kernels:
+                    continue
+                block_idx, kernel_offset = divmod(sequence_kernel, local_scale)
+                if block_idx >= len(full_local):
+                    break
+                local_id = full_local[block_idx]
+                if local_id != 0 and local_id in unhashed_local:
+                    kernel_local.append(local_id * local_scale + kernel_offset)
+                    matched_remote.append(remote_id)
+            return kernel_local, matched_remote
+
+        kernel_local = self._expand_block_ids(list(meta.local_block_ids[kv_cache_group_id]), local_scale)
         # Skip prefix-cached remote kernels (D-side already holds them). The token size of one
         # remote kernel is kernel_size * compress_ratio, so the number to skip is
         # num_computed_tokens // (kernel_size * compress_ratio).

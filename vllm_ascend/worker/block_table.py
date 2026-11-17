@@ -6,17 +6,59 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpecKind,
+    UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
 from vllm.v1.utils import CpuGpuBuffer
 
-from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+from vllm_ascend.core.kv_cache_interface import (
+    is_circular_kv_cache_spec,
+    is_sliding_window_gqa_draft_group,
+)
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 from vllm_ascend.ops.triton.compute_slot_mapping import (
     _compute_slot_mapping_kernel,
     _next_power_of_2,
     compute_slot_mapping_fused_groups,
 )
+
+
+def _is_replicated_window_spec(kv_cache_spec, kv_cache_group=None) -> bool:
+    """Whether a cache group owns a replicated sliding-window table.
+
+    A ``UniformTypeKVCacheSpecs`` wrapper is used for the draft layers in
+    Kimi K3 DSpark.  The wrapper must be unwrapped before deciding the DCP
+    topology; otherwise its inherited block-table sizing still uses the
+    worker-wide target DCP size.
+    """
+    return kv_cache_group is not None and is_sliding_window_gqa_draft_group(kv_cache_group)
+
+
+def max_num_blocks_per_req_for_group(kv_cache_spec, vllm_config, max_len: int, kv_cache_group=None) -> int:
+    """Return the worker BlockTable width for one KV cache group.
+
+    ``SlidingWindowSpec.max_num_blocks_per_req`` is inherited from
+    ``AttentionSpec`` on the v0.30 vLLM lane and divides by the global DCP
+    size.  A replicated Window-GQA group intentionally uses DCP=1, while the
+    target MLA groups continue to use the global DCP topology.
+    """
+    if _is_replicated_window_spec(kv_cache_spec, kv_cache_group):
+        if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+            specs = tuple(kv_cache_spec.kv_cache_specs.values())
+        else:
+            specs = (kv_cache_spec,)
+        block_sizes = {spec.block_size for spec in specs}
+        if len(block_sizes) != 1:
+            raise ValueError(
+                "All replicated sliding-window layers must use one block size, "
+                f"got {sorted(block_sizes)}"
+            )
+        return cdiv(max_len, next(iter(block_sizes)))
+    if vllm_config is None:
+        if is_circular_kv_cache_spec(kv_cache_spec):
+            return 1
+        return cdiv(max_len, kv_cache_spec.block_size * get_decode_context_model_parallel_world_size())
+    return kv_cache_spec.max_num_blocks_per_req(vllm_config, max_len)
 
 
 class BlockTable:
@@ -34,8 +76,21 @@ class BlockTable:
         kv_cache_group: KVCacheGroupSpec = None,
     ):
         self.max_num_reqs = max_num_reqs
-        self.dcp_world_size = get_dcp_group().world_size
-        self.dcp_rank = get_dcp_group().rank_in_group
+        # DCP is a property of the cache group, rather than of the worker as
+        # a whole.  Kimi Window-GQA DSpark keeps a replicated sliding-window
+        # cache while the target MLA group remains DCP-sharded.  Using the
+        # worker-wide DCP size here would make the window group's slot mapping
+        # address only one rank's virtual shard, even though its manager and
+        # draft attention use DCP=1.
+        is_replicated_window = _is_replicated_window_spec(
+            kv_cache_group.kv_cache_spec if kv_cache_group is not None else None,
+            kv_cache_group,
+        )
+        global_dcp_group = get_dcp_group()
+        self.dcp_world_size = (
+            1 if is_replicated_window else global_dcp_group.world_size
+        )
+        self.dcp_rank = 0 if is_replicated_window else global_dcp_group.rank_in_group
         is_mamba_group = (
             kv_cache_group is not None
             and hasattr(kv_cache_group, "kv_cache_spec")
@@ -106,7 +161,12 @@ class BlockTable:
         )
 
         self.kernel_sizes = kernel_sizes
-        self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
+        # A replicated sliding-window group has no DCP shard.  It must use
+        # the ordinary contiguous slot layout even when the target MLA group
+        # uses a non-unit interleave for global DCP.
+        self.cp_kv_cache_interleave_size = (
+            1 if is_replicated_window else cp_kv_cache_interleave_size
+        )
 
     def append_row(
         self,
@@ -370,7 +430,18 @@ class MultiGroupBlockTable:
             # so the block_size which used for calc max_num_blocks_per_req
             # must be multiplied by dcp_world_size.
             dcp_world_size = get_decode_context_model_parallel_world_size()
-            max_num_blocks = [cdiv(max_model_len, block_size * dcp_world_size) for block_size in block_sizes]
+            if kv_cache_groups is not None:
+                max_num_blocks = [
+                    max_num_blocks_per_req_for_group(
+                        group.kv_cache_spec,
+                        None,
+                        max_model_len,
+                        group,
+                    )
+                    for group in kv_cache_groups
+                ]
+            else:
+                max_num_blocks = [cdiv(max_model_len, block_size * dcp_world_size) for block_size in block_sizes]
 
         if len(max_num_blocks) != len(block_sizes):
             raise ValueError(

@@ -188,6 +188,25 @@ def test_compute_slot_mappings_passes_enabled_mask_on_newer_vllm():
     assert kwargs["slot_mapping_enabled"] is enabled
 
 
+def test_compute_slot_mappings_uses_group_local_cp_topology():
+    tables = _make_uninitialized_tables()
+    tables.cp_sizes = (2, 1)
+    tables.cp_ranks = (1, 0)
+    tables.cp_interleaves = (4, 1)
+    idx_mapping = torch.tensor([0, 1], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
+    positions = torch.zeros(6, dtype=torch.int64)
+    kernel = MagicMock()
+
+    with patch("vllm_ascend.worker.v2.block_table._compute_slot_mappings_kernel", kernel):
+        tables.compute_slot_mappings(idx_mapping, query_start_loc, positions, 3)
+
+    assert kernel.__getitem__.call_count == 2
+    first_kwargs = kernel.__getitem__.return_value.call_args.kwargs
+    assert first_kwargs["CP_SIZE"] == 1
+    assert first_kwargs["CP_INTERLEAVE"] == 1
+
+
 def test_init_block_table_layout_tensors_builds_distinct_sizes():
     tables = AscendBlockTables.__new__(AscendBlockTables)
     tables.block_sizes = [16, 32]
