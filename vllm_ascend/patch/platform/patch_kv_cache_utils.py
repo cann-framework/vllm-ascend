@@ -827,6 +827,57 @@ def _ascend_get_kv_cache_config_from_groups(
     return kv_cache_config
 
 
+_orig_sliding_window_max_memory_usage_bytes = SlidingWindowSpec.max_memory_usage_bytes
+
+
+def _ascend_sliding_window_max_memory_usage_bytes(
+    self: SlidingWindowSpec,
+    vllm_config: VllmConfig,
+) -> int:
+    """Give the replicated Window-GQA DSpark draft a DCP-independent bound.
+
+    Upstream asserts ``decode_context_parallel_size == 1`` because an
+    ordinary sliding-window cache cannot be DCP-sharded. The Window-GQA
+    DSpark draft group is the deliberate exception: its cache is
+    replicated on every DCP rank (the target MLA group keeps the
+    worker-wide DCP sharding), so this spec's per-rank usage never
+    depends on the worker-wide DCP size and the upstream assert must not
+    reject the configuration. Call sites reaching here include the
+    startup pool sizer, ``get_max_concurrency_for_kv_cache_config``
+    (kv_cache_size_tokens / max concurrency) and the auto-fit paths,
+    all of which pass the worker-wide ``vllm_config``.
+
+    Non-DSpark models keep the original behavior. Non-GQA window specs
+    (sliding-MLA, circular tails) are excluded by the GQA guard and keep
+    the original assert, so a genuinely DCP-sharded sliding window stays
+    a rejected configuration.
+    """
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    is_window_gqa_draft = (
+        getattr(speculative_config, "method", None) == "dspark"
+        and is_sliding_window_gqa_spec(self)
+    )
+    dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+    if dcp_size <= 1 or not is_window_gqa_draft:
+        return _orig_sliding_window_max_memory_usage_bytes(self, vllm_config)
+    # The scheduler conversion may hand the scheduler config a bare
+    # representative spec while the worker config keeps the uniform
+    # wrapper; both reach this method through the same admission bound,
+    # so the worker and scheduler capacity call sites stay consistent.
+    max_in_flight_tokens = getattr(
+        vllm_config,
+        "max_in_flight_tokens",
+        vllm_config.scheduler_config.max_num_batched_tokens,
+    )
+    max_blocks = self.max_admission_blocks_per_request(
+        max_in_flight_tokens=max_in_flight_tokens,
+        max_model_len=vllm_config.model_config.max_model_len,
+    )
+    return max_blocks * self.page_size_bytes
+
+
+SlidingWindowSpec.max_memory_usage_bytes = _ascend_sliding_window_max_memory_usage_bytes
+
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 assert _orig_get_packed_kv_cache_groups is not None
 vllm.v1.core.kv_cache_utils._get_packed_kv_cache_groups = _ascend_get_packed_kv_cache_groups
