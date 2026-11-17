@@ -21,12 +21,7 @@ from typing import Any, cast
 
 import numpy as np
 import torch
-from vllm.config import (
-    VllmConfig,
-    get_layers_from_vllm_config,
-    replace,
-    set_current_vllm_config,
-)
+from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_dcp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -89,16 +84,22 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
     @property
     def attn_vllm_config(self) -> VllmConfig:
         """Use a local DCP=1 config for a replicated Window-GQA draft."""
-        config = super().attn_vllm_config
         if not getattr(self, "_window_gqa_dcp_fallback", False):
-            return config
-        parallel_config = replace(
-            config.parallel_config,
-            decode_context_parallel_size=1,
-            dcp_kv_cache_interleave_size=1,
-            cp_kv_cache_interleave_size=1,
-        )
-        return replace(config, parallel_config=parallel_config)
+            return super().attn_vllm_config
+        # This property is read before proposal and during metadata/replay.
+        # replace(VllmConfig, ...) reruns __post_init__ and platform setup on
+        # every read, stalling host submission between target and draft ops.
+        # Mirror DFlash's causality override with shallow copies: older vLLM
+        # versions also reconstruct VllmConfig in the parent property. Keep
+        # the other fields live, including compilation state and bound caches.
+        config = copy(self.vllm_config)
+        config.attention_config = copy(config.attention_config)
+        config.attention_config.use_non_causal = self.requires_non_causal
+        config.parallel_config = copy(config.parallel_config)
+        config.parallel_config.decode_context_parallel_size = 1
+        config.parallel_config.dcp_kv_cache_interleave_size = 1
+        config.parallel_config.cp_kv_cache_interleave_size = 1
+        return config
 
     def _init_dcp(self) -> None:
         self.use_dcp = self.attn_vllm_config.parallel_config.decode_context_parallel_size > 1
