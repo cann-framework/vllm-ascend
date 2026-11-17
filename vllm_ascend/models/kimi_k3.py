@@ -110,7 +110,7 @@ from vllm_ascend.ops.kimi_situ import initialize_kimi_situ_ops
 from vllm_ascend.ops.linear_op import KimiOProjMMReduceScatterOp
 from vllm_ascend.quantization.methods.base import PreparedLinearInput
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
-from vllm_ascend.utils import get_rotation_path, is_950
+from vllm_ascend.utils import get_rotation_path, is_950, shared_experts_calculation_stream
 from vllm_ascend.worker.v2.pp_transport import (
     PPTransportDataType,
     add_pp_transport_tensors,
@@ -493,6 +493,8 @@ class AscendKimiMoE(nn.Module):
         if self.shared_experts is not None and get_ascend_config().multistream_overlap_shared_expert:
             # Share a communication stream across this model's MoE layers;
             # keep it separate from both Router and shared Cube/Vector work.
+            if not hasattr(vllm_config, "_kimi_shared_compute_stream"):
+                vllm_config._kimi_shared_compute_stream = shared_experts_calculation_stream()
             if not hasattr(vllm_config, "_kimi_shared_comm_stream"):
                 vllm_config._kimi_shared_comm_stream = torch.npu.Stream()
             object.__setattr__(self.experts, "_kimi_shared_comm_stream", vllm_config._kimi_shared_comm_stream)
@@ -1098,6 +1100,36 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
         else:
             self.attn_res_query_plan.refresh(specs)
 
+    def _start_flash_mla_metadata(self) -> None:
+        """Start all shared FlashMLA metadata builds before the layer loop."""
+        if not is_forward_context_available():
+            return
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return
+        started = set()
+        for layer in self.layers:
+            self_attn = getattr(layer, "self_attn", None)
+            impl = getattr(self_attn, "impl", None)
+            if impl is None or not hasattr(impl, "start_flash_mla_metadata"):
+                continue
+            layer_name = getattr(self_attn, "layer_name", None) or getattr(impl, "layer_name", None)
+            layer_metadata = attn_metadata.get(layer_name)
+            flash = (
+                layer_metadata.get_external_flashmla(getattr(impl, "flash_mla_layout", None))
+                if layer_metadata is not None
+                else None
+            )
+            if (
+                flash is None
+                or not getattr(flash, "metadata_async", False)
+                or getattr(layer_metadata, "num_decode_tokens", 0) <= 0
+                or id(flash) in started
+            ):
+                continue
+            impl.start_flash_mla_metadata(layer_metadata)
+            started.add(id(flash))
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1106,6 +1138,11 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        # Launch the shared metadata build before embedding, attention-residual
+        # preparation, and MoE router/GMM/TopK work.  The builder owns a
+        # dedicated metadata stream; attention waits on its ready event at the
+        # consumer, so the MoE streams remain independent.
+        self._start_flash_mla_metadata()
         if self.config.attn_res_block_size is None:
             return super().forward(
                 input_ids=input_ids,
@@ -1312,7 +1349,6 @@ class AscendKimiLinearForCausalLM(UpstreamKimiLinearForCausalLM, KimiMixtureOfEx
         CUDA RecoverSSM records). ReplaySSM is an Ascend-only ABI, so its
         three page records must be included here before KV cache allocation.
         """
-        hf_config = vllm_config.model_config.hf_config
         base = MambaStateDtypeCalculator.kda_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
@@ -1328,11 +1364,7 @@ class AscendKimiLinearForCausalLM(UpstreamKimiLinearForCausalLM, KimiMixtureOfEx
     def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
         hf_config = vllm_config.model_config.hf_config
         tp_size = vllm_config.parallel_config.tensor_parallel_size
-        num_spec = (
-            vllm_config.speculative_config.num_speculative_tokens
-            if vllm_config.speculative_config
-            else 0
-        )
+        num_spec = vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config else 0
         base = MambaStateShapeCalculator.kda_state_shape(
             tp_size,
             hf_config.linear_attn_config["num_heads"],
@@ -1515,17 +1547,13 @@ class AscendKimiK3ForConditionalGeneration(UpstreamKimiK3ForConditionalGeneratio
         page-size assertion would fire.
         """
         text_config = vllm_config.model_config.hf_config.text_config
-        return AscendKimiLinearForCausalLM.get_mamba_state_dtype_from_config(
-            vllm_config.with_hf_config(text_config)
-        )
+        return AscendKimiLinearForCausalLM.get_mamba_state_dtype_from_config(vllm_config.with_hf_config(text_config))
 
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
         """Delegate to the Ascend text model; see the dtype hook above."""
         text_config = vllm_config.model_config.hf_config.text_config
-        return AscendKimiLinearForCausalLM.get_mamba_state_shape_from_config(
-            vllm_config.with_hf_config(text_config)
-        )
+        return AscendKimiLinearForCausalLM.get_mamba_state_shape_from_config(vllm_config.with_hf_config(text_config))
 
     def process_weights_after_loading(self) -> None:
         # The loader invokes only the outer model-level hook for VL models.

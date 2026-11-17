@@ -93,6 +93,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # Enable the BF16 no-RoPE MLA Prolog and native FlashMLA over a merged
+    # PA_NZ latent cache (Kimi K3 target, Model Runner V2, Ascend 950).
+    # Default: disabled; use PA_BBND. Requires matching cannbot-dsl and
+    # DCP-capable cann_ops_transformer operators.
+    # Valid values: 0 or 1. Not sensitive.
+    "VLLM_ASCEND_ENABLE_PA_NZ": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_PA_NZ", "0"))),
 }
 
 # end-env-vars-definition
