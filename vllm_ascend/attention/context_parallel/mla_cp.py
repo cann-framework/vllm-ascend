@@ -742,9 +742,10 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
             # FlashMLA consumes the original paged cache, including its strides.
             history_k_nope, history_k_pe = cache_k_nope, None
 
-        # FlashMLA attends persistent history and this step's KV in one operator
-        # call, so only the framework path stages a replicated current chunk.
-        uses_current_chunk = flash is None
+        # Native FlashMLA owns persistent history.  The current chunk is still
+        # replicated across DCP ranks and must be reduced separately, just as
+        # in the FIA path.  PA_NZ supplies it from its private prolog workspace.
+        uses_current_chunk = flash is None or (current_k_nope is not None and current_k_pe is not None)
         if uses_current_chunk:
             assert current_k_nope is not None and current_k_pe is not None
             current_q_nope, current_q_pe = self._local_decode_query(q_nope, q_pe, num_heads=self.num_heads)
@@ -825,8 +826,8 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
                 attention_kind=CPKVScope.HISTORY,
             )
         else:
-            # One call covers persistent history and this step's KV; the metadata
-            # operator owns the causal boundary of the local slice.
+            # This is the non-DCP/native path.  DCP always supplies a current
+            # chunk and therefore reaches the split history/current reduction.
             history_output, history_lse = self._run_dcp_flashmla_attention(flash, q_nope, q_pe, history_k_nope)
 
         # Stage the framework's current KV and Q on the main stream so its AIV

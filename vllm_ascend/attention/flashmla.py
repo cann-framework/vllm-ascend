@@ -566,9 +566,15 @@ class FlashMLAMetadataBuilder:
             flash.cache_lens.zero_()
             if flash.global_cache_lens is not None:
                 flash.global_cache_lens.zero_()
-            # One call covers the whole decode range, so the KV length keeps the
-            # current rows; the metadata operator derives the causal boundary.
+            # Non-DCP attention covers the full decode range.  DCP uses this
+            # metadata for persistent history; its replicated current rows are
+            # reduced separately by the context-parallel path below.
             global_lengths = common.seq_lens[:num_decodes]
+            if self.dcp_size > 1 and flash.adapter.config.layout_kv == "PA_NZ":
+                # DCP FlashMLA handles persistent history, while the current
+                # replicated chunk is reduced by the framework FIA path.  Do
+                # not expose the current query rows to the history metadata.
+                global_lengths = (global_lengths - flash.used_q[:num_decodes]).clamp_min(0)
             lengths = global_lengths
             if self.dcp_size > 1:
                 # Both causal and noncausal attention read only this rank's

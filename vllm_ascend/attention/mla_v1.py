@@ -3349,14 +3349,32 @@ class AscendMLAImpl(MLAAttentionImpl):
         return decode_q_nope, decode_q_pe
 
     @staticmethod
+    def _gather_pa_nz_rows(cache: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+        """Gather complete token rows from the physical PA_NZ tile layout."""
+        from vllm_ascend.ops.flash_mla_pa_nz import pa_nz_tile_indices  # noqa: PLC0415
+
+        tile_count = cache.shape[-1] // PA_NZ_TILE_WIDTH
+        tile_indices = pa_nz_tile_indices(slots.to(torch.int64), cache.shape[1], tile_count)
+        rows = cache.view(-1, PA_NZ_TILE_WIDTH).index_select(0, tile_indices)
+        return rows.view(slots.numel(), tile_count, PA_NZ_TILE_WIDTH).reshape(slots.numel(), cache.shape[-1])
+
+    @staticmethod
     def _copy_pa_nz_rows(
         src_cache: torch.Tensor,
         dst_cache: torch.Tensor,
         src_indices: torch.Tensor,
         dst_indices: torch.Tensor,
+        valid_rows: torch.Tensor | None = None,
     ) -> None:
         """Copy PA_NZ rows using batch-precomputed tile indices."""
         rows = src_cache.view(-1, PA_NZ_TILE_WIDTH).index_select(0, src_indices)
+        if valid_rows is not None:
+            # Invalid graph-padding rows use slot zero in the precomputed
+            # address tensor. Preserve that live row by writing back its
+            # current value instead of the padding row.
+            safe_dst_indices = dst_indices.clamp_min(0)
+            existing = dst_cache.view(-1, PA_NZ_TILE_WIDTH).index_select(0, safe_dst_indices)
+            rows = torch.where(valid_rows[:, None], rows, existing)
         torch_npu.npu_scatter_nd_update_(
             dst_cache.view(-1, PA_NZ_TILE_WIDTH),
             dst_indices.view(-1, 1),
@@ -3364,7 +3382,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         )
 
     def _forward_decode_flash_bf16(self, hidden_states, kv_cache, attn_metadata):
-        """Run the TP-local BF16 prolog, then native full-range FlashMLA."""
+        """Run BF16 Prolog and split DCP current/history attention safely."""
         from vllm_ascend.ops.flash_mla_pa_nz import mla_prolog_no_rope  # noqa: PLC0415
 
         flash = attn_metadata.get_external_flashmla(self.flash_mla_layout)
@@ -3394,18 +3412,44 @@ class AscendMLAImpl(MLAAttentionImpl):
             self.q_a_layernorm.variance_epsilon,
         )
         q = q.view(num_tokens, self.num_heads, FLASHMLA_QK_DIM)
+        current_k_nope = current_k_pe = None
         if flash.pa_nz_current_cache is not None:
             assert flash.pa_nz_copy_src_indices is not None and flash.pa_nz_copy_dst_indices is not None
+            current_rows = self._gather_pa_nz_rows(writer_cache, writer_slots)
+            current_k_nope = current_rows[..., : self.kv_lora_rank].view(
+                num_tokens, self.num_kv_heads, self.kv_lora_rank
+            )
+            current_k_pe = current_rows[..., self.kv_lora_rank :].view(
+                num_tokens, self.num_kv_heads, self.qk_rope_head_dim
+            )
             tile_rows = num_tokens * PA_NZ_TILE_COUNT
             self._copy_pa_nz_rows(
                 writer_cache,
                 merged_cache,
                 flash.pa_nz_copy_src_indices[:tile_rows],
                 flash.pa_nz_copy_dst_indices[:tile_rows],
+                valid_rows=(flash.token_live[:num_tokens] & (flash.slots[:num_tokens] >= 0)).repeat_interleave(
+                    PA_NZ_TILE_COUNT
+                ),
             )
-        # Metadata includes current KV and the global causal lengths. No
-        # replicated-current attention or second LSE merge is needed.
         self.wait_flash_mla_metadata(attn_metadata)
+        if self.dcp_enabled:
+            split_attention = getattr(self, "_forward_decode_split_attention", None)
+            if split_attention is None:
+                raise RuntimeError("PA_NZ DCP requires the DCP MLA implementation.")
+            q_nope, q_pe = self.reorg_decode_q(q[..., : self.kv_lora_rank], q[..., self.kv_lora_rank :])
+            return split_attention(
+                q_nope,
+                q_pe,
+                merged_cache,
+                None,
+                current_k_nope,
+                current_k_pe,
+                merged_cache.shape[1],
+                attn_metadata,
+            )
+        # Metadata covers the complete sequence for ordinary (non-DCP)
+        # FlashMLA decode.
         q_nope, q_pe = self.reorg_decode_q(q[..., : self.kv_lora_rank], q[..., self.kv_lora_rank :])
         preprocessed = DecodeMLAPreprocessResult(q_nope, q_pe)
         return self._forward_external_flashmla(preprocessed, merged_cache, attn_metadata)
