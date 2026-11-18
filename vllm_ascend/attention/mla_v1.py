@@ -89,6 +89,8 @@ from vllm_ascend.utils import (
     enable_sfa,
     is_pd_decode_recompute_scheduler_enabled,
     maybe_trans_nz,
+    mla_gate_stream,
+    npu_stream_switch,
     weak_ref_tensors,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
@@ -107,6 +109,14 @@ TRANSPOSE_BMM_MAX_SUPPORTED_DIM = 65536
 PROLOG_V3_SUPPORTED_INPUT_SIZES = (1024, 2048, 3072, 4096, 5120, 6144, 7168, 7680, 8192)
 MLAPO_CACHE_BLOCK_ALIGNMENT = 16
 MLAPO_MAX_CACHE_BLOCK_SIZE = 1024
+
+# The MLA output gate is a MIX_AIC GEMM: its quant/epilogue phase occupies
+# paired vector cores. Cap those cores on the auxiliary gate stream so the DCP
+# LSE pack/combine kernels (pure AIV, grid == all vector cores) keep their
+# parallelism. MXFP gates spend real work in the AIV quant phase, so they get
+# more vector cores than the floating-point BF16 gate.
+MLA_GATE_CORE_LIMIT_BF16 = (32, 1)
+MLA_GATE_CORE_LIMIT_MXFP = (16, 8)
 
 
 class AscendMLABackend(AttentionBackend):
@@ -1093,6 +1103,13 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.o_proj = kwargs["o_proj"]
         self.g_proj = kwargs.get("g_proj")
         self.use_output_gate = self.g_proj is not None
+        self._gate_stream: torch.npu.Stream | None = None
+        self._gate_in_event: torch.npu.Event | None = None
+        self._gate_done_event: torch.npu.Event | None = None
+        self._gate_pending = False
+        # Resolved on the first fork: quantized layers only grow ``weight_scale``
+        # during ``process_weights_after_loading``, after this constructor.
+        self._gate_core_limit: tuple[int, int] | None = None
         self.use_mla_rope = kwargs.get("use_mla_rope", True)
         self.vllm_config = get_current_vllm_config()
         self.pcp_enabled = self.vllm_config.parallel_config.prefill_context_parallel_size > 1
@@ -1792,6 +1809,53 @@ class AscendMLAImpl(MLAAttentionImpl):
             out = self._merge_dcp_attention_output(out, lse.transpose(0, 1).unsqueeze(-1).contiguous())
         return self._v_up_proj_batch_major(out), lse
 
+    def _fork_gate(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """Launch the output gate on its auxiliary stream, unjoined.
+
+        The gate GEMM is MIX_AIC while the DCP LSE pack/combine kernels are
+        pure AIV, so the auxiliary stream caps the gate's vector cores and lets
+        FlashMLA, the AllToAll (HCCL, no AI cores) and the LSE kernels run
+        ahead on the main stream. The gate is consumed only by the final
+        sigmoid multiply, which joins through ``_join_gate``.
+        """
+        self._gate_pending = False
+        if not self.use_output_gate:
+            return None
+        if torch.compiler.is_compiling() and not get_ascend_config().ascend_compilation_config.enable_npugraph_ex:
+            return self.g_proj(hidden_states.contiguous())[0]
+        if self._gate_stream is None:
+            self._gate_stream = mla_gate_stream()
+            self._gate_in_event = torch.npu.Event()
+            self._gate_done_event = torch.npu.Event()
+        assert self._gate_in_event is not None and self._gate_done_event is not None
+        if self._gate_core_limit is None:
+            self._gate_core_limit = (
+                MLA_GATE_CORE_LIMIT_MXFP if hasattr(self.g_proj, "weight_scale") else MLA_GATE_CORE_LIMIT_BF16
+            )
+        main_stream = torch.npu.current_stream()
+        gate_stream = self._gate_stream
+        hidden_states.record_stream(gate_stream)
+        self._gate_in_event.record(main_stream)
+        with npu_stream_switch(gate_stream):
+            gate_stream.wait_event(self._gate_in_event)
+            # Keep a layout copy outside the core-limit scope: it is pure AIV
+            # work and must not be pinned to the gate's spare vector cores.
+            hidden = hidden_states.contiguous()
+            with torch_npu.npu.npugraph_ex.scope.limit_core_num(*self._gate_core_limit):
+                gate = self.g_proj(hidden)[0]
+            self._gate_done_event.record(gate_stream)
+        gate.record_stream(main_stream)
+        self._gate_pending = True
+        return gate
+
+    def _join_gate(self) -> None:
+        """Wait for the auxiliary-stream gate tail before applying it."""
+        if not self._gate_pending:
+            return
+        assert self._gate_done_event is not None
+        torch.npu.current_stream().wait_event(self._gate_done_event)
+        self._gate_pending = False
+
     def _forward_kimi_c8(self, layer_name, hidden_states, kv_cache, attn_metadata, output):
         from vllm_ascend.attention.kimi_c8_decode import project_and_write_kimi_c8
         from vllm_ascend.attention.kimi_c8_static import pa_nz_prolog_view
@@ -1805,6 +1869,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         actual, num_decode = attn_metadata.num_actual_tokens, attn_metadata.num_decode_tokens
         if actual == 0:
             return output.zero_()
+        gate = self._fork_gate(hidden_states)
         cos = sin = None
         if self.use_mla_rope:
             rows = []
@@ -1891,9 +1956,9 @@ class AscendMLAImpl(MLAAttentionImpl):
                 kv_cache,
                 attn_metadata,
             )
-        if self.use_output_gate:
-            assert self.g_proj is not None
-            projected.mul_(torch.sigmoid(self.g_proj(hidden_states.contiguous())[0]))
+        if gate is not None:
+            self._join_gate()
+            projected.mul_(torch.sigmoid(gate))
         output[...] = self.o_proj(projected, is_prefill=has_prefill)[0]
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
         return output
@@ -3971,10 +4036,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         o_proj_input_shape = (_EXTRA_CTX.num_tokens, self.num_heads * self.v_head_dim)
         o_proj_input = torch.zeros(o_proj_input_shape, dtype=hidden_states.dtype, device=hidden_states.device)
 
-        gate = None
-        if self.use_output_gate:
-            assert self.g_proj is not None
-            gate = self.g_proj(hidden_states.contiguous())[0]
+        gate = self._fork_gate(hidden_states)
 
         # MLA Preprocess
         decode_requires_current_kv = self._decode_requires_current_kv(attn_metadata)
@@ -4064,6 +4126,7 @@ class AscendMLAImpl(MLAAttentionImpl):
 
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
         if gate is not None:
+            self._join_gate()
             o_proj_input.mul_(torch.sigmoid(gate))
         # O proj
         output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
