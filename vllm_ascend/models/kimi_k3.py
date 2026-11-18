@@ -352,6 +352,14 @@ def _get_kimi_router_stream(vllm_config: VllmConfig) -> torch.npu.Stream | None:
     return vllm_config._kimi_router_stream
 
 
+def _get_kimi_shared_comm_stream(vllm_config: VllmConfig, shared_experts) -> torch.npu.Stream | None:
+    if shared_experts is None or not get_ascend_config().multistream_overlap_shared_expert:
+        return None
+    if not hasattr(vllm_config, "_kimi_shared_comm_stream"):
+        vllm_config._kimi_shared_comm_stream = torch.npu.Stream()
+    return vllm_config._kimi_shared_comm_stream
+
+
 class AscendKimiMoE(nn.Module):
     """Kimi K3 MoE assembled from the standard vLLM MoE interfaces."""
 
@@ -490,12 +498,11 @@ class AscendKimiMoE(nn.Module):
             "_kimi_router_stream",
             _get_kimi_router_stream(vllm_config),
         )
-        if self.shared_experts is not None and get_ascend_config().multistream_overlap_shared_expert:
-            # Share a communication stream across this model's MoE layers;
-            # keep it separate from both Router and shared Cube/Vector work.
-            if not hasattr(vllm_config, "_kimi_shared_comm_stream"):
-                vllm_config._kimi_shared_comm_stream = torch.npu.Stream()
-            object.__setattr__(self.experts, "_kimi_shared_comm_stream", vllm_config._kimi_shared_comm_stream)
+        object.__setattr__(
+            self.experts,
+            "_kimi_shared_comm_stream",
+            _get_kimi_shared_comm_stream(vllm_config, self.shared_experts),
+        )
 
         # Use the factory's validated counts, including its effective EP size.
         moe_config = self.experts.moe_config

@@ -19,7 +19,13 @@ ROOT = Path(__file__).resolve().parents[3]
 
 def load(path, names, ns, class_name=None):
     ns.setdefault("moe_superkernel_scope", lambda *args: nullcontext())
-    ns.setdefault("get_ascend_config", lambda: NS(ascend_compilation_config=NS(enable_super_kernel=False)))
+    ns.setdefault(
+        "get_ascend_config",
+        lambda: NS(multistream_overlap_shared_expert=True, ascend_compilation_config=NS(enable_super_kernel=False)),
+    )
+    ns.setdefault(
+        "shared_expert_core_limit", lambda stage, limit: ns["torch_npu"].npu.npugraph_ex.scope.limit_core_num(*limit)
+    )
     tree = ast.parse((ROOT / path).read_text())
     if class_name:
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name)

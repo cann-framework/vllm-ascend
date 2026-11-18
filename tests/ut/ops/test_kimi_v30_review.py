@@ -16,6 +16,10 @@ ROOT = Path(__file__).resolve().parents[3]
 
 def load_class(path, name, methods, ns, base=None):
     ns.setdefault("moe_superkernel_scope", lambda *args: nullcontext())
+    ns.setdefault("get_ascend_config", lambda: NS(multistream_overlap_shared_expert=True))
+    ns.setdefault(
+        "shared_expert_core_limit", lambda stage, limit: ns["torch_npu"].npu.npugraph_ex.scope.limit_core_num(*limit)
+    )
     tree = ast.parse((ROOT / path).read_text())
     node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name)
     node.bases = [] if base is None else [ast.Name(id=base, ctx=ast.Load())]
@@ -278,7 +282,7 @@ class TestKimiMigrationReview(unittest.TestCase):
             HardwareCapability=NS(CANN_MEGAMOE_MXFP=1),
             get_ascend_config=lambda: NS(multistream_overlap_shared_expert=False),
         )
-        load("vllm_ascend/models/kimi_k3.py", {"_get_kimi_router_stream"}, ns)
+        load("vllm_ascend/models/kimi_k3.py", {"_get_kimi_router_stream", "_get_kimi_shared_comm_stream"}, ns)
         cls = load_class("vllm_ascend/models/kimi_k3.py", "AscendKimiMoE", {"__init__"}, ns, "Module")
         cls(config=cfg, vllm_config=NS(parallel_config=NS(enable_eplb=False)))
         sparse.assert_called_once_with(1.0, 25.0)

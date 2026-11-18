@@ -140,6 +140,78 @@ all other paths retain 0.30's collective ordering. Shared input AllGather still
 joins before routed EP communication. Multi-rank capture/replay must validate
 the new overlap; CPU dependency tests do not establish HCCL deadlock freedom.
 
+## Decode shared-expert diagnostics
+
+The existing `additional_config.multistream_overlap_shared_expert` switch
+controls shared computation, dedicated AG/RS communication, Router/TopK stream
+submission, and the Router and shared Gate/Up core limits. With the switch
+disabled, these Kimi auxiliary streams are not selected, precomputed TopK is
+cleared, and neither core-limit context is entered. No additional switch is
+required. Set the value before starting the workers; live graph reconfiguration
+is not supported.
+
+When an eligible Decode schedule enters a core-limit context, INFO logs report
+the requested AIC and AIV limits once per stage/parameter combination:
+
+```text
+[SharedExpertCoreLimit] stage=router aic_num=32 aiv_num=1
+[SharedExpertCoreLimit] stage=shared_gate_up aic_num=32 aiv_num=1
+[SharedExpertCoreLimit] stage=shared_gate_up aic_num=16 aiv_num=32
+```
+
+The Gate/Up line is `(32, 1)` for BF16 or `(16, 32)` for the admitted MXFP4
+path, rather than both for a uniformly quantized model. These are requested
+limits, not measured utilization or core reservations. The scope ends when its
+submission block exits; SiTU, shared Down and RS remain outside that limit.
+Core-limit invocation follows the multistream switch and Decode eligibility,
+independently of `enable_npugraph_ex` and `enable_super_kernel`.
+
+Diagnostics use `logger.info_once` and are available at the normal vLLM INFO
+logging level. If the service overrides that level, set it before starting a
+Decode worker:
+
+```bash
+export VLLM_LOGGING_LEVEL=INFO
+```
+
+The diagnostic applies to KV consumers and `DecodeBenchConnector`, excluding
+draft models. Filter the service log with:
+
+```bash
+rg '\[SharedExpertDebug\]' service.log
+```
+
+`stage=selection` reports the actual overlap setting, schedule, communication
+type, shared quantization schemes, and compute/communication/Router stream IDs.
+`stage=eligibility` lists failed conditions in `rejected`; `rejected=none`
+means the specialized Kimi Decode schedule is eligible. A `generic` schedule
+can still use shared-expert multistream execution. In particular, shared
+W8A8 MXFP8 weights do not satisfy the specialized BF16/MXFP4 shared-weight gate.
+
+`stage=ag`, `gate_up`, `activation`, `down` and `rs` report the stream active
+at their host submission points. `wait_ag`, the routed milestone waits,
+`rs_wait_down` and `join` show the corresponding dependency boundaries.
+For the specialized schedule, AG and RS should report the communication
+stream, while Gate/Up, activation and Down should report the compute stream.
+Generic execution can perform shared communication on a different stream;
+inspect the reported IDs together with `schedule` and `overlap`.
+AG also reports `input_path=async_sp`, `before_routed` or `serial_sp` to
+distinguish the asynchronous and fallback submission paths.
+
+Messages use `logger.info_once` and are deduplicated per layer, stage,
+capture/graph mode, profile phase and scheduling decision. They do not
+synchronize the NPU or read tensor values. Captured graph replay does not
+execute these Python logging sites;
+use capture-time messages to identify the recorded path and an NPU profiler
+to establish whether communication and computation actually overlap.
+
+The dependency-free diagnostic regression tests run with:
+
+```bash
+python tests/ut/ops/test_shared_expert_diagnostics.py -v
+python tests/ut/ops/test_kimi_overlap_controls.py -v
+```
+
 ## Model Runner V2 validation
 
 V2 reuses the same MC2 Dispatch and routed GMM1 callbacks as V1. Enabling V2

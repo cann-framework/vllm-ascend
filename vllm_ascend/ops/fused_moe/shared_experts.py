@@ -314,6 +314,9 @@ class AscendSharedExperts:
         all-gather the shards back to [T_padded, H] and drop the padding rows.
         """
         gathered = tensor_model_parallel_all_gather(hidden_states, dim=0)
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.record("ag", tokens=gathered.shape[0], input_path="serial_sp", dedicated_comm_stream=False)
         return gathered[: _EXTRA_CTX.num_tokens]
 
     def _pad_and_reduce_scatter(self, shared_out: torch.Tensor) -> torch.Tensor:
@@ -330,6 +333,9 @@ class AscendSharedExperts:
         pad_size = (tp_size - original_num_tokens % tp_size) % tp_size
         if pad_size > 0:
             shared_out = F.pad(shared_out, (0, 0, 0, pad_size))
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.record("rs", tokens=original_num_tokens, padded_tokens=shared_out.shape[0])
         return tensor_model_parallel_reduce_scatter(shared_out, dim=0)
 
     def prepare_input_async(
@@ -355,6 +361,15 @@ class AscendSharedExperts:
             # trims it before computation.
             hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
             all_gather_done = torch.npu.current_stream().record_event()
+            diagnostics = getattr(self, "_diagnostics", None)
+            if diagnostics is not None:
+                diagnostics.record(
+                    "ag",
+                    tokens=hidden_states.shape[0],
+                    input_path="async_sp",
+                    dedicated_comm_stream=comm_stream is not None,
+                    ready_event=True,
+                )
         hidden_states.record_stream(shared_experts_calculation_stream())
         hidden_states.record_stream(torch.npu.current_stream())
         return PreparedSharedExpertInput(
@@ -381,6 +396,11 @@ class AscendSharedExperts:
         # it before computation. The caller records shared_input_ready after
         # this returns, handing the gathered tensor to the auxiliary stream.
         hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.record(
+                "ag", tokens=hidden_states.shape[0], input_path="before_routed", dedicated_comm_stream=False
+            )
         return PreparedSharedExpertInput(
             hidden_states=hidden_states,
             is_gathered=True,
@@ -396,6 +416,9 @@ class AscendSharedExperts:
             return
         if event is None:
             raise RuntimeError(f"Missing {name} event while shared-expert multistream is enabled.")
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.record(f"wait_{name}", event_present=True)
         torch.npu.current_stream().wait_event(event)
 
     def _wait_for_routed_stage(
@@ -427,6 +450,9 @@ class AscendSharedExperts:
         # Kimi Decode hands the AG event directly to this consumer stream.
         # Wait before any activation preparation, including quantization.
         if prepared_input.ready_event is not None:
+            diagnostics = getattr(self, "_diagnostics", None)
+            if diagnostics is not None:
+                diagnostics.record("wait_ag", event_present=True)
             torch.npu.current_stream().wait_event(prepared_input.ready_event)
         hidden_states = prepared_input.hidden_states
         local_dp_metadata = None
@@ -534,6 +560,9 @@ class AscendSharedExperts:
         gate_up_input_scale = None
         with self._compute_stream_context():
             self._wait_for_milestone(router_output_ready, "router_output_ready")
+            diagnostics = getattr(self, "_diagnostics", None)
+            if diagnostics is not None:
+                diagnostics.record("gate_up", mlp_path=path.name, overlap=self.multistream_overlap)
             if path is SharedExpertMLPPath.A8_INT_FUSED:
                 # W8A8/W4A8: INT8 activations with INT8 or INT4 weights.
                 assert isinstance(prepared_execution.gate_up_input, tuple)
@@ -788,6 +817,9 @@ class AscendSharedExperts:
         # inside an opaque custom op for ACL Graph, so a Python-side Event
         # assigned inside that op is not available while its fake path traces.
         if self.multistream_overlap:
+            diagnostics = getattr(self, "_diagnostics", None)
+            if diagnostics is not None:
+                diagnostics.record("join", wait_stream=shared_experts_calculation_stream().npu_stream)
             torch.npu.current_stream().wait_stream(shared_experts_calculation_stream())
 
     def forward(
@@ -818,6 +850,14 @@ class AscendSharedExperts:
 
         local_dp_metadata = submitted_gate_up.local_dp_metadata
         with self._compute_stream_context():
+            diagnostics = getattr(self, "_diagnostics", None)
+            if diagnostics is not None:
+                diagnostics.record(
+                    "shared_mlp",
+                    overlap=self.multistream_overlap,
+                    fine_grained_events=milestones.has_fine_grained_stage_events,
+                    defer_output_wait=defer_output_wait,
+                )
             shared_out = self._finish_shared_mlp(submitted_gate_up, milestones)
             if self.multistream_overlap and mode is SharedExpertParallelMode.SEQUENCE_PARALLEL_ONLY:
                 self._wait_for_milestone(
