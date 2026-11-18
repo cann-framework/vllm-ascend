@@ -344,6 +344,9 @@ def test_real_forward_preserves_write_wait_gate_and_save_order(monkeypatch, deco
     )
     impl._forward_prefill = lambda *a, **kw: events.append("prefill") or torch.full((3 - decode_tokens, 3), 5.0)
     impl.g_proj = lambda value: (events.append("gate") or torch.zeros_like(value), None)
+    # Keep the gate on the serial main-stream path: this CPU test has no NPU
+    # stream/event machinery and only checks call ordering.
+    monkeypatch.setattr(mla_v1.torch.npu, "is_available", lambda: False, raising=False)
 
     def output_projection(value, **kwargs):
         reuse = decode_tokens == 3 and padding == 0 and decode_dtype == torch.float32
@@ -363,11 +366,13 @@ def test_real_forward_preserves_write_wait_gate_and_save_order(monkeypatch, deco
     torch.testing.assert_close(output[:decode_tokens], torch.full_like(output[:decode_tokens], 2.5))
     torch.testing.assert_close(output[decode_tokens:3], torch.full_like(output[decode_tokens:3], 3.5))
     torch.testing.assert_close(output[3:], torch.ones_like(output[3:]))
+    # The gate now runs at the layer entry (serial on CPU-only test hosts), so
+    # it is recorded before the KV write/wait bookkeeping.
     assert events == (
-        ["wait", "layer_wait", "write", "written"]
+        ["gate", "wait", "layer_wait", "write", "written"]
         + (["decode"] if decode_tokens else [])
         + (["prepare", "prefill"] if decode_tokens < 3 else [])
-        + ["gate", "out", "save"]
+        + ["out", "save"]
     )
 
 
