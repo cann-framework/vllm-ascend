@@ -702,10 +702,14 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         # PR45 keeps TopK on the Router stream. Retain 0.30's common prepare
         # (including SP padding/masks) and join its actual producer here.
         if (
-            router_stream is None
+            not get_ascend_config().multistream_overlap_shared_expert
+            or router_stream is None
             or _EXTRA_CTX.moe_comm_type != MoECommType.MC2
             or not self.moe_config.is_sequence_parallel
         ):
+            diagnostics = getattr(self, "_shared_expert_diagnostics", None)
+            if diagnostics is not None:
+                diagnostics.record("topk", precomputed=False)
             return self._select_experts(hidden_states, router_logits, enable_force_load_balance, input_ids)
         main_stream = torch.npu.current_stream()
         prepared = main_stream.record_event()
@@ -714,6 +718,9 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
                 tensor.record_stream(router_stream)
         with npu_stream_switch(router_stream):
             torch.npu.current_stream().wait_event(prepared)
+            diagnostics = getattr(self, "_shared_expert_diagnostics", None)
+            if diagnostics is not None:
+                diagnostics.record("topk", precomputed=False)
             topk_weights, topk_ids = self._select_experts(
                 hidden_states, router_logits, enable_force_load_balance, input_ids
             )
