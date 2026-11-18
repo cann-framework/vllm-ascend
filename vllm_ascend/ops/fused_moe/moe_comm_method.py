@@ -23,6 +23,7 @@ import torch
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.distributed import get_ep_group
 
 from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
@@ -135,6 +136,25 @@ class MoECommMethod(ABC):
         self.prepare_finalize.set_lora_context(lora_context)
         self.token_dispatcher.set_lora_context(lora_context)
 
+    def _maybe_kimi_ep_sync(self, fused_experts_input: MoEFusedExpertsInput) -> None:
+        """Synchronize Kimi MC2 ranks with a side-effect-free EP all-reduce."""
+        if not isinstance(self, (MC2CommImpl, FusedMC2CommImpl)):
+            return
+        if not getattr(fused_experts_input.layer, "_is_kimi_moe", False):
+            return
+        ep_group = get_ep_group()
+        if ep_group.world_size <= 1:
+            return
+
+        sync_tensor = getattr(self, "_kimi_ep_sync_tensor", None)
+        if sync_tensor is None or sync_tensor.device != fused_experts_input.hidden_states.device:
+            sync_tensor = torch.zeros(
+                1,
+                dtype=torch.int32,
+                device=fused_experts_input.hidden_states.device,
+            )
+        self._kimi_ep_sync_tensor = ep_group.all_reduce(sync_tensor)
+
     def prepare(
         self,
         hidden_states: torch.Tensor,
@@ -184,6 +204,7 @@ class MoECommMethod(ABC):
         before_dispatch_evt = torch.npu.current_stream().record_event()
         if fused_experts_input.shared_expert_schedule is not None:
             fused_experts_input.shared_expert_schedule.before_dispatch(before_dispatch_evt)
+        self._maybe_kimi_ep_sync(fused_experts_input)
         token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
         if fused_experts_input.shared_expert_schedule is not None:
             fused_experts_input.shared_expert_schedule.after_dispatch()
@@ -212,6 +233,7 @@ class MoECommMethod(ABC):
             hidden_states=mlp_output,
             combine_metadata=token_dispatch_output.combine_metadata,
         )
+        self._maybe_kimi_ep_sync(fused_experts_input)
 
         return FusedExpertsResult(
             routed_out=routed_out,
@@ -614,6 +636,7 @@ class FusedMC2CommImpl(MoECommMethod):
 
         expert_tokens = None
         if self.enable_fused_mc2 == 1:
+            self._maybe_kimi_ep_sync(fused_experts_input)
             if _EXTRA_CTX.use_mega_moe:
                 out, expert_tokens = self._apply_cann_mega_moe(
                     fused_experts_input, weights, is_decode_only_node=_EXTRA_CTX.is_decode_only_node
@@ -643,6 +666,7 @@ class FusedMC2CommImpl(MoECommMethod):
                     expert_token_nums=self.expert_token_nums,
                 )
                 expert_tokens = self.expert_token_nums
+            self._maybe_kimi_ep_sync(fused_experts_input)
         else:
             raise ValueError(f"Wrong value of {self.enable_fused_mc2=}")
         return FusedExpertsResult(
