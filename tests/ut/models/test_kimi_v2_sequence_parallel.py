@@ -59,7 +59,7 @@ class TestKimiV2SequenceParallel(unittest.TestCase):
 
         # Resolve the production Kimi import, so this test fails when the
         # model accidentally switches back to the trace-sensitive upstream SP.
-        model_path = ROOT / "vllm_ascend/models/kimi_k3.py"
+        model_path = ROOT / "vllm_ascend/models/kimi_k3/kimi_k3.py"
         imports = [
             n
             for n in ast.parse(model_path.read_text()).body

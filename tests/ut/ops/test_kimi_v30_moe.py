@@ -319,7 +319,7 @@ class TestRouterStreamReuse(unittest.TestCase):
         options = NS(multistream_overlap_shared_expert=True)
         factory = Mock(side_effect=[object(), object()])
         ns = dict(torch=NS(npu=NS(Stream=factory)), get_ascend_config=lambda: options)
-        load("vllm_ascend/models/kimi_k3.py", {"_get_kimi_router_stream"}, ns)
+        load("vllm_ascend/models/kimi_k3/kimi_k3.py", {"_get_kimi_router_stream"}, ns)
         get_stream = ns["_get_kimi_router_stream"]
         first = get_stream(config)
         self.assertIs(get_stream(config), first)

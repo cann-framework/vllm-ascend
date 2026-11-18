@@ -53,7 +53,19 @@ def map_blocks(thread, remote_block, block_lists, token_counts):
     """Lists: suffix/full/remote; counts: local prompt/remote prompt/computed."""
     thread._kimi_c8_enabled = True
     return thread._compute_group_block_ids(
-        "r", [[0]], 1, 0, 1536, remote_block, *block_lists, *token_counts, 24, 24, spec(), 0
+        "r",
+        [[0]],
+        1,
+        0,
+        1536,
+        remote_block,
+        *block_lists,
+        *token_counts,
+        24,
+        24,
+        spec(),
+        0,
+        remote_interleave_size=remote_block,
     )
 
 
@@ -169,11 +181,12 @@ def test_registration_reads_impl_scale_and_preserves_physical_stride(monkeypatch
     cache = pa_nz_cache_view(backing, 2, 1536, page_stride_bytes=16 * PAYLOAD)
     worker = MooncakeBaseConnectorWorker.__new__(MooncakeBaseConnectorWorker)
     worker.vllm_config = Ns(
+        parallel_config=Ns(cp_kv_cache_interleave_size=1536),
         compilation_config=Ns(
             static_forward_context={
                 "mla": Ns(fak_descale_float=torch.tensor([0.5]), impl=Ns(fak_descale_float=torch.tensor([0.25])))
             }
-        )
+        ),
     )
     worker.ascend_config = Ns(kvpp_config=Ns(size=1))
     worker.pcp_rank, worker.tp_rank, worker.tp_size = 0, 0, 1

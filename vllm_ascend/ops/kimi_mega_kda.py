@@ -46,6 +46,8 @@ MEGA_KDA_REPLAY_ABI_REQUIRED_ARGS = (
     "rms_norm_eps",
     "cu_seqlens",
 )
+
+
 class MegaKDAFirstVerifyTracker:
     """Request-local history indexed by the actual Mamba cache block.
 
@@ -144,9 +146,7 @@ def load_commit_recurrent_kda_operator():
     try:
         operator = import_module("ops.commit_recurrent_kda").commit_recurrent_kda
     except (ImportError, AttributeError) as error:
-        raise ImportError(
-            "enable_mega_kda_replayssm requires ops.commit_recurrent_kda.commit_recurrent_kda"
-        ) from error
+        raise ImportError("enable_mega_kda_replayssm requires ops.commit_recurrent_kda.commit_recurrent_kda") from error
     if not callable(operator):
         raise TypeError("ops.commit_recurrent_kda.commit_recurrent_kda must be callable")
     return operator

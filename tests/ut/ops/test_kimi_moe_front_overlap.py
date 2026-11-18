@@ -7,7 +7,8 @@ from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
 import torch
-from test_kimi_v30_review import load_class
+
+from tests.ut.ops.test_kimi_v30_review import load_class
 
 
 class EventGraph:

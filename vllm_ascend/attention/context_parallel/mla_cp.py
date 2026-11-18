@@ -363,9 +363,10 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
         max_tokens: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        native_pages = getattr(self, "use_flashmla", False) or getattr(self, "_kimi_c8_enabled", False)
         block_size = (
             MLA_KERNEL_BLOCK_SIZE
-            if getattr(self, "is_draft_cache", False)
+            if getattr(self, "is_draft_cache", False) or not native_pages
             else self.vllm_config.cache_config.block_size
         )
         cache_shape = (cdiv(max_tokens, block_size), block_size, self.num_kv_heads)

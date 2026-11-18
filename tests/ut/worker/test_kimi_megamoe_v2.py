@@ -542,7 +542,7 @@ class TestKimiMegaMoEV2(unittest.TestCase):
                     init_vllm_registered_model=init_language_model,
                 )
                 load_functions(
-                    "vllm_ascend/models/kimi_k3.py",
+                    "vllm_ascend/models/kimi_k3/kimi_k3.py",
                     {"__init__"},
                     namespace,
                     class_name="AscendKimiK3ForConditionalGeneration",

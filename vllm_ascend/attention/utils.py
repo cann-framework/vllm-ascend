@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import import_module
 from importlib.util import find_spec
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -36,6 +36,9 @@ from vllm_ascend.utils import (
     get_ascend_config,
     is_pd_decode_recompute_scheduler_enabled,
 )
+
+if TYPE_CHECKING:
+    from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
 
 # Native npu_attention_update accepts at most 16 output/LSE pairs.
 ATTENTION_UPDATE_MAX_INPUTS = 16
@@ -427,6 +430,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
 
     # Metadata for Decode Context Parallelism (DCP) operations.
     context_parallel_metadata: AscendDCPMetadata | None = None
+    # Absent for non-PCP batches and replicated draft decoding.
+    pcp_context: "AscendPCPAttentionContext | None" = None
     # Per-request / per-token request identity used by the Sparse KV offload
     # resident LRU (adler32-hashed request ids and token->request mapping).
     req_ids_tensor: torch.Tensor | None = None
@@ -477,6 +482,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
             num_input_tokens=self.num_input_tokens,
             context_parallel_metadata=self.context_parallel_metadata,
+            pcp_context=self.pcp_context,
             seq_lens_cpu_upper_bound=self.seq_lens_cpu_upper_bound[:num_actual_reqs]
             if self.seq_lens_cpu_upper_bound is not None
             else None,
@@ -501,6 +507,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             req_topk_buffer_slots=_slice_reqs(self.req_topk_buffer_slots),
             req_topk_buffer_active=_slice_reqs(self.req_topk_buffer_active),
             copy_sfa_draft_index=self.copy_sfa_draft_index,
+            copy_sfa_restore_tails=self.copy_sfa_restore_tails,
             offload_dummy=self.offload_dummy,
             req_ids_tensor=_slice_reqs(self.req_ids_tensor),
             token_to_req=(self.token_to_req[:num_actual_tokens] if self.token_to_req is not None else None),
@@ -777,3 +784,20 @@ def merge_prefill_chunks(
     relative_lse, anchor = prepare_attention_update(lse_list, lse_anchor)
     output, lse = torch_npu.npu_attention_update(relative_lse, tuple(out_list), int(return_lse))
     return output, lse, anchor
+
+
+def uses_pcp_sharded_layout(common_attn_metadata: "AscendCommonAttentionMetadata", use_pcp: bool) -> bool:
+    """Return whether this step should use the PCP-sharded layout.
+
+    Under PCP, metadata built without a PCP context (e.g. a replicated draft
+    decode) runs replicated on every rank, so its slot mapping must not be
+    expanded to every rank's tokens.
+    """
+    if not use_pcp:
+        return False
+    if common_attn_metadata.pcp_context is None:
+        assert common_attn_metadata.slot_mapping.shape[0] <= common_attn_metadata.num_input_tokens, (
+            "PCP metadata without a PCP context must keep a rank-local slot mapping."
+        )
+        return False
+    return True

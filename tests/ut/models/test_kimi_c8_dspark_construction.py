@@ -9,7 +9,7 @@ from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
 from vllm_ascend.attention import mla_v1
 from vllm_ascend.device.hardware_profile import HardwareCapability
-from vllm_ascend.models import kimi_k3, kimi_k3_dspark
+from vllm_ascend.models.kimi_k3 import kimi_k3, kimi_k3_dspark
 from vllm_ascend.ops import mla as mla_ops
 from vllm_ascend.quantization import utils as quant_utils
 from vllm_ascend.quantization.methods.kv_cache import kv_c8

@@ -67,13 +67,13 @@ class TestKimiLatentProjection(unittest.TestCase):
         # Include the former constructor so this test catches a return to the
         # eager-GMM/graph-QMM split instead of just checking source text.
         load_class(
-            "vllm_ascend/models/kimi_k3.py",
+            "vllm_ascend/models/kimi_k3/kimi_k3.py",
             "AscendKimiK3RoutedLinear",
             {"__init__", "forward", "apply_projection"},
             ns,
             base="ReplicatedLinear",
         )
-        tree = ast.parse((ROOT / "vllm_ascend/models/kimi_k3.py").read_text())
+        tree = ast.parse((ROOT / "vllm_ascend/models/kimi_k3/kimi_k3.py").read_text())
         moe = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AscendKimiMoE")
         init = next(n for n in moe.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
         latent = next(

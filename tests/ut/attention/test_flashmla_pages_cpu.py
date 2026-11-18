@@ -131,6 +131,7 @@ def test_selection_keeps_reader_page_and_interleave_consistent(page, interleave,
         vllm_config=SimpleNamespace(
             use_v2_model_runner=True,
             speculative_config=None,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="kimi_k3")),
             cache_config=SimpleNamespace(block_size=page),
             parallel_config=SimpleNamespace(decode_context_parallel_size=dcp, cp_kv_cache_interleave_size=interleave),
         ),

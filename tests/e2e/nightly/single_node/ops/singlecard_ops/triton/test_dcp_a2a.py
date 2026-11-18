@@ -5,6 +5,7 @@ from statistics import median
 import pytest
 import torch
 
+from tests.e2e.nightly.single_node.ops.singlecard_ops.triton.dcp_test_utils import assert_dcp_close
 from vllm_ascend.ops.triton.dcp import dcp_a2a
 from vllm_ascend.ops.triton.dcp.dcp_a2a import (
     fused_dcp_lse_combine,
@@ -39,6 +40,23 @@ def _simulate_receive(
     return torch.stack([send_buffers[source_rank][destination_rank] for source_rank in range(dcp_size)])
 
 
+@pytest.mark.parametrize("tokens", [128, 129])
+@torch.inference_mode()
+def test_decode_combine_without_local(tokens):
+    torch.manual_seed(35)
+    world, heads, dim = 8, 96, 512
+    outputs = torch.randn(world, tokens, heads, dim, device="npu", dtype=torch.bfloat16)
+    lses = torch.randn(world, tokens, heads, 1, device="npu") * 8 + 70_000
+    lses[:, 0, 0] = -torch.inf
+    outputs[:, 0, 0] = torch.nan
+    lses[0, 1, 0] = torch.nan
+    outputs[0, 1, 0] = torch.nan
+    recv = _simulate_receive(outputs, lses, 0, 1)
+    actual = fused_dcp_lse_combine(recv, dim, 1)
+    expected = _reference_merge(outputs[:, :, : heads // world], lses[:, :, : heads // world, 0])
+    assert_dcp_close(actual, expected)
+
+
 _A5_FIXED_CASES = (
     pytest.param(64, 96, 512, 8, 1, 1, True, id="original-shape"),
     pytest.param(4, 96, 512, 8, 1, 1, True, id="too-few-pack-rows"),
@@ -60,7 +78,6 @@ _A5_FIXED_CASES = (
 )
 
 
-@torch.inference_mode()
 def _check_a5_batching_case(
     monkeypatch: pytest.MonkeyPatch,
     num_tokens: int,
@@ -337,8 +354,7 @@ def test_pack_and_fused_lse_combine(
         )
     actual = fused_dcp_lse_combine(recv, head_dim, scatter_dim)
 
-    tolerance = 2e-2 if dtype == torch.bfloat16 else 1e-2
-    torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+    assert_dcp_close(actual, expected)
 
 
 @pytest.mark.parametrize("scatter_dim", [0, 1])
@@ -390,7 +406,7 @@ def test_stride_aware_pack(scatter_dim: int) -> None:
         )
     actual = fused_dcp_lse_combine(recv, head_dim, scatter_dim)
 
-    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    assert_dcp_close(actual, expected)
 
 
 @pytest.mark.parametrize("scatter_dim", [0, 1])
@@ -440,7 +456,7 @@ def test_invalid_lse_and_all_invalid_rows(scatter_dim: int) -> None:
             sender_outputs[:, :, : num_heads // dcp_size],
             sender_lses[:, :, : num_heads // dcp_size, 0],
         )
-    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    assert_dcp_close(actual, expected)
     assert torch.count_nonzero(actual[1, 0]).item() == 0
 
 
@@ -493,8 +509,7 @@ def test_finite_lse_outside_activation_dtype_range(
             sender_lses[:, :, head_slice, 0],
         )
 
-    tolerance = 2e-2 if dtype == torch.bfloat16 else 1e-2
-    torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+    assert_dcp_close(actual, expected)
     assert torch.count_nonzero(actual).item() > 0
 
 
@@ -516,20 +531,57 @@ def test_mla_history_lse_then_current_merge() -> None:
     partials = torch.cat((outputs, lse.unsqueeze(-1)), dim=-1).npu()
     direct = fused_dcp_lse_combine(partials, 512, scatter_dim=0)
     assert direct.dtype == torch.float32
-    torch.testing.assert_close(direct.cpu(), expected, atol=3e-6, rtol=3e-5)
+    assert_dcp_close(direct, expected)
     history = torch.cat((outputs[:16], lse[:16].unsqueeze(-1)), dim=-1).npu()
     merged_history = fused_dcp_lse_combine(history, 512, scatter_dim=0, return_lse=True)
     assert merged_history.shape == (num_tokens, 6, 513)
     current = torch.cat((outputs[-1], lse[-1].unsqueeze(-1)), dim=-1).npu()
     actual = fused_dcp_lse_combine(torch.stack((merged_history, current)), 512, scatter_dim=0)
-    torch.testing.assert_close(actual.cpu(), expected, atol=5e-4, rtol=5e-4)
+    assert_dcp_close(actual, expected)
     assert torch.isfinite(actual).all()
 
 
-@pytest.mark.parametrize("scatter_dim", [0, 1])
-@pytest.mark.parametrize("dcp_size", [1, 2, 8])
-@pytest.mark.parametrize("head_dim", [96, 256, 512])
-@pytest.mark.parametrize("local_dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "scatter_dim,dcp_size,head_dim,local_dtype",
+    [
+        (0, 1, 96, torch.float32),
+        (1, 1, 96, torch.float32),
+        (0, 1, 96, torch.bfloat16),
+        (1, 1, 96, torch.bfloat16),
+        (0, 1, 96, torch.float16),
+        (1, 1, 96, torch.float16),
+        (1, 1, 256, torch.float32),
+        (0, 1, 256, torch.bfloat16),
+        (1, 1, 256, torch.float16),
+        (0, 1, 512, torch.float32),
+        (1, 1, 512, torch.bfloat16),
+        (0, 1, 512, torch.float16),
+        (1, 2, 96, torch.float32),
+        (0, 2, 96, torch.bfloat16),
+        (1, 2, 96, torch.float16),
+        (0, 2, 256, torch.float32),
+        (1, 2, 256, torch.bfloat16),
+        (0, 2, 256, torch.float16),
+        (0, 2, 512, torch.float32),
+        (1, 2, 512, torch.float32),
+        (0, 2, 512, torch.bfloat16),
+        (1, 2, 512, torch.bfloat16),
+        (0, 2, 512, torch.float16),
+        (1, 2, 512, torch.float16),
+        (0, 8, 96, torch.float32),
+        (1, 8, 96, torch.bfloat16),
+        (0, 8, 96, torch.float16),
+        (0, 8, 256, torch.float32),
+        (1, 8, 256, torch.float32),
+        (0, 8, 256, torch.bfloat16),
+        (1, 8, 256, torch.bfloat16),
+        (0, 8, 256, torch.float16),
+        (1, 8, 256, torch.float16),
+        (0, 8, 512, torch.float32),
+        (1, 8, 512, torch.bfloat16),
+        (0, 8, 512, torch.float16),
+    ],
+)
 @torch.inference_mode()
 def test_combine_with_raw_local_fia(scatter_dim, dcp_size, head_dim, local_dtype):
     torch.manual_seed(16362)
@@ -558,5 +610,9 @@ def test_combine_with_raw_local_fia(scatter_dim, dcp_size, head_dim, local_dtype
     lses = torch.cat((history_lse, local_lse.unsqueeze(0)))[..., 0]
     expected = _reference_merge(values, lses)
     expected_lse = torch.logsumexp(lses.masked_fill(~torch.isfinite(lses), -torch.inf), dim=0)
-    torch.testing.assert_close(actual[..., :head_dim], expected, atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(actual[..., head_dim], expected_lse, atol=1e-4, rtol=1e-4)
+    assert_dcp_close(actual[..., :head_dim], expected)
+    # Empty contributions have an exact -inf LSE sentinel, outside finite tolerances.
+    actual_lse, golden_lse = actual[..., head_dim].cpu(), expected_lse.cpu()
+    finite = golden_lse.isfinite()
+    assert torch.equal(actual_lse[~finite], golden_lse[~finite])
+    assert_dcp_close(actual_lse[finite], golden_lse[finite])

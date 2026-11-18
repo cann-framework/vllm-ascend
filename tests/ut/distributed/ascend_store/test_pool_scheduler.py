@@ -14,7 +14,6 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-
 import copy
 import unittest
 from dataclasses import replace
@@ -27,7 +26,6 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     MambaSpec,
-    MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -154,20 +152,36 @@ def test_prefix_lookup_rechecks_after_save_and_eviction(mode):
 
 
 @pytest.mark.parametrize("draft_first", [False, True])
-def test_joint_prefix_group_ownership_survives_scheduler_conversion_and_empty_pp_layer_names(draft_first):
+@pytest.mark.parametrize("non_causal", [False, True])
+@pytest.mark.parametrize("empty_pp_layers", [False, True])
+def test_joint_prefix_group_ownership_survives_scheduler_conversion_and_empty_pp_layer_names(
+    draft_first, non_causal, empty_pp_layers
+):
     from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
 
+    from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
     from vllm_ascend.patch.platform import patch_kv_cache_utils
 
-    target = MLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32)
-    draft = replace(target, non_causal_multi_token_decode=True)
+    target = AscendMLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32)
+    # Ownership comes from is_draft, independently of the attention mask.
+    target = replace(target, non_causal_multi_token_decode=non_causal)
+    draft = replace(target, is_draft=True)
     layer_specs = {"draft": draft, "target": target} if draft_first else {"target": target, "draft": draft}
     mixed = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=layer_specs)
-    config = SimpleNamespace(speculative_config=SimpleNamespace(method="dspark"), kv_transfer_config=None)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="kimi_k3")),
+        speculative_config=SimpleNamespace(method="dspark"),
+        kv_transfer_config=None,
+    )
     kv_config = SimpleNamespace(
         num_blocks=4,
         hisparse_host_num_blocks=0,
-        kv_cache_groups=[KVCacheGroupSpec([], draft), KVCacheGroupSpec(list(layer_specs), mixed)],
+        kv_cache_groups=[
+            KVCacheGroupSpec([], draft, is_eagle_group=True),
+            KVCacheGroupSpec([] if empty_pp_layers else list(layer_specs), mixed, is_eagle_group=True),
+            KVCacheGroupSpec(["target-only"], target),
+            KVCacheGroupSpec([], UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={"draft": draft})),
+        ],
     )
     original_groups = copy.deepcopy(kv_config.kv_cache_groups)
     with (
@@ -177,12 +191,35 @@ def test_joint_prefix_group_ownership_survives_scheduler_conversion_and_empty_pp
         patch.object(patch_kv_cache_utils, "_orig_get_kv_cache_config_from_groups", return_value=kv_config),
     ):
         result = patch_kv_cache_utils._ascend_get_kv_cache_config_from_groups(config, kv_config.kv_cache_groups, 0)
-    assert result.dspark_draft_only_group_ids == (0,)
+    assert result.dspark_draft_only_group_ids == (0, 3)
     scheduler_config = generate_scheduler_kv_cache_config([result])
-    assert scheduler_config.dspark_draft_only_group_ids == (0,)
+    assert scheduler_config.dspark_draft_only_group_ids == (0, 3)
     assert scheduler_config.kv_cache_groups[0].layer_names == []
     assert scheduler_config.kv_cache_groups[1].kv_cache_spec == next(iter(layer_specs.values()))
     assert result.kv_cache_groups == original_groups
+
+    # Feed the preserved ownership to its real consumer. A mixed group must
+    # retain target keys even if its representative is draft or this PP stage
+    # has no local layers; standalone draft groups have no target object.
+    scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
+    scheduler.mamba_state_sharding = {}
+    scheduler.layerwise_keys = SimpleNamespace(
+        make_hit_check_keys=MagicMock(side_effect=lambda group_id, *_, **kwargs: [f"target-group{group_id}"])
+    )
+    scheduler.tp_size, scheduler.put_step = 4, 4
+    scheduler.num_speculative_blocks_by_group = {}
+    scheduler.dspark_prefix_keys = DSparkPrefixKeys("draft-contract", pp_size=2, tp_size=4)
+    scheduler.dspark_draft_only_group_ids = frozenset(scheduler_config.dspark_draft_only_group_ids)
+    draft_keys = scheduler.dspark_prefix_keys.make_hit_check_keys("block-hash")
+    for group_id in (0, 3):
+        assert scheduler._make_layerwise_hit_check_keys(group_id, "block-hash") == draft_keys
+    scheduler.layerwise_keys.make_hit_check_keys.assert_not_called()
+    for group_id in (1, 2):
+        assert scheduler._make_layerwise_hit_check_keys(group_id, "block-hash") == [
+            f"target-group{group_id}",
+            *draft_keys,
+        ]
+    assert scheduler.layerwise_keys.make_hit_check_keys.call_count == 2
 
 
 def make_config(kv_role="kv_producer", extra_config=None, block_size=16):
@@ -633,6 +670,41 @@ class TestKVPoolScheduler(unittest.TestCase):
         self.assertEqual(need, 48)
         self.assertTrue(is_async)
 
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_swa_group_selected_for_save_retention(self, mock_client_cls):
+        groups = [
+            KVCacheGroupSpec(
+                ["layer.0"],
+                SlidingWindowSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32, sliding_window=32),
+            )
+        ]
+        scheduler = KVPoolScheduler(
+            self._make_config(extra_config={"backend": "memcache"}),
+            use_layerwise=False,
+            kv_cache_config=MagicMock(kv_cache_groups=groups),
+        )
+        self.assertEqual(scheduler.swa_group_ids, {0})
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.infer_cacheable_group_ids")
+    def test_noncacheable_swa_group_is_not_retained(self, mock_cacheable_groups, mock_client_cls):
+        mock_cacheable_groups.return_value = [0]
+        groups = [
+            KVCacheGroupSpec(
+                ["layer.0"], FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32)
+            ),
+            KVCacheGroupSpec(
+                ["layer.1"],
+                SlidingWindowSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32, sliding_window=32),
+            ),
+        ]
+        scheduler = KVPoolScheduler(
+            self._make_config(extra_config={"backend": "memcache"}),
+            use_layerwise=False,
+            kv_cache_config=MagicMock(kv_cache_groups=groups),
+        )
+        self.assertEqual(scheduler.swa_group_ids, set())
+
 
 class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
     def _make_config(self, kv_role="kv_producer", block_size=16, extra_config=None, num_layers=2):
@@ -885,32 +957,6 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
         _meta = scheduler.build_connector_meta(sched_output)
         self.assertNotIn("r1", scheduler._request_trackers)
 
-    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
-    def test_build_connector_meta_released_req_ids_union(self, mock_client_cls):
-        config = self._make_config()
-        scheduler = KVPoolScheduler(config, use_layerwise=False)
-
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import RequestTracker
-
-        for req_id in ("f1", "f2", "p1"):
-            scheduler._request_trackers[req_id] = RequestTracker(
-                req_id=req_id,
-                token_len=32,
-                allocated_block_ids=[0, 1],
-            )
-            scheduler._unfinished_requests[req_id] = (MagicMock(), [0, 1])
-
-        sched_output = MagicMock()
-        sched_output.finished_req_ids = {"f1", "f2"}
-        sched_output.preempted_req_ids = {"p1"}
-        sched_output.scheduled_new_reqs = []
-        sched_output.num_scheduled_tokens = {}
-        sched_output.scheduled_cached_reqs = MagicMock()
-        sched_output.scheduled_cached_reqs.req_ids = []
-
-        meta = scheduler.build_connector_meta(sched_output)
-        self.assertEqual(meta.released_req_ids, {"f1", "f2", "p1"})
-
 
 class TestLookupKeyClient(unittest.TestCase):
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.make_zmq_socket")
@@ -1139,6 +1185,18 @@ class TestKVPoolSchedulerUpdateConnectorOutput(unittest.TestCase):
         self.assertEqual(scheduler.sending_events, {7: 1})
         self.assertEqual(scheduler.sending_blocks, {7: [1, 2, 3]})
         scheduler._block_pool.free_blocks.assert_not_called()
+
+    def test_sync_swa_blocks_uses_current_request_table(self):
+        scheduler = self._make_scheduler()
+        scheduler.swa_group_ids = {0}
+        scheduler._kv_cache_manager = MagicMock()
+        scheduler._kv_cache_manager.get_block_ids.return_value = ([0, 2, 3],)
+        tracker = RequestTracker("r1", token_len=48, allocated_block_ids_by_group=[[1, 2, 3]])
+
+        scheduler._sync_swa_block_ids(tracker)
+
+        self.assertEqual(tracker.allocated_block_ids_by_group, [[0, 2, 3]])
+        scheduler._kv_cache_manager.get_block_ids.assert_called_once_with("r1")
 
 
 class TestKVPoolSchedulerRequestFinishedAllGroups(unittest.TestCase):

@@ -220,6 +220,7 @@ def runtime(monkeypatch):
         "ascend_envs": SimpleNamespace(VLLM_ASCEND_KIMI_K3_ATTNRES_FUSED_ENABLED=True),
         "logger": SimpleNamespace(info=lambda *args: None, warning_once=lambda *args: None),
         "load_attn_res_fused_ops": lambda: None,
+        "is_kimi_c8_config": lambda _: False,
     }
     attn_res = runpy.run_path(str(ROOT / "vllm_ascend/ops/kimi_attn_res.py"))
     for name in ("AttnResBackend", "AttnResQueryPlan", "resolve_attn_res_mode"):
@@ -283,7 +284,7 @@ def runtime(monkeypatch):
         monkeypatch.setattr(torch.ops.vllm, name, namespace[f"_{name}"], raising=False)
     monkeypatch.setattr(torch.ops._C_ascend, "attn_res_fwd", attn_res_fwd_cpu, raising=False)
     load_definitions(
-        "vllm_ascend/models/kimi_k3.py",
+        "vllm_ascend/models/kimi_k3/kimi_k3.py",
         {"AscendKimiLinearModel", "AscendKimiDecoderLayer", "AscendKimiMLP"},
         namespace,
         bases={
@@ -626,7 +627,7 @@ def test_draft_mapper_reuses_upstream_rules(owns_embed):
         "AutoWeightsLoader": lambda model: SimpleNamespace(load_weights=load_weights),
     }
     load_definitions(
-        "vllm_ascend/models/kimi_k3_dspark.py",
+        "vllm_ascend/models/kimi_k3/kimi_k3_dspark.py",
         {"AscendK3DSparkForCausalLM"},
         namespace,
         bases={"AscendK3DSparkForCausalLM": "BaseModel"},

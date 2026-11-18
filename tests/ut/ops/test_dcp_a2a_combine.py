@@ -37,6 +37,28 @@ def test_deferred_exchange_skips_combine(monkeypatch, scatter_size):
         assert result is send
 
 
+@pytest.mark.parametrize("use_sfa_fast_exchange", [False, True])
+def test_sfa_exchange_does_not_replace_flashmla_combine(monkeypatch, use_sfa_fast_exchange):
+    """Keep cann's MLA pack/combine route unless the SFA caller opts in."""
+    partial = torch.empty(2, 16, 512, dtype=torch.bfloat16)
+    lse = torch.empty(2, 16, 1)
+    merged = torch.empty(2, 8, 512, dtype=torch.bfloat16)
+    pack = Mock(return_value=torch.empty(2, 8, 2, 516, dtype=torch.bfloat16))
+    combine = Mock(return_value=merged)
+    exchange = Mock(return_value=merged)
+    monkeypatch.setattr(dcp_a2a, "can_exchange", lambda *args: True)
+    monkeypatch.setattr(dcp_a2a, "pack_dcp_output_lse", pack)
+    monkeypatch.setattr(dcp_a2a, "fused_dcp_lse_combine", combine)
+    monkeypatch.setattr(dcp_a2a, "exchange", exchange)
+    monkeypatch.setattr(dcp_a2a.dist, "all_to_all_single", Mock())
+
+    result = dcp_a2a.dcp_a2a_fused_combine(partial, lse, 2, 1, object(), use_sfa_fast_exchange=use_sfa_fast_exchange)
+
+    assert result is merged
+    assert exchange.call_count == int(use_sfa_fast_exchange)
+    assert pack.call_count == combine.call_count == int(not use_sfa_fast_exchange)
+
+
 def _tensor(shape, dtype=torch.bfloat16):
     from math import prod
 

@@ -9,7 +9,8 @@ from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
 import torch
-from test_kimi_v30_moe import load
+
+from tests.ut.ops.test_kimi_v30_moe import load
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -278,8 +279,8 @@ class TestKimiMigrationReview(unittest.TestCase):
             HardwareCapability=NS(CANN_MEGAMOE_MXFP=1),
             get_ascend_config=lambda: NS(multistream_overlap_shared_expert=False),
         )
-        load("vllm_ascend/models/kimi_k3.py", {"_get_kimi_router_stream"}, ns)
-        cls = load_class("vllm_ascend/models/kimi_k3.py", "AscendKimiMoE", {"__init__"}, ns, "Module")
+        load("vllm_ascend/models/kimi_k3/kimi_k3.py", {"_get_kimi_router_stream"}, ns)
+        cls = load_class("vllm_ascend/models/kimi_k3/kimi_k3.py", "AscendKimiMoE", {"__init__"}, ns, "Module")
         cls(config=cfg, vllm_config=NS(parallel_config=NS(enable_eplb=False)))
         sparse.assert_called_once_with(1.0, 25.0)
         ns["initialize_kimi_situ_ops"].assert_called_once_with()

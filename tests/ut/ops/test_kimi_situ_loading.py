@@ -6,7 +6,7 @@ from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
-from test_kimi_v30_moe import load
+from tests.ut.ops.test_kimi_v30_moe import load
 
 
 class TestSituLoading(unittest.TestCase):

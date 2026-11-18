@@ -80,6 +80,8 @@ def test_combine_dispatch(has_local, world, dim, rows, scatter, dtype, a5, local
         "_validate_dcp_inputs": Mock(),
         "_lse_pack_dim": lambda value: 1 if value == torch.float32 else 4,
     }
+    scope["_launch_kernel"] = lambda kernel, grid, *args, **kwargs: kernel[grid](*args, **kwargs)
+    load_function("dcp_a2a.py", "_launch_fused_dcp_lse_combine", scope)
     combine = load_function("dcp_a2a.py", "fused_dcp_lse_combine", scope)
     recv_shape = (
         (world, 1, rows, dim + scope["_lse_pack_dim"](dtype))

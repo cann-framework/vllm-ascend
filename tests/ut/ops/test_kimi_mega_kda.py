@@ -130,6 +130,7 @@ def runtime():
         "_release_default_kda_weights",
         "_released_mega_nd_params",
         "_forward_default",
+        "_forward_projections",
         "_current_mega_weight_signature",
         "_forward_mega_kda",
         "_execute_mega_kda",
@@ -155,6 +156,7 @@ def _attention(ns, *, batch=4, spec_len=8):
     layer.conv_size = 4
     layer.num_spec = spec_len - 1
     layer.tp_size = 2
+    layer.pcp_size = 1
     layer.uses_mixed_projection = False
     layer.use_mega_kda_replayssm = True
     layer._mega_operator = MagicMock()
@@ -520,7 +522,7 @@ def test_model_postload_visits_only_target_attention_and_mm_forwards(runtime):
         get_ascend_config=lambda: SimpleNamespace(enable_mega_kda_replayssm=True),
     )
     _definitions(
-        "vllm_ascend/models/kimi_k3.py",
+        "vllm_ascend/models/kimi_k3/kimi_k3.py",
         {"AscendKimiLinearForCausalLM"},
         runtime,
         methods={"process_weights_after_loading"},
@@ -532,7 +534,7 @@ def test_model_postload_visits_only_target_attention_and_mm_forwards(runtime):
     target._prepare_mega_weights.assert_called_once()
     other._prepare_mega_weights.assert_not_called()
     _definitions(
-        "vllm_ascend/models/kimi_k3.py",
+        "vllm_ascend/models/kimi_k3/kimi_k3.py",
         {"AscendKimiK3ForConditionalGeneration"},
         runtime,
         methods={"process_weights_after_loading"},

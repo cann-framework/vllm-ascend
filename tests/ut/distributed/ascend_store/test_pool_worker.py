@@ -19,7 +19,7 @@ import queue
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 
@@ -1315,7 +1315,7 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         kwargs["invalid_block_ids"].add(7)
         self.assertEqual(worker.get_block_ids_with_load_errors(), {7})
 
-    def test_wait_for_save_submits_batch_without_joining_queue(self):
+    def test_wait_for_save_submits_batch_then_drains_queue(self):
         worker = self._make_worker()
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import KVCacheStoreSendingThread
 
@@ -1337,12 +1337,18 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         with patch(f"{module}.torch.npu", create=True):
             worker.wait_for_save(meta)
         worker.kv_send_thread.add_save_batch.assert_called_once_with([req])
-        worker.kv_send_thread.request_queue.join.assert_not_called()
+        worker.kv_send_thread.request_queue.join.assert_called_once_with()
+        worker.kv_send_thread.assert_has_calls(
+            [call.add_save_batch([req]), call.request_queue.join(), call.raise_if_failed()]
+        )
         self.assertIs(worker._previous_save_batch, save_batch)
 
-    def test_wait_for_save_skip_non_save(self):
+    def test_wait_for_save_drains_queue_without_new_saves(self):
         worker = self._make_worker()
-        worker.kv_send_thread = MagicMock()
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import KVCacheStoreSendingThread
+
+        worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
+        worker.kv_send_thread.request_queue = MagicMock()
 
         req = ReqMeta(
             req_id="r1",
@@ -1355,32 +1361,23 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         meta.add_request(req)
         worker.wait_for_save(meta)
         worker.kv_send_thread.add_stored_request.assert_not_called()
-        worker.kv_send_thread.request_queue.join.assert_not_called()
+        worker.kv_send_thread.request_queue.join.assert_called_once_with()
+        worker.kv_send_thread.assert_has_calls([call.request_queue.join(), call.raise_if_failed()])
 
-    def test_handle_released_saves_noop_without_send_thread(self):
-        worker = self._make_worker()
-        worker.kv_send_thread = None
-        worker.handle_released_saves({"r1"})
-
-    def test_handle_released_saves_drains_only_released_requests(self):
-        worker = self._make_worker()
+    def test_wait_for_save_propagates_sender_failure_after_drain(self):
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import KVCacheStoreSendingThread
 
-        worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
-        released = {"r1", "r2"}
-        worker.handle_released_saves(released)
-        worker.kv_send_thread.raise_if_failed.assert_called_once_with()
-        worker.kv_send_thread.wait_for_requests_saved.assert_called_once_with(released)
-
-    def test_handle_released_saves_skips_layerwise_thread(self):
         worker = self._make_worker()
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import KVCacheStoreLayerSendingThread
+        worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
+        worker.kv_send_thread.request_queue = MagicMock()
+        worker.kv_send_thread.raise_if_failed.side_effect = RuntimeError("save failed")
+        meta = AscendConnectorMetadata(set(), set())
 
-        # A spec'd layerwise-thread mock has no wait_for_requests_saved member,
-        # so a wrong dispatch would raise AttributeError here.
-        worker.kv_send_thread = MagicMock(spec=KVCacheStoreLayerSendingThread)
-        worker.handle_released_saves({"r1"})
-        worker.kv_send_thread.raise_if_failed.assert_called_once_with()
+        with self.assertRaisesRegex(RuntimeError, "save failed"):
+            worker.wait_for_save(meta)
+
+        worker.kv_send_thread.add_save_batch.assert_not_called()
+        worker.kv_send_thread.assert_has_calls([call.request_queue.join(), call.raise_if_failed()])
 
     def test_get_finished_producer_clears_synchronous_completions(self):
         worker = self._make_worker(kv_role="kv_producer")
