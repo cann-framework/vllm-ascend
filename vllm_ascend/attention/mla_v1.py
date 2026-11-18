@@ -167,7 +167,13 @@ class AscendMLAAttention(MLAAttention):
     supports_pcp_dcp: ClassVar[bool] = True
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        if getattr(self.impl, "use_flashmla", False) and not getattr(self.impl, "is_draft_cache", False):
+        # BF16 PA_NZ retains a 128-token physical reader even when scheduler
+        # pages are larger. Only native FlashMLA advertises full reader pages.
+        if (
+            getattr(self.impl, "use_flashmla", False)
+            and not getattr(self.impl, "use_flashmla_pa_nz", False)
+            and not getattr(self.impl, "is_draft_cache", False)
+        ):
             return AscendFlashMLABackend
         return super().get_attn_backend()
 
@@ -426,8 +432,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             if state is None:
                 custom_params = getattr(vllm_config.model_config, "custom_params", {}) or {}
                 enable_metadata_stream = bool(
-                    get_ascend_config().enable_multi_streams
-                    or custom_params.get("enable_multi_streams", False)
+                    get_ascend_config().enable_multi_streams or custom_params.get("enable_multi_streams", False)
                 )
                 state = FlashMLAMetadataBuilder(
                     impl,
@@ -1215,9 +1220,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         if self.fa_quant_layer or self.enable_kv_nz:
             raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 does not support FA-quant or KV NZ caches.")
         if self.q_lora_rank is None or self.fused_qkv_a_proj is None or self.q_proj is None:
-            raise RuntimeError(
-                "VLLM_ASCEND_ENABLE_PA_NZ=1 requires q_lora_rank, fused_qkv_a_proj and q_proj."
-            )
+            raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 requires q_lora_rank, fused_qkv_a_proj and q_proj.")
         if self.q_a_layernorm is None or self.kv_a_layernorm is None:
             raise RuntimeError("VLLM_ASCEND_ENABLE_PA_NZ=1 requires Q/KV RMSNorm layers.")
         if self.q_a_layernorm.variance_epsilon != self.kv_a_layernorm.variance_epsilon:
@@ -1671,13 +1674,17 @@ class AscendMLAImpl(MLAAttentionImpl):
             self._prepare_prolog_v3_weights_after_loading()
         self._prepare_strided_kv_workspace()
 
-        if self.use_flashmla and not self.use_flashmla_pa_nz and (
-            # DSpark context-KV writes use the PROLOG_V3 writer eagerly before
-            # the captured draft decode. Allocate its dense workspace during
-            # weight loading so graph capture never sees a late allocation.
-            self.is_draft_model
-            or self.supports_prolog_v3_writer()
-            or (self._supports_flashmla_mlapo() and not self.dcp_enabled)
+        if (
+            self.use_flashmla
+            and not self.use_flashmla_pa_nz
+            and (
+                # DSpark context-KV writes use the PROLOG_V3 writer eagerly before
+                # the captured draft decode. Allocate its dense workspace during
+                # weight loading so graph capture never sees a late allocation.
+                self.is_draft_model
+                or self.supports_prolog_v3_writer()
+                or (self._supports_flashmla_mlapo() and not self.dcp_enabled)
+            )
         ):
             self._prepare_flashmla_writer_buffers()
 
@@ -3914,9 +3921,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 last_columns[:, None],
             ).squeeze(1)
             stale = flash.block_columns[None, :] >= valid_cols[:, None]
-            flash.block_table.copy_(
-                torch.where(stale, last_blocks[:, None], flash.block_table)
-            )
+            flash.block_table.copy_(torch.where(stale, last_blocks[:, None], flash.block_table))
         if flash.prolog_slots is not None:
             cache_indices = flash.prolog_slots[:num_decode_tokens].to(torch.int64)
         else:

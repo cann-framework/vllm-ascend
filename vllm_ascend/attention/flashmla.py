@@ -53,11 +53,7 @@ def _pa_nz_tile_indices(
     """
     block_ids = torch.div(slots, block_size, rounding_mode="floor")
     offsets = torch.remainder(slots, block_size)
-    return (
-        block_ids[:, None] * (tile_count * block_size)
-        + tile_offsets[None, :]
-        + offsets[:, None]
-    ).reshape(-1)
+    return (block_ids[:, None] * (tile_count * block_size) + tile_offsets[None, :] + offsets[:, None]).reshape(-1)
 
 
 def prepare_flashmla_batch_req_state(
@@ -461,10 +457,7 @@ class PaNzFlashMLAImpl:
             or kv_cache.shape[2] != 1
             or kv_cache.shape[-1] != FLASHMLA_QK_DIM
         ):
-            raise ValueError(
-                "PA_NZ FlashMLA cache must be "
-                f"[blocks, {FLASHMLA_BLOCK_SIZE}, 1, {FLASHMLA_QK_DIM}]"
-            )
+            raise ValueError(f"PA_NZ FlashMLA cache must be [blocks, {FLASHMLA_BLOCK_SIZE}, 1, {FLASHMLA_QK_DIM}]")
         if kv_cache.dtype != torch.bfloat16:
             raise ValueError("PA_NZ FlashMLA cache must be BF16")
         if not kv_cache.is_contiguous():
@@ -705,8 +698,12 @@ class FlashMLAMetadataBuilder:
             sin=torch.empty(rope_shape, dtype=self.dtype, device=self.device) if self.use_rope else None,
             layout=adapter.config.layout_kv,
             q_len=q_len,
-            prolog_slots=torch.full((tokens,), -1, dtype=torch.int64, device=self.device),
-            block_columns=torch.arange(columns, dtype=torch.int64, device=self.device),
+            prolog_slots=torch.full((tokens,), -1, dtype=torch.int64, device=self.device)
+            if adapter.config.layout_kv == "PA_NZ"
+            else None,
+            block_columns=torch.arange(columns, dtype=torch.int64, device=self.device)
+            if adapter.config.layout_kv == "PA_NZ"
+            else None,
         )
         if adapter.config.layout_kv == "PA_NZ" and self.dcp_size > 1 and causal and self.use_spec_decode:
             # Only PA_NZ needs the replicated speculative current chunk.
@@ -738,8 +735,7 @@ class FlashMLAMetadataBuilder:
                 # and 16-element tiles.  Keep every tensor at a stable address
                 # so graph replay and all MLA layers can reuse the metadata.
                 tile_offsets = (
-                    torch.arange(PA_NZ_TILE_COUNT, dtype=torch.int64, device=self.device)
-                    * FLASHMLA_BLOCK_SIZE
+                    torch.arange(PA_NZ_TILE_COUNT, dtype=torch.int64, device=self.device) * FLASHMLA_BLOCK_SIZE
                 )
                 flash.pa_nz_tile_offsets = tile_offsets
                 flash.pa_nz_current_slots = torch.zeros_like(flash.current.slots)
@@ -761,7 +757,10 @@ class FlashMLAMetadataBuilder:
         rows = num_decodes + 1 if has_prefill else max(num_decodes, min(tokens, self.max_num_reqs)) + 1
         columns = common.block_table_tensor.shape[1]
         q_len = max(1, int(getattr(common, "max_query_len", 1) or 1))
-        key = tokens, rows, columns, common.causal, q_len
+        # Native metadata derives variable query lengths from device boundaries;
+        # only PA_NZ specializes its schedule by the host query-length bound.
+        pa_nz = self.adapters[common.causal].config.layout_kv == "PA_NZ"
+        key = tokens, rows, columns, common.causal, q_len if pa_nz else 1
         # Captured buffers run their producer in the graph on every replay.
         # Other batches can fork as soon as the schedule inputs are ready.
         start_during_refresh = self.enable_async and not retain_for_graph and (has_prefill or key not in self.buffers)
@@ -844,9 +843,7 @@ class FlashMLAMetadataBuilder:
                 # Prolog must never receive -1 for graph padding or an empty
                 # request.  Do this once with the batch metadata instead of
                 # masking the same slots in every MLA layer.
-                flash.prolog_slots.copy_(
-                    torch.where(flash.token_live & (flash.slots >= 0), flash.slots, 0)
-                )
+                flash.prolog_slots.copy_(torch.where(flash.token_live & (flash.slots >= 0), flash.slots, 0))
             if flash.current is not None:
                 current = flash.current
                 page_counts = (flash.used_q + FLASHMLA_BLOCK_SIZE - 1) // FLASHMLA_BLOCK_SIZE
@@ -866,12 +863,8 @@ class FlashMLAMetadataBuilder:
                     current_valid = flash.token_live & (current.slots >= 0)
                     history_valid = flash.token_live & (flash.slots >= 0)
                     scratch_slot = (current.cache.shape[0] - 1) * FLASHMLA_BLOCK_SIZE
-                    flash.pa_nz_current_slots.copy_(
-                        torch.where(current_valid, current.slots, scratch_slot)
-                    )
-                    flash.pa_nz_history_slots.copy_(
-                        torch.where(history_valid, flash.slots, 0)
-                    )
+                    flash.pa_nz_current_slots.copy_(torch.where(current_valid, current.slots, scratch_slot))
+                    flash.pa_nz_history_slots.copy_(torch.where(history_valid, flash.slots, 0))
                     # Keep the old copy semantics: invalid source rows read
                     # the current scratch page and invalid destination rows
                     # target slot zero.  The slot decoding now happens once
@@ -902,13 +895,9 @@ class FlashMLAMetadataBuilder:
 
     def _refresh_schedule(self, flash: FlashMLADecode) -> None:
         if flash.layout == "PA_NZ":
-            schedule = flash.adapter.build_metadata(
-                flash.cache_lens, flash.cu, flash.used_q, q_len=flash.q_len
-            )
+            schedule = flash.adapter.build_metadata(flash.cache_lens, flash.cu, flash.used_q, q_len=flash.q_len)
         else:
-            schedule = flash.adapter.build_metadata(
-                flash.cache_lens, flash.cu, flash.used_q, flash.global_cache_lens
-            )
+            schedule = flash.adapter.build_metadata(flash.cache_lens, flash.cu, flash.used_q, flash.global_cache_lens)
         flash.schedule.copy_(schedule)
         if flash.current is not None:
             current = flash.current

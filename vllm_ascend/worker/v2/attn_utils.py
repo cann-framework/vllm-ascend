@@ -1019,6 +1019,8 @@ def _uses_single_raw_mla_cache(
         # preprocessing contract. Keep their allocation compatible with it.
         return False
     if kv_cache_spec.static_fp8_pa_nz:
+        if not supports_component_major_mla_pd(vllm_config):
+            return False
         validate_pa_nz_page_stride(kv_cache_spec.block_size, kv_cache_spec.page_size_bytes)
         return True
     if getattr(impl, "flash_mla_layout", None) == "pa_nz":
@@ -1872,9 +1874,9 @@ def _reshape_kv_cache_v2(
                     # stride must remain the unpadded slot size.
                     dense_page_bytes = slot_bytes * kernel_blocks_per_manager
                     page_size_padded = getattr(kv_cache_spec, "page_size_padded", None)
-                    if (
-                        kv_cache_spec.page_size_bytes != dense_page_bytes
-                        or page_size_padded not in (None, dense_page_bytes)
+                    if kv_cache_spec.page_size_bytes != dense_page_bytes or page_size_padded not in (
+                        None,
+                        dense_page_bytes,
                     ):
                         raise ValueError(
                             "PA_NZ requires dense scheduler pages: "

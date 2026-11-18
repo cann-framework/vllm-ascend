@@ -413,8 +413,9 @@ class SFAPDRD2HScheduler:
                 kv_tokens,
                 dense,
             )
+
         # Notify P via the metaserver rendezvous that D is ready to pull this
-        # request. D does NOT send its block ids to P �?D keeps them (passed to
+        # request. D does NOT send its block ids to P — D keeps them (passed to
         # the D worker via connector_meta) and looks
         # them up by req_id when P's READ_READY arrives. Only contact info +
         # the do_remote_decode "go" flag go to P. (Sending block ids to P was a
