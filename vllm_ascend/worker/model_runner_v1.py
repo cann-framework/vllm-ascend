@@ -120,7 +120,7 @@ from vllm.v1.worker.utils import (
 )
 
 # yapf: enable
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_config import get_ascend_config, is_kimi_c8_config
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
     fill_mxfp_v_scale_cache,
@@ -152,7 +152,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
-from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec, is_sliding_window_gqa_spec
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h import get_prebound_copy_sfa_slots
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
@@ -232,6 +232,7 @@ from vllm_ascend.worker.dcp_utils import (
     DCPDummyRunMetadata,
     DCPManager,
 )
+from vllm_ascend.worker.block_table import max_num_blocks_per_req_for_group
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataExecutor,
     DeviceMetadataTask,
@@ -5948,6 +5949,51 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     if (
                         raw_kv_is_combined
+                        and is_sliding_window_gqa_spec(current_kv_cache_spec)
+                        and getattr(current_kv_cache_spec, "page_size_padded", None) is not None
+                        and len(kv_cache_shape) == 5
+                        and kv_cache_shape[0] == 2
+                    ):
+                        # Window-GQA pages are padded to the common C8/MLA
+                        # physical stride.  A contiguous trim would drop one
+                        # padding region only at the front and make every
+                        # subsequent block read the wrong page. Keep the
+                        # logical [K/V, kernel_block, token, head, dim]
+                        # shape, but advance its block axis by one complete
+                        # physical page (the same view used by V2).
+                        dtype_size = get_dtype_size(current_kv_cache_spec.dtype)
+                        page_stride_bytes = current_kv_cache_spec.page_size_bytes
+                        if page_stride_bytes % (block_size_chunk * dtype_size):
+                            raise ValueError(
+                                "Padded Window-GQA page must split into "
+                                "dtype-aligned kernel blocks."
+                            )
+                        raw_typed = raw_k_tensor.view(current_kv_cache_spec.dtype)
+                        if raw_typed.numel() < num_blocks * page_stride_bytes // dtype_size:
+                            raise ValueError(
+                                "Padded Window-GQA cache backing is smaller "
+                                "than its physical pages."
+                            )
+                        hidden_size = math.prod(kv_cache_shape[2:])
+                        kernel_stride = page_stride_bytes // (block_size_chunk * dtype_size)
+                        dense_strides = [
+                            math.prod(kv_cache_shape[dim + 1 :])
+                            for dim in range(len(kv_cache_shape))
+                        ]
+                        kv_cache = torch.as_strided(
+                            raw_typed,
+                            size=kv_cache_shape,
+                            stride=(
+                                hidden_size,
+                                kernel_stride,
+                                *dense_strides[2:],
+                            ),
+                            storage_offset=raw_typed.storage_offset(),
+                        )
+                        kv_caches[layer_name] = (kv_cache[0], kv_cache[1])
+                        continue
+                    if (
+                        raw_kv_is_combined
                         and len(kv_cache_shape) == 5
                         and kv_cache_shape[0] == 2
                     ):
@@ -6205,9 +6251,11 @@ class NPUModelRunner(GPUModelRunner):
         max_num_blocks = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         for kv_cache_group in non_encoder_groups:
-            max_num_blocks_per_req = kv_cache_group.kv_cache_spec.max_num_blocks_per_req(
+            max_num_blocks_per_req = max_num_blocks_per_req_for_group(
+                kv_cache_group.kv_cache_spec,
                 self.vllm_config,
                 max_model_len,
+                kv_cache_group,
             )
             max_num_blocks.append(max_num_blocks_per_req)
 
@@ -6573,6 +6621,32 @@ class NPUModelRunner(GPUModelRunner):
                 if spec := mamba_module.get_kv_cache_spec(self.vllm_config):
                     kv_cache_spec[layer_name] = spec
                     mamba_page_size_padded = spec.page_size_bytes
+            # Kimi C8 uses a 1664-token static MLA page.  Window-GQA keeps its
+            # native kernel block size, but must use the same physical stride
+            # when it shares the hybrid page pool with MLA/Mamba.
+            if is_kimi_c8_config(self.vllm_config):
+                c8_pages = [
+                    spec.page_size_bytes
+                    for spec in kv_cache_spec.values()
+                    if isinstance(spec, AscendMLAAttentionSpec)
+                    and getattr(spec, "static_fp8_pa_nz", False)
+                ]
+                if c8_pages:
+                    # The physical page must cover every attention payload,
+                    # including ordinary Window-GQA draft layers. Their
+                    # logical/kernel block size stays native; only the page
+                    # stride is shared with C8 MLA and Mamba.
+                    attention_pages = [
+                        spec.page_size_bytes
+                        for spec in kv_cache_spec.values()
+                        if is_sliding_window_gqa_spec(spec)
+                    ]
+                    common_page = max(
+                        [*c8_pages, *attention_pages, mamba_page_size_padded]
+                    )
+                    for layer_name, spec in list(kv_cache_spec.items()):
+                        if is_sliding_window_gqa_spec(spec) and spec.page_size_bytes < common_page:
+                            kv_cache_spec[layer_name] = replace(spec, page_size_padded=common_page)
             # align attn_page_size to mamba_page_size_padded
             for layer_name in attn_layer_names:
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import replace
 from typing import Any
 
 import torch
-from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
@@ -17,7 +18,91 @@ from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.utils import enable_pcp
 from vllm_ascend.ops.triton.spec_decode.utils import copy_and_expand_dflash_and_dspark_inputs_kernel
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer, _compute_num_programs
-from vllm_ascend.spec_decode.utils import DynamicSpecScheduler
+from vllm_ascend.spec_decode.utils import DynamicSpecScheduler, SlidingWindowAdapter
+
+
+# The RedHat Window-GQA checkpoint was trained with an eight-row anchor
+# block.  Kimi-K3's verification ABI exposes seven draft tokens, so the extra
+# row is an implementation detail of the draft forward only.
+_REDHAT_WINDOW_GQA_NATIVE_WIDTH = 8
+_REDHAT_WINDOW_GQA_VERIFY_WIDTH = 7
+
+
+def _draft_config_value(config: Any, name: str, default: Any = None) -> Any:
+    """Read a draft setting from its top-level or nested decoder config."""
+    nested = getattr(config, "transformer_layer_config", None)
+    if isinstance(nested, dict):
+        if name in nested:
+            return nested[name]
+    else:
+        value = getattr(nested, name, None) if nested is not None else None
+        if value is not None:
+            return value
+    value = getattr(config, name, None)
+    return default if value is None else value
+
+
+def _mapping_value(value: Any, name: str, default: Any = None) -> Any:
+    """Read a field from dict-like or attribute-style HF config objects."""
+    if isinstance(value, dict):
+        return value.get(name, default)
+    if value is None:
+        return default
+    return getattr(value, name, default)
+
+
+def _get_native_window_gqa_width(config: Any, verify_width: int) -> int | None:
+    """Return the native proposal width of the RedHat Window-GQA checkpoint."""
+    block_size = _draft_config_value(config, "block_size")
+    has_target_layers = bool(
+        getattr(config, "aux_hidden_state_layer_ids", None)
+        or getattr(config, "eagle_aux_hidden_state_layer_ids", None)
+        or getattr(config, "target_layer_ids", None)
+        or _mapping_value(_draft_config_value(config, "dflash_config"), "target_layer_ids")
+    )
+    is_qwen3_dspark = (
+        _draft_config_value(config, "model_type") == "qwen3"
+        or "Qwen3DSparkModel" in (getattr(config, "architectures", None) or ())
+        or "DSparkDraftModel" in (getattr(config, "architectures", None) or ())
+    )
+    if (
+        is_qwen3_dspark
+        and bool(_draft_config_value(config, "use_sliding_window", False))
+        and bool(_draft_config_value(config, "sample_from_anchor", False))
+        and has_target_layers
+        and isinstance(block_size, int)
+        and block_size == _REDHAT_WINDOW_GQA_NATIVE_WIDTH
+        and verify_width == _REDHAT_WINDOW_GQA_VERIFY_WIDTH
+    ):
+        return block_size
+    return None
+
+
+def _is_window_gqa_draft(config: Any) -> bool:
+    """Identify an ordinary GQA DSpark draft with a fixed sliding window."""
+    architectures = getattr(config, "architectures", None) or ()
+    is_dspark = (
+        _draft_config_value(config, "model_type") in ("qwen3", "speculators")
+        and any(arch in ("Qwen3DSparkModel", "DSparkDraftModel") for arch in architectures)
+    )
+    return (
+        is_dspark
+        and bool(_draft_config_value(config, "use_sliding_window", False))
+        and _draft_config_value(config, "sliding_window", None) is not None
+        and not bool(_draft_config_value(config, "use_mla", False))
+    )
+
+
+def _clear_draft_dcp_metadata(common_attn_metadata: Any) -> None:
+    """Remove target MLA DCP fields before building Window-GQA metadata."""
+    for name in (
+        "context_parallel_metadata",
+        "dcp_local_seq_lens",
+        "dcp_local_seq_lens_cpu",
+        "dcp_local_seq_lens_cpu_upper_bound",
+    ):
+        if hasattr(common_attn_metadata, name):
+            setattr(common_attn_metadata, name, None)
 
 
 class AscendDSparkProposer(AscendDflashProposer):
@@ -37,12 +122,26 @@ class AscendDSparkProposer(AscendDflashProposer):
         super().__init__(vllm_config, device, runner=runner)
         assert vllm_config.speculative_config is not None
         self.sample_from_anchor = getattr(self.draft_model_config.hf_config, "sample_from_anchor", True)
+        self._native_num_speculative_tokens = _get_native_window_gqa_width(
+            self.draft_model_config.hf_config,
+            self.num_speculative_tokens,
+        )
+        # The target Kimi worker may use MLA+DCP while this draft owns an
+        # ordinary SlidingWindowSpec.  Keep the target topology intact and
+        # run only the draft on a replicated DCP=1 view.
+        self._window_gqa_dcp_fallback = _is_window_gqa_draft(self.draft_model_config.hf_config)
+        self._draft_forward_vllm_config: VllmConfig | None = None
+        if self._window_gqa_dcp_fallback:
+            self.dcp_size = 1
+            self.dcp_rank = 0
         if self.sample_from_anchor:
-            self.num_query_per_req = self.num_speculative_tokens
+            draft_width = self._native_num_speculative_tokens or self.num_speculative_tokens
+            self.num_query_per_req = draft_width
         else:
-            self.num_query_per_req = 1 + self.num_speculative_tokens
+            draft_width = self._native_num_speculative_tokens or self.num_speculative_tokens
+            self.num_query_per_req = 1 + draft_width
 
-        blk = 1 + self.num_speculative_tokens
+        blk = 1 + draft_width
         self._dspark_draft_buffer = torch.zeros((self.max_batch_size, blk), dtype=torch.int64, device=device)
         self._dspark_seed_buffer = torch.zeros(self.max_batch_size, dtype=torch.int64, device=device)
         # Replace the target-sized DFlash buffers with the draft model's hidden
@@ -69,10 +168,17 @@ class AscendDSparkProposer(AscendDflashProposer):
                 num_speculative_tokens=self.num_speculative_tokens,
                 device=device,
             )
+        # RedHat's native graph is fixed at eight query rows. Dynamic K would
+        # change both the graph shape and the confidence-head ABI, so keep the
+        # public seven-token Verify width on this checkpoint path.
+        if self._native_num_speculative_tokens is not None:
+            self.dynamic_spec = None
         # DSpark runs eager only (Ascend cudagraph unsupported on this path).
         self.use_cuda_graph = False
         # Max query tokens depend on whether sampling from anchor or not.
         self.max_query_tokens = self.max_batch_size * self.num_query_per_req
+        self.max_positions = self.max_num_tokens + self.max_query_tokens
+        self.arange_dflash = torch.arange(self.max_positions + 1, device=device, dtype=torch.int32)
         # Position ids for the draft query block [max_query_tokens].
         # Overrides dflash:49; v2 uses input_buffers.positions.
         self.positions = torch.zeros(
@@ -89,6 +195,36 @@ class AscendDSparkProposer(AscendDflashProposer):
             device=device,
         )
 
+        # The native checkpoint has one more query row than the Verify ABI.
+        # Grow only DSpark-owned metadata buffers; target scheduling remains
+        # expressed in the configured verification width.
+        if self._native_num_speculative_tokens is not None:
+            max_num_reqs = getattr(self.runner, "max_num_reqs", self.max_batch_size)
+            max_query_slots = self.max_num_tokens + (draft_width - 1) * max_num_reqs
+            self.slot_mapping_group = [
+                torch.zeros(max_query_slots, dtype=torch.int32, device=device)
+                for _ in range(draft_width)
+            ]
+            runner_max_num_tokens = getattr(self.runner, "max_num_tokens", self.max_num_tokens)
+            metadata_len = runner_max_num_tokens + 2 * max_num_reqs
+            self.seq_lens_group = [
+                torch.zeros(metadata_len, dtype=torch.int32, device=device)
+                for _ in range(draft_width)
+            ]
+            self.query_start_loc_group = [
+                torch.zeros(metadata_len, dtype=torch.int32, device=device)
+                for _ in range(draft_width)
+            ]
+            required_indices = self.max_batch_size * draft_width
+            if self.token_indices_to_sample.numel() < required_indices:
+                self.token_indices_to_sample = torch.zeros(required_indices, dtype=torch.int32, device=device)
+            if hasattr(self, "_dspark_confidence_logits_buffer"):
+                confidence = self._dspark_confidence_logits_buffer
+                self._dspark_confidence_logits_buffer = confidence.new_empty(
+                    max_num_reqs,
+                    draft_width,
+                )
+
         # The v1 runner owns block tables and slot mappings. Keep per-group
         # references here because K3 draft layers can span multiple cache
         # groups with different logical block sizes.
@@ -104,6 +240,44 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._per_group_query_slot_mapping_buffers: dict[int, torch.Tensor] = {}
         self._per_group_context_slot_mapping_buffers: dict[int, torch.Tensor] = {}
         self._context_slot_mapping_buffers: list[torch.Tensor | None] | None = None
+
+    def _create_draft_vllm_config(self) -> VllmConfig:
+        draft_vllm_config = super()._create_draft_vllm_config()
+        if not getattr(self, "_window_gqa_dcp_fallback", False):
+            return draft_vllm_config
+        parallel_config = replace(
+            draft_vllm_config.parallel_config,
+            decode_context_parallel_size=1,
+            dcp_kv_cache_interleave_size=1,
+            cp_kv_cache_interleave_size=1,
+        )
+        return replace(draft_vllm_config, parallel_config=parallel_config)
+
+    def _get_draft_forward_vllm_config(self) -> VllmConfig:
+        if not self._window_gqa_dcp_fallback:
+            return self.vllm_config
+        if self._draft_forward_vllm_config is None:
+            self._draft_forward_vllm_config = self._create_draft_vllm_config()
+        return self._draft_forward_vllm_config
+
+    def _propose(self, num_speculative_tokens: int, *args, **kwargs) -> torch.Tensor:
+        """Run RedHat's fixed native width and expose the Verify width."""
+        native_width = self._native_num_speculative_tokens
+        if native_width is None or num_speculative_tokens == 0:
+            return super()._propose(num_speculative_tokens, *args, **kwargs)
+        if num_speculative_tokens > native_width - 1:
+            raise ValueError(
+                "Window-GQA DSpark supports at most native_width - 1 draft "
+                f"tokens ({native_width - 1}), got {num_speculative_tokens}."
+            )
+        verify_width = num_speculative_tokens
+        try:
+            draft_token_ids = super()._propose(native_width, *args, **kwargs)
+            if self._last_draft_probs is not None:
+                self._last_draft_probs = self._last_draft_probs[:, :verify_width].contiguous()
+            return draft_token_ids[:, :verify_width]
+        finally:
+            self.num_speculative_tokens = verify_width
 
     def _compute_confidence(
         self,
@@ -166,11 +340,13 @@ class AscendDSparkProposer(AscendDflashProposer):
                         layer_kv_cache_spec,
                         kv_cache_gid,
                     )
-                    attn_group.create_metadata_builders(
-                        self.vllm_config,
-                        self.device,
-                        kernel_block_size=kernel_block_size,
-                    )
+                    builder_config = self._get_draft_forward_vllm_config()
+                    with set_current_vllm_config(builder_config):
+                        attn_group.create_metadata_builders(
+                            builder_config,
+                            self.device,
+                            kernel_block_size=kernel_block_size,
+                        )
                     self._per_group_kernel_block_sizes[kv_cache_gid] = kernel_block_size
                     attention_groups[key] = attn_group
                 else:
@@ -214,6 +390,48 @@ class AscendDSparkProposer(AscendDflashProposer):
             for attn_group in self.draft_attn_groups
         }
 
+    def load_model(self, model: torch.nn.Module) -> None:
+        """Use the checkpoint's native Window-GQA history when no override exists."""
+        # ``AscendSpecDecodeBaseProposer.load_model`` calls the draft
+        # ``post_process`` hook with ``self.vllm_config``.  A Window-GQA draft
+        # must see the local DCP=1 topology during that hook as well; otherwise
+        # its cache layout is initialized with the target MLA DCP settings.
+        target_vllm_config = self.vllm_config
+        if self._window_gqa_dcp_fallback:
+            self.vllm_config = self._get_draft_forward_vllm_config()
+        try:
+            super().load_model(model)
+        finally:
+            self.vllm_config = target_vllm_config
+        config = self.draft_model_config.hf_config
+        if self._native_num_speculative_tokens is None or self.draft_window_size is not None or not (
+            (
+                _draft_config_value(config, "model_type") == "qwen3"
+                or "Qwen3DSparkModel" in (getattr(config, "architectures", None) or ())
+            )
+            and bool(_draft_config_value(config, "use_sliding_window", False))
+            and _draft_config_value(config, "sliding_window", None) is not None
+        ):
+            return
+        # set_inputs_first_pass extends seq_lens by the native query block.
+        # Keep the trained history plus all native rows in the table; the
+        # adapter then presents the anchor-aligned recent window to FIA.
+        history_window = int(_draft_config_value(config, "sliding_window"))
+        cache_window = history_window + self._native_num_speculative_tokens
+        self.draft_window_size = cache_window
+        self.sliding_window = SlidingWindowAdapter(
+            cache_window,
+            self.kernel_block_size,
+            self.runner.max_num_reqs,
+            future_offset=0,
+            device=self.device,
+        )
+
+    def build_draft_attn_metadata(self, common_attn_metadata, num_input_tokens, num_actual_tokens):
+        if self._window_gqa_dcp_fallback:
+            _clear_draft_dcp_metadata(common_attn_metadata)
+        return super().build_draft_attn_metadata(common_attn_metadata, num_input_tokens, num_actual_tokens)
+
     def set_per_group_attn_metadata(
         self,
         gid: int,
@@ -237,6 +455,11 @@ class AscendDSparkProposer(AscendDflashProposer):
         num_prefill_reqs=0,
         num_decode_reqs=0,
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata, tuple[Any, Any] | None]:
+        if self._window_gqa_dcp_fallback:
+            # The target metadata may still carry MLA DCP fields.  The draft
+            # cache is replicated, so ordinary GQA builders must see the
+            # unsharded request view.
+            _clear_draft_dcp_metadata(cad)
         # The initial input token of markovHead is the next token
         n = next_token_ids.shape[0]
         self._dspark_seed_buffer[:n].copy_(next_token_ids)
@@ -340,7 +563,14 @@ class AscendDSparkProposer(AscendDflashProposer):
         cad.max_seq_len = cad.max_seq_len + self.num_query_per_req
         cad.slot_mapping = self._per_group_query_slot_mapping_buffers[primary_gid][:num_query_total]
         cad.positions = self.positions  # this would be sliced in attention backend
-        if hasattr(self.model, "get_draft_attn_causal"):
+        if self._window_gqa_dcp_fallback:
+            # Some Qwen3 DSpark model classes expose the MLA-oriented
+            # ``get_draft_attn_causal`` hook and return False for their
+            # original non-causal path.  Window-GQA FIA still selects
+            # sparse_mode=4, which requires an explicit causal mask on CANN.
+            dflash_config = _draft_config_value(self.draft_model_config.hf_config, "dflash_config")
+            cad.causal = bool(_mapping_value(dflash_config, "causal", True))
+        elif hasattr(self.model, "get_draft_attn_causal"):
             # Currently, attention causality across draft layers are uniform.
             cad.causal = self.model.get_draft_attn_causal()[0]
         else:
@@ -394,7 +624,7 @@ class AscendDSparkProposer(AscendDflashProposer):
 
         with set_ascend_forward_context(
             None,
-            self.vllm_config,
+            self._get_draft_forward_vllm_config(),
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_actual_tokens=num_input_tokens,
@@ -418,12 +648,25 @@ class AscendDSparkProposer(AscendDflashProposer):
 
             else:
                 self._dflash_num_context = num_input_tokens
-                self._runnable(
-                    num_input_tokens=num_input_tokens,
-                    batch_size=num_reqs,
-                    token_indices_to_sample=self.token_indices_to_sample[: num_reqs * self.num_speculative_tokens],
-                    target_positions=self._get_positions(num_input_tokens),
-                    inputs_embeds=None,
-                    multi_steps_attn_metadata=[],
-                    num_tokens=num_input_tokens,
-                )
+                # The native RedHat graph always executes all eight rows.
+                # Keep profiling/DP dummy runs consistent with the real
+                # proposal path even though verification exposes seven rows.
+                public_width = self.num_speculative_tokens
+                native_width = self._native_num_speculative_tokens
+                if native_width is not None:
+                    self.num_speculative_tokens = native_width
+                try:
+                    self._runnable(
+                        num_input_tokens=num_input_tokens,
+                        batch_size=num_reqs,
+                        token_indices_to_sample=self.token_indices_to_sample[
+                            : num_reqs * self.num_speculative_tokens
+                        ],
+                        target_positions=self._get_positions(num_input_tokens),
+                        inputs_embeds=None,
+                        multi_steps_attn_metadata=[],
+                        num_tokens=num_input_tokens,
+                    )
+                finally:
+                    if native_width is not None:
+                        self.num_speculative_tokens = public_width

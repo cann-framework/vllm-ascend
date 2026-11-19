@@ -175,9 +175,9 @@ def verify_and_update_config(cls, vllm_config) -> None:
         # Kimi C8 stores one 576-byte E4M3 latent per token (512 nope + 64
         # rope); the static per-layer scale is outside the page.  Keep the
         # scheduler block at 1664 (C8+DCP8 contract) and shrink the shared
-        # mamba page to the C8 payload instead of the bf16 geometry.  Draft
-        # stays bf16 at 1,916,928 and is handled as its own per-layer page by
-        # the mixed-page worker grouping.
+        # mamba page to the C8 payload instead of the bf16 geometry.  A
+        # Window-GQA draft keeps its BF16 kernel layout but receives the same
+        # physical page stride during KV-spec construction.
         if cache_config.block_size != 1664:
             raise ValueError(f"Kimi C8 packed page requires block_size=1664, got {cache_config.block_size}")
         kernel_block_size = 128
