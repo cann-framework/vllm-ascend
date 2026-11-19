@@ -222,6 +222,7 @@ class AscendMLAPrefillMetadata:
     cos: torch.Tensor = None
     actual_seq_lengths_q: list[int] | None = None
     pcp_local_num_input_tokens: int | None = None
+    c8_physical_tables: dict[tuple, torch.Tensor] = field(default_factory=dict)
 
 
 @dataclass
@@ -802,17 +803,15 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         self.chunk_seq_lens = (chunk_ends - chunk_starts).clamp(min=0)
         self.cu_seq_lens_cpu = torch.zeros(self.num_chunks, self.num_prefills + 1, dtype=torch.int32, pin_memory=True)
         torch.cumsum(self.chunk_seq_lens, dim=1, out=self.cu_seq_lens_cpu[:, 1:], dtype=torch.int32)
-        chunk_actual_seq_lengths_kv_list = [
-            torch.cumsum(self.chunk_seq_lens[i], dim=0).tolist() for i in range(self.num_chunks)
-        ]
+        chunk_actual_seq_lengths_kv_list = self.cu_seq_lens_cpu[:, 1:].tolist()
         return ChunkedContextMetadata(
-            cu_seq_lens=self.cu_seq_lens_cpu.pin_memory().to(self.device, non_blocking=True),
+            cu_seq_lens=self.cu_seq_lens_cpu.to(self.device, non_blocking=True),
             starts=chunk_starts.pin_memory().to(self.device, non_blocking=True),
             starts_cpu=chunk_starts,
-            seq_tot=self.chunk_seq_lens.sum(dim=1).tolist(),
+            seq_tot=[lengths[-1] for lengths in chunk_actual_seq_lengths_kv_list],
             max_seq_lens=self.chunk_seq_lens.max(dim=1).values.tolist(),
             chunk_seq_lens=self.chunk_seq_lens,
-            chunk_seq_lens_npu=self.chunk_seq_lens.npu(),
+            chunk_seq_lens_npu=self.chunk_seq_lens.pin_memory().to(self.device, non_blocking=True),
             workspace=self.chunked_prefill_workspace,
             chunk_actual_seq_lengths_kv_list=chunk_actual_seq_lengths_kv_list,
         )
@@ -2049,6 +2048,15 @@ class AscendMLAImpl(MLAAttentionImpl):
         if iters == 0:
             return prefix_output, prefix_lse
 
+        if is_c8:
+            # The runner shares prefill metadata across layers in this attention group.
+            key = (context_table, self.kimi_c8_manager_block_size, self.kimi_c8_page_stride_bytes)
+            physical_table = prefill_metadata.c8_physical_tables.get(key)
+            if physical_table is None:
+                physical_table = self._kimi_c8_physical_table(context_table)
+                prefill_metadata.c8_physical_tables[key] = physical_table
+            context_table = physical_table
+
         num_tokens = q_nope.size(0)
         D = self.v_head_dim
         H = self.num_heads
@@ -2089,7 +2097,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 )
                 history = read_static_fp8_cache(
                     cache_kv_c,
-                    self._kimi_c8_physical_table(context_table),
+                    context_table,
                     c8_chunk_lengths,
                     self.fak_descale_float,
                     starts=c8_chunk_starts,
