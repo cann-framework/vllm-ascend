@@ -701,16 +701,18 @@ class AscendConfig:
         dcp = getattr(parallel, "decode_context_parallel_size", 1)
         if dcp not in (1, 8):
             raise ValueError("mla_cache_mode=C8 currently supports decode_context_parallel_size=1 or 8")
-        if dcp == 8 and getattr(parallel, "cp_kv_cache_interleave_size", None) != 1664:
-            raise ValueError("mla_cache_mode=C8 with DCP8 requires cp_kv_cache_interleave_size=1664")
+        manager_block_size = getattr(getattr(vllm_config, "cache_config", None), "block_size", None)
+        if dcp == 8 and getattr(parallel, "cp_kv_cache_interleave_size", None) != manager_block_size:
+            raise ValueError(
+                "mla_cache_mode=C8 with DCP8 requires cp_kv_cache_interleave_size "
+                f"to equal block_size ({manager_block_size})"
+            )
         kv_transfer = getattr(vllm_config, "kv_transfer_config", None)
         if kv_transfer is not None:
             if getattr(kv_transfer, "is_kv_producer", False) and dcp != 1:
                 raise ValueError("mla_cache_mode=C8 KV producer requires decode_context_parallel_size=1")
             if kv_transfer.kv_connector not in ("MooncakeConnectorV2", "MooncakePullConnector"):
                 raise ValueError("mla_cache_mode=C8 P/D requires MooncakeConnectorV2 or MooncakePullConnector")
-            if dcp == 8 and getattr(vllm_config.cache_config, "block_size", None) != 1664:
-                raise ValueError("mla_cache_mode=C8 P/D with DCP8 requires block_size=1664")
 
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):

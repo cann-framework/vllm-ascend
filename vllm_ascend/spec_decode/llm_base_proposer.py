@@ -1899,7 +1899,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # The split indexer cache may be the first draft group, but its
             # storage layout is not the main attention cache layout.
             assert len(self.draft_attn_groups) > 0
-            block_size = self._get_primary_draft_attn_group().kv_cache_spec.block_size
+            # ``KVCacheSpec.block_size`` is the manager page width.  Ascend
+            # may split that page into several kernel blocks (for example,
+            # 1664 -> 13 x 128 for Window-GQA).  ``compute_new_slot_mapping`` indexes the
+            # expanded kernel-granularity block table, so it must use the
+            # selected kernel width here as well.
+            block_size = self.kernel_block_size
 
             new_slot_mapping = compute_new_slot_mapping(
                 cad=cad,

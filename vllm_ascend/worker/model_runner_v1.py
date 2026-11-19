@@ -6460,6 +6460,20 @@ class NPUModelRunner(GPUModelRunner):
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     if self._is_c8_mxfp_kv_cache(spec):
                         spec = mxfp_cache_spec(spec)
+                    manager_block_size = getattr(self.cache_config, "block_size", None)
+                    if (
+                        is_kimi_c8_config(self.vllm_config)
+                        and is_sliding_window_gqa_spec(spec)
+                        and (
+                            layer_name.startswith("model.layers.")
+                            or getattr(attn_module.impl, "is_draft_cache", False)
+                            or getattr(attn_module.impl, "is_draft_model", False)
+                        )
+                        and isinstance(manager_block_size, int)
+                        and manager_block_size > 0
+                        and spec.block_size != manager_block_size
+                    ):
+                        spec = replace(spec, block_size=manager_block_size, page_size_padded=None)
                     kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)
             elif isinstance(attn_module, MLAAttention):
@@ -6609,6 +6623,20 @@ class NPUModelRunner(GPUModelRunner):
                     attn_layer_names.add(layer_name)
 
             elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                manager_block_size = getattr(self.cache_config, "block_size", None)
+                if (
+                    is_kimi_c8_config(self.vllm_config)
+                    and is_sliding_window_gqa_spec(spec)
+                    and (
+                        layer_name.startswith("model.layers.")
+                        or getattr(attn_module.impl, "is_draft_cache", False)
+                        or getattr(attn_module.impl, "is_draft_model", False)
+                    )
+                    and isinstance(manager_block_size, int)
+                    and manager_block_size > 0
+                    and spec.block_size != manager_block_size
+                ):
+                    spec = replace(spec, block_size=manager_block_size, page_size_padded=None)
                 kv_cache_spec[layer_name] = spec
                 if isinstance(spec, AttentionSpec) and getattr(
                     attn_module, "align_kv_cache_with_mamba", True
@@ -6621,9 +6649,9 @@ class NPUModelRunner(GPUModelRunner):
                 if spec := mamba_module.get_kv_cache_spec(self.vllm_config):
                     kv_cache_spec[layer_name] = spec
                     mamba_page_size_padded = spec.page_size_bytes
-            # Kimi C8 uses a 1664-token static MLA page.  Window-GQA keeps its
-            # native kernel block size, but must use the same physical stride
-            # when it shares the hybrid page pool with MLA/Mamba.
+            # Kimi C8 uses the configured static MLA manager page. Window-GQA
+            # uses the same manager block and is split into backend-selected
+            # kernel blocks by ``prepare_kernel_block_sizes``.
             if is_kimi_c8_config(self.vllm_config):
                 c8_pages = [
                     spec.page_size_bytes
@@ -6633,9 +6661,7 @@ class NPUModelRunner(GPUModelRunner):
                 ]
                 if c8_pages:
                     # The physical page must cover every attention payload,
-                    # including ordinary Window-GQA draft layers. Their
-                    # logical/kernel block size stays native; only the page
-                    # stride is shared with C8 MLA and Mamba.
+                    # including ordinary Window-GQA draft layers.
                     attention_pages = [
                         spec.page_size_bytes
                         for spec in kv_cache_spec.values()
