@@ -2,18 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vllm-ascend project
 
 from contextlib import AbstractContextManager
+from copy import copy
 from dataclasses import replace
 from typing import Any, cast
 
 import torch
 import torch.distributed as dist
-from vllm.config import get_layers_from_vllm_config
+from vllm.config import get_layers_from_vllm_config, set_current_vllm_config
 from vllm.distributed import get_dp_group
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as upstream
+from vllm.v1.worker.gpu.attn_utils import get_attn_cg_support as _get_attn_cg_support
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp as _dispatch_cg_and_sync_dp
+from vllm.v1.worker.ubatch_utils import get_num_ubatches
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
@@ -260,6 +263,42 @@ def initialize_kv_cache(
             self.device,
             draft_layer_names=draft_attn_layer_names,
         )
+    # init_attn_backend selects each group's builder class from the *current*
+    # config, which here is the worker-wide target config (DCP > 1). A
+    # replicated Window-GQA DSpark draft never consumes DCP execution: its
+    # block tables are built with cp_size=1 below and its speculator keeps a
+    # local DCP=1 attention config. Building DCP metadata builders for those
+    # layers makes graph capture run the DCP-only decode path (including the
+    # DCP CPU seq-lens partition over device tensors) against a topology the
+    # draft never uses. Rebuild exactly those groups' builders under the
+    # draft's local DCP=1 topology, mirroring the speculator's set_attn.
+    replicated_draft_layer_names = frozenset(
+        layer_name
+        for group in kv_cache_config.kv_cache_groups
+        if is_sliding_window_gqa_draft_group(group)
+        for layer_name in group.layer_names
+    )
+    if replicated_draft_layer_names:
+        draft_local_config = copy(self.vllm_config)
+        draft_local_config.parallel_config = replace(
+            self.parallel_config,
+            decode_context_parallel_size=1,
+            dcp_kv_cache_interleave_size=1,
+            cp_kv_cache_interleave_size=1,
+        )
+        num_metadata_builders = get_num_ubatches(self.parallel_config)
+        for groups in self.attn_groups:
+            for group in groups:
+                if not any(name in replicated_draft_layer_names for name in group.layer_names):
+                    continue
+                with set_current_vllm_config(draft_local_config):
+                    group.create_metadata_builders(
+                        vllm_config=draft_local_config,
+                        device=self.device,
+                        kernel_block_size=self.kernel_block_sizes[group.kv_cache_group_id],
+                        num_metadata_builders=num_metadata_builders,
+                    )
+        attn_cg_support = _get_attn_cg_support(self.attn_groups, self.vllm_config)
     additional_attn_cg_support = self.model_state.get_additional_cg_support()
     attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
     # The speculator clears the flag at load time when the checkpoint has
@@ -347,13 +386,8 @@ def initialize_kv_cache(
     # A replicated Window-GQA DSpark draft runs with a local DCP size of one
     # (cp_size=1 block tables above), so the worker-wide CP interleave and
     # DCP LSE assertions must not apply to its layers. Every other
-    # configuration keeps the exact upstream check.
-    replicated_draft_layer_names = frozenset(
-        layer_name
-        for group in kv_cache_config.kv_cache_groups
-        if is_sliding_window_gqa_draft_group(group)
-        for layer_name in group.layer_names
-    )
+    # configuration keeps the exact upstream check. The layer set was already
+    # collected while rebuilding its metadata builders above.
     if replicated_draft_layer_names:
         _check_attention_cp_compatibility(
             self.vllm_config, target_attn_layer_names, replicated_draft_layer_names
