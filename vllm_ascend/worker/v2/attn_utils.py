@@ -84,6 +84,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSlidingWindowMLASpec,
     get_kv_cache_compression_ratio,
     get_storage_block_size,
+    is_sliding_window_gqa_spec,
     supports_component_major_mla_pd,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
@@ -380,13 +381,20 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             for name, spec in list(mamba_specs.items()):
                 if spec.real_page_size_bytes <= c8_page and spec.page_size_bytes > c8_page:
                     mamba_specs[name] = replace(spec, page_size_padded=c8_page)
-        # Kimi C8: derive target/Mamba pages from their payloads. Draft keeps
-        # its own BF16 page within the per-layer mixed-page group.
-        page_pool = (
-            [*c8_attention_specs, *mamba_specs.values()]
-            if c8_attention_specs
-            else [*kv_cache_spec.values(), *mamba_specs.values()]
-        )
+        # Kimi C8: derive one physical page stride for target, Window-GQA draft,
+        # and Mamba.  The draft keeps its native GQA kernel block size; only
+        # its physical page is padded to the 1664-token MLA page so allocation,
+        # slot addressing, and the mixed-page planner use the same block ID.
+        # Include the draft attention payload in the common-page calculation.
+        # Indexer/SFA auxiliary caches have their own physical pool and must
+        # not inflate the MLA page used by the Window-GQA + Mamba pool. The
+        # draft keeps its native logical block size; only its physical stride
+        # must fit in the shared C8/MLA page.
+        page_pool = [
+            *c8_attention_specs,
+            *[spec for spec in kv_cache_spec.values() if is_sliding_window_gqa_spec(spec)],
+            *mamba_specs.values(),
+        ]
         common_page_size = max(spec.page_size_bytes for spec in page_pool)
         c8_page_alignments = [spec.static_fp8_kernel_block_size * spec.static_fp8_width for spec in c8_attention_specs]
         if c8_page_alignments:
@@ -394,7 +402,15 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             common_page_size = _align_up(common_page_size, alignment)
         for layer_name in attention_layer_names:
             spec = kv_cache_spec[layer_name]
-            if c8_attention_specs and getattr(attn_layers[layer_name].impl, "is_draft_cache", False):
+            # Preserve the original C8 behavior for ordinary MLA DSpark
+            # layers.  Window-GQA is the only draft layout that must share
+            # the physical C8 page stride; regular draft MLA keeps its own
+            # cache page and therefore must remain outside this padding path.
+            if (
+                c8_attention_specs
+                and getattr(attn_layers[layer_name].impl, "is_draft_cache", False)
+                and not is_sliding_window_gqa_spec(spec)
+            ):
                 continue
             page_size_padded = common_page_size if spec.page_size_bytes < common_page_size else spec.page_size_padded
             kv_cache_spec[layer_name] = replace(spec, page_size_padded=page_size_padded)

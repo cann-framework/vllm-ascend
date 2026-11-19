@@ -361,10 +361,20 @@ def requires_contiguous_pa_kv_cache(layer, vllm_config: VllmConfig, spec: FullAt
     )
 
 
-@lru_cache(maxsize=1)
 def enable_dcp():
+    """Resolve DCP from the active model config for every draft/target pass.
+
+    A target MLA and a replicated Window-GQA draft are built in one worker
+    under different ``VllmConfig`` objects. Caching the first result can leak
+    target DCP into the draft attention backend (or the reverse).
+    """
     parallel_config = get_current_vllm_config().parallel_config
     return parallel_config.decode_context_parallel_size > 1
+
+
+# Older tests/callers clear the former one-entry cache. Keep that API as a
+# harmless compatibility hook after making the value context-sensitive.
+enable_dcp.cache_clear = lambda: None
 
 
 def enable_pcp():

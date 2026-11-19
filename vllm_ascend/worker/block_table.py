@@ -6,17 +6,67 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpecKind,
+    UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
 from vllm.v1.utils import CpuGpuBuffer
 
-from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+from vllm_ascend.core.kv_cache_interface import (
+    is_circular_kv_cache_spec,
+    is_sliding_window_gqa_draft_group,
+)
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 from vllm_ascend.ops.triton.compute_slot_mapping import (
     _compute_slot_mapping_kernel,
     _next_power_of_2,
     compute_slot_mapping_fused_groups,
 )
+
+
+def _is_replicated_window_spec(kv_cache_spec, kv_cache_group=None) -> bool:
+    """Return whether this group owns a replicated Window-GQA table."""
+    return kv_cache_group is not None and is_sliding_window_gqa_draft_group(kv_cache_group)
+
+
+def max_num_blocks_per_req_for_group(
+    kv_cache_spec,
+    vllm_config,
+    max_len: int,
+    kv_cache_group=None,
+) -> int:
+    """Compute block-table width using the group's actual DCP topology.
+
+    The target MLA remains DCP-sharded, while an ordinary Window-GQA draft is
+    replicated on every rank and therefore uses DCP=1 for both admission and
+    slot mapping.
+    """
+    if _is_replicated_window_spec(kv_cache_spec, kv_cache_group):
+        specs = (
+            tuple(kv_cache_spec.kv_cache_specs.values())
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs)
+            else (kv_cache_spec,)
+        )
+        block_sizes = {spec.block_size for spec in specs}
+        if len(block_sizes) != 1:
+            raise ValueError(
+                "All replicated sliding-window layers must use one block size, "
+                f"got {sorted(block_sizes)}"
+            )
+        # ``max_admission_blocks_per_request`` is the physical pool bound, not
+        # the block-table width.  SlidingWindowManager retains null entries for
+        # evicted prefix blocks, so slot mapping still indexes the table by the
+        # absolute token position.  ``AttentionSpec.max_num_blocks_per_req``
+        # consults the worker-wide DCP size, which is intentionally wrong for
+        # this replicated group; compute the local-DCP=1 width explicitly.
+        # Using the admission bound (or a DCP-sharded width) works for short
+        # prompts and then overflows as soon as a request advances beyond the
+        # first window.
+        return cdiv(max_len, next(iter(block_sizes)))
+    if vllm_config is None:
+        if is_circular_kv_cache_spec(kv_cache_spec):
+            return 1
+        return cdiv(max_len, kv_cache_spec.block_size * get_decode_context_model_parallel_world_size())
+    return kv_cache_spec.max_num_blocks_per_req(vllm_config, max_len)
 
 
 class BlockTable:
@@ -34,8 +84,13 @@ class BlockTable:
         kv_cache_group: KVCacheGroupSpec = None,
     ):
         self.max_num_reqs = max_num_reqs
-        self.dcp_world_size = get_dcp_group().world_size
-        self.dcp_rank = get_dcp_group().rank_in_group
+        is_replicated_window = _is_replicated_window_spec(
+            kv_cache_group.kv_cache_spec if kv_cache_group is not None else None,
+            kv_cache_group,
+        )
+        dcp_group = get_dcp_group()
+        self.dcp_world_size = 1 if is_replicated_window else dcp_group.world_size
+        self.dcp_rank = 0 if is_replicated_window else dcp_group.rank_in_group
         is_mamba_group = (
             kv_cache_group is not None
             and hasattr(kv_cache_group, "kv_cache_spec")
@@ -106,7 +161,7 @@ class BlockTable:
         )
 
         self.kernel_sizes = kernel_sizes
-        self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
+        self.cp_kv_cache_interleave_size = 1 if is_replicated_window else cp_kv_cache_interleave_size
 
     def append_row(
         self,
@@ -370,7 +425,15 @@ class MultiGroupBlockTable:
             # so the block_size which used for calc max_num_blocks_per_req
             # must be multiplied by dcp_world_size.
             dcp_world_size = get_decode_context_model_parallel_world_size()
-            max_num_blocks = [cdiv(max_model_len, block_size * dcp_world_size) for block_size in block_sizes]
+            if kv_cache_groups is not None:
+                max_num_blocks = [
+                    max_num_blocks_per_req_for_group(
+                        group.kv_cache_spec, None, max_model_len, group
+                    )
+                    for group in kv_cache_groups
+                ]
+            else:
+                max_num_blocks = [cdiv(max_model_len, block_size * dcp_world_size) for block_size in block_sizes]
 
         if len(max_num_blocks) != len(block_sizes):
             raise ValueError(

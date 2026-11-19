@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 import math
 from collections import defaultdict
+from copy import copy
 from dataclasses import replace
 
 import vllm.v1.core.kv_cache_utils
@@ -10,6 +11,7 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.kv_cache_utils import _approximate_gcd, may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -19,11 +21,16 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
 
-from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+from vllm_ascend.core.kv_cache_interface import (
+    is_prefix_cacheable,
+    is_sliding_window_gqa_draft_group,
+    is_sliding_window_gqa_spec,
+)
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_kv_cache_config,
     get_deepseek_v41_pool_bytes_per_block,
@@ -52,20 +59,48 @@ _orig_get_kv_cache_config_from_groups = vllm.v1.core.kv_cache_utils.get_kv_cache
 _orig_max_memory_usage_bytes_from_groups = vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups
 _orig_pool_bytes_per_block = vllm.v1.core.kv_cache_utils._pool_bytes_per_block
 _orig_validate_kv_cache_layout = vllm.v1.core.kv_cache_utils.validate_kv_cache_layout
+_orig_validate_block_size = VllmConfig.validate_block_size
+
+
+def _is_kimi_attention_spec(spec: KVCacheSpec) -> bool:
+    """Recognize MLA and ordinary attention specs in V1 and V2 workers."""
+    return isinstance(spec, AttentionSpec) and not isinstance(spec, MambaSpec)
+
+
+def _is_kimi_c8_mixed_group_layout(kv_cache_groups) -> bool:
+    """Return whether a Kimi C8 target/draft cache has mixed page geometry.
+
+    Static C8 is only used by the target MLA layers.  The draft can either be
+    the original MLA DSpark model or the Window-GQA model; in both cases the
+    draft page geometry differs from the target C8 page (and the Window-GQA
+    page may additionally be padded to the common physical stride).  Mamba
+    groups participate in the same compact allocation, so vLLM's generic
+    uniform-page assertion cannot describe this topology.
+
+    Keep the exception narrowly scoped to a Kimi target + Kimi draft + Mamba
+    layout.  In particular, a standalone C8 model must still go through the
+    upstream validation path.
+    """
+    has_target_c8 = False
+    has_draft_attention = False
+    has_mamba = False
+    for group in kv_cache_groups:
+        specs = (
+            tuple(group.kv_cache_spec.kv_cache_specs.values())
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else (group.kv_cache_spec,)
+        )
+        is_target = any(name.startswith(_KIMI_K3_TARGET_LAYER_PREFIX) for name in group.layer_names)
+        is_draft = any(name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) for name in group.layer_names)
+        has_target_c8 |= is_target and any(getattr(spec, "static_fp8_pa_nz", False) for spec in specs)
+        has_draft_attention |= is_draft and any(_is_kimi_attention_spec(spec) for spec in specs)
+        has_mamba |= is_target and any(isinstance(spec, MambaSpec) for spec in specs)
+    return has_target_c8 and has_draft_attention and has_mamba
 
 
 def _validate_kv_cache_layout(layout, kv_cache_groups) -> None:
     """Allow mixed page sizes only for the current Kimi C8 groups."""
-    has_c8 = any(
-        getattr(spec, "static_fp8_pa_nz", False)
-        for group in kv_cache_groups
-        for spec in (
-            group.kv_cache_spec.kv_cache_specs.values()
-            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-            else (group.kv_cache_spec,)
-        )
-    )
-    if has_c8 and layout.is_layer_compact and layout.is_block_compact:
+    if _is_kimi_c8_mixed_group_layout(kv_cache_groups) and layout.is_layer_compact and layout.is_block_compact:
         return
     _orig_validate_kv_cache_layout(layout, kv_cache_groups)
 
@@ -127,22 +162,30 @@ def _ascend_resolve_kv_cache_block_sizes(
 
     cacheable_groups = [g for g in groups if is_prefix_cacheable(g.kv_cache_spec)]
     if len(cacheable_groups) != len(groups):
-        scheduler_block_size = math.lcm(*(g.kv_cache_spec.block_size for g in groups)) * dcp
-        if not cache_config.enable_prefix_caching or not cacheable_groups:
+        effective_group_block_sizes = [
+            _effective_scheduler_block_size(group, dcp) for group in groups
+        ]
+        scheduler_block_size = math.lcm(*effective_group_block_sizes)
+        if not (cache_config.enable_prefix_caching or vllm_config.kv_transfer_config is not None) or not cacheable_groups:
             return scheduler_block_size, scheduler_block_size
         filtered = replace(kv_cache_config, kv_cache_groups=cacheable_groups)
         if dcp == 1:
             _, hash_block_size = _orig_resolve_kv_cache_block_sizes(filtered, vllm_config)
         else:
-            hash_block_size = math.gcd(*(g.kv_cache_spec.block_size for g in cacheable_groups))
+            hash_block_size = math.gcd(*(_effective_scheduler_block_size(group, dcp) for group in cacheable_groups))
         return scheduler_block_size, hash_block_size
 
     if len(groups) <= 1:
         # EngineCore's global size is the minimum across all original groups.
         # After filtering a private tail, it can therefore be smaller than the
         # sole cacheable group's token-page size.
-        block_size = groups[0].kv_cache_spec.block_size if filtered_private_groups else cache_config.block_size
+        if groups and is_sliding_window_gqa_draft_group(groups[0]):
+            block_size = groups[0].kv_cache_spec.block_size
+        else:
+            block_size = groups[0].kv_cache_spec.block_size if filtered_private_groups else cache_config.block_size
         bs = block_size * dcp
+        if groups and is_sliding_window_gqa_draft_group(groups[0]):
+            bs = block_size
         return bs, bs
 
     group_block_sizes = [group.kv_cache_spec.block_size for group in groups]
@@ -150,13 +193,71 @@ def _ascend_resolve_kv_cache_block_sizes(
         # Ascend supports CP with multiple KV cache groups; compute
         # scheduler_block_size using the LCM of all group block sizes
         # multiplied by DCP for proper alignment.
-        scheduler_block_size = math.lcm(*group_block_sizes) * dcp
-        if not cache_config.enable_prefix_caching:
+        effective_group_block_sizes = [
+            _effective_scheduler_block_size(group, dcp)
+            for group in groups
+        ]
+        scheduler_block_size = math.lcm(*effective_group_block_sizes)
+        if not (cache_config.enable_prefix_caching or vllm_config.kv_transfer_config is not None):
             return scheduler_block_size, scheduler_block_size
-        hash_block_size = math.gcd(*group_block_sizes)
+        hash_block_size = math.gcd(*effective_group_block_sizes)
+        return scheduler_block_size, hash_block_size
+
+    if _is_kimi_k3_dspark_window_kv_cache_config(groups):
+        group_block_sizes = [group.kv_cache_spec.block_size for group in groups]
+        scheduler_block_size = math.lcm(*group_block_sizes)
+        if not cache_config.enable_prefix_caching and vllm_config.kv_transfer_config is None:
+            return scheduler_block_size, scheduler_block_size
+        requested = cache_config.prefix_match_unit
+        hash_block_size = requested if requested is not None else math.gcd(*group_block_sizes)
+        if hash_block_size <= 0 or any(block_size % hash_block_size != 0 for block_size in group_block_sizes):
+            raise ValueError(
+                f"Invalid prefix_match_unit={hash_block_size}; all Kimi K3 DSpark "
+                f"KV cache group block sizes must be divisible by it. Got group block sizes={group_block_sizes}."
+            )
         return scheduler_block_size, hash_block_size
 
     return _orig_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+
+
+def _effective_scheduler_block_size(group: KVCacheGroupSpec, dcp: int) -> int:
+    """Return the scheduler token alignment for one cache group's topology."""
+    spec = group.kv_cache_spec
+    if is_sliding_window_gqa_draft_group(group) or isinstance(spec, MambaSpec):
+        return spec.block_size
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        inner_specs = tuple(spec.kv_cache_specs.values())
+        if inner_specs and all(isinstance(inner, MambaSpec) for inner in inner_specs):
+            return spec.block_size
+        if inner_specs and all(isinstance(inner, AttentionSpec) for inner in inner_specs):
+            return spec.block_size * dcp
+        return spec.block_size
+    if isinstance(spec, AttentionSpec):
+        return spec.block_size * dcp
+    return spec.block_size
+
+
+def _is_kimi_k3_dspark_window_kv_cache_config(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> bool:
+    """Recognize Kimi K3 with an ordinary Window-GQA draft and Mamba align."""
+    has_target = False
+    has_window_draft = False
+    has_mamba = False
+    for group in kv_cache_groups:
+        specs = (
+            tuple(group.kv_cache_spec.kv_cache_specs.values())
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else (group.kv_cache_spec,)
+        )
+        if any(isinstance(spec, MambaSpec) and spec.mamba_cache_mode != "align" for spec in specs):
+            return False
+        if any(name.startswith(_KIMI_K3_TARGET_LAYER_PREFIX) for name in group.layer_names):
+            has_target |= any(_is_kimi_attention_spec(spec) for spec in specs)
+            has_mamba |= any(isinstance(spec, MambaSpec) for spec in specs)
+        if any(name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) for name in group.layer_names):
+            has_window_draft |= any(is_sliding_window_gqa_spec(spec) for spec in specs)
+    return has_target and has_window_draft and has_mamba
 
 
 def _get_kimi_k3_dspark_mixed_kv_cache_groups(
@@ -179,12 +280,19 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
     target_attention_specs = {
         name: spec
         for name, spec in kv_cache_spec.items()
-        if name.startswith(_KIMI_K3_TARGET_LAYER_PREFIX) and isinstance(spec, FullAttentionSpec)
+        if name.startswith(_KIMI_K3_TARGET_LAYER_PREFIX) and _is_kimi_attention_spec(spec)
     }
     draft_attention_specs = {
         name: spec
         for name, spec in kv_cache_spec.items()
-        if name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) and isinstance(spec, FullAttentionSpec)
+        if name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX)
+        and _is_kimi_attention_spec(spec)
+        and not is_sliding_window_gqa_spec(spec)
+    }
+    draft_window_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) and is_sliding_window_gqa_spec(spec)
     }
     mamba_specs = {
         name: spec
@@ -192,25 +300,78 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
         if name.startswith(_KIMI_K3_TARGET_LAYER_PREFIX) and isinstance(spec, MambaSpec)
     }
 
-    matched_layer_count = len(target_attention_specs) + len(draft_attention_specs) + len(mamba_specs)
+    matched_layer_count = (
+        len(target_attention_specs)
+        + len(draft_attention_specs)
+        + len(draft_window_specs)
+        + len(mamba_specs)
+    )
     if (
         not target_attention_specs
-        or not draft_attention_specs
+        or not (draft_attention_specs or draft_window_specs)
         or not mamba_specs
         or matched_layer_count != len(kv_cache_spec)
     ):
         return None
 
-    attention_specs = [*target_attention_specs.values(), *draft_attention_specs.values()]
+    attention_specs = [*target_attention_specs.values(), *draft_attention_specs.values(), *draft_window_specs.values()]
     # Only attention layers share a scheduler block table. Mamba keeps its
     # own groups and may use max_model_len as block_size when cache_mode=none.
     # Mixed native page sizes are an opt-in C8 layout. Preserve the base
     # uniform-page signature for every C16/other model.
     has_c8 = any(getattr(spec, "static_fp8_pa_nz", False) for spec in attention_specs)
-    if len({spec.block_size for spec in attention_specs}) != 1 or (
+    has_window_gqa = bool(draft_window_specs)
+    if (not (has_c8 and has_window_gqa) and len({spec.block_size for spec in attention_specs}) != 1) or (
         not has_c8 and len({spec.page_size_bytes for spec in (*attention_specs, *mamba_specs.values())}) != 1
     ):
         return None
+
+    if has_c8 and has_window_gqa:
+        # Ordinary GQA keeps its native kernel block size (usually 128/256),
+        # while the static C8 MLA target uses the 1664-token manager page.
+        # Align only the physical stride; changing the GQA block size would
+        # invalidate its FIA reshape/cache ABI.  The aligned spec is consumed
+        # by the returned group and therefore also reaches allocation and
+        # worker-side cache views.
+        c8_pages = [
+            spec.page_size_bytes
+            for spec in target_attention_specs.values()
+            if getattr(spec, "static_fp8_pa_nz", False)
+        ]
+        if not c8_pages:
+            return None
+        common_page = max(
+            [
+                *c8_pages,
+                # Indexer/SFA auxiliary pages have a separate cache layout;
+                # only the draft attention payload shares the C8+Mamba page
+                # stride that is being padded here.
+                *(spec.page_size_bytes for spec in draft_attention_specs.values()),
+                *(spec.page_size_bytes for spec in draft_window_specs.values()),
+                *(spec.page_size_bytes for spec in mamba_specs.values()),
+            ]
+        )
+
+        def pad_attention_specs(specs: dict[str, KVCacheSpec]) -> dict[str, KVCacheSpec]:
+            return {
+                name: replace(spec, page_size_padded=common_page)
+                if isinstance(spec, AttentionSpec) and spec.page_size_bytes < common_page
+                else spec
+                for name, spec in specs.items()
+            }
+
+        # Target MLA/indexer layers keep their native physical pages. The
+        # shared page stride is required by the replicated draft GQA and
+        # recurrent state pools; padding auxiliary target caches here would
+        # needlessly enlarge those pools and can mix incompatible layouts.
+        draft_attention_specs = pad_attention_specs(draft_attention_specs)
+        draft_window_specs = pad_attention_specs(draft_window_specs)
+        mamba_specs = {
+            name: replace(spec, page_size_padded=common_page)
+            if spec.page_size_bytes < common_page
+            else spec
+            for name, spec in mamba_specs.items()
+        }
 
     first_mamba_spec = next(iter(mamba_specs.values()))
     if any(spec != first_mamba_spec for spec in mamba_specs.values()):
@@ -221,17 +382,52 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
     # with the FullAttentionManager needed by both target and draft attention.
     mixed_attention_specs = {**target_attention_specs, **draft_attention_specs}
     mixed_attention_spec = UniformTypeKVCacheSpecs.from_specs(mixed_attention_specs)
-    if mixed_attention_spec is None:
-        return None
-
-    groups = [
-        KVCacheGroupSpec(
-            layer_names=list(mixed_attention_specs),
-            kv_cache_spec=mixed_attention_spec,
+    groups: list[KVCacheGroupSpec] = []
+    if mixed_attention_spec is not None:
+        groups.append(
+            KVCacheGroupSpec(
+                layer_names=list(mixed_attention_specs),
+                kv_cache_spec=mixed_attention_spec,
+                # A mixed target/draft group needs the EAGLE replay rule;
+                # a target-only group must retain ordinary MLA semantics.
+                is_eagle_group=any(
+                    name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) for name in mixed_attention_specs
+                ),
+            )
         )
-    ]
+    else:
+        # MLA target and ordinary GQA draft have different cache families.
+        # Keep them in separate groups so only the Window-GQA group is
+        # replicated when target MLA uses DCP.
+        for specs in (target_attention_specs, draft_attention_specs):
+            if not specs:
+                continue
+            uniform_spec = UniformTypeKVCacheSpecs.from_specs(specs)
+            if uniform_spec is None:
+                return None
+            groups.append(
+                KVCacheGroupSpec(
+                    layer_names=list(specs),
+                    kv_cache_spec=uniform_spec,
+                    is_eagle_group=any(
+                        name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) for name in specs
+                    ),
+                )
+            )
+    if draft_window_specs:
+        window_spec = UniformTypeKVCacheSpecs.from_specs(draft_window_specs)
+        if window_spec is None:
+            return None
+        groups.append(
+            KVCacheGroupSpec(
+                layer_names=list(draft_window_specs),
+                kv_cache_spec=window_spec,
+                is_eagle_group=True,
+            )
+        )
     mamba_layer_names = list(mamba_specs)
-    mamba_group_count = cdiv(len(mamba_layer_names), len(mixed_attention_specs))
+    attention_layer_count = len(target_attention_specs) + len(draft_attention_specs) + len(draft_window_specs)
+    mamba_group_count = cdiv(len(mamba_layer_names), max(attention_layer_count, 1))
     for group_idx in range(mamba_group_count):
         layer_names = mamba_layer_names[group_idx::mamba_group_count]
         group_specs = {name: mamba_specs[name] for name in layer_names}
@@ -245,9 +441,11 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
         )
 
     logger.info(
-        "Using Kimi K3 DSpark mixed KV grouping: %d target + %d draft attention layers, followed by Mamba groups %s",
+        "Using Kimi K3 DSpark mixed KV grouping: %d target + %d draft attention + %d Window-GQA layers, "
+        "followed by Mamba groups %s",
         len(target_attention_specs),
         len(draft_attention_specs),
+        len(draft_window_specs),
         [len(group.layer_names) for group in groups[1:]],
     )
     return groups
@@ -588,6 +786,74 @@ def _ascend_max_memory_usage_bytes_from_groups(
         return tq_cache.max_memory_usage(vllm_config, kv_cache_groups)
     if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
         return get_glm5_next_max_memory_usage(vllm_config, kv_cache_groups)
+
+    # Ordinary SlidingWindowSpec rejects worker-wide DCP in upstream vLLM.
+    # Window-GQA DSpark is the deliberate exception: its draft pages are
+    # replicated on each target DCP rank and execute through a local DCP=1
+    # draft view.  Compute the admission bound from the inner specs so a
+    # UniformType group does not multiply one page by its layer count twice.
+    has_window_gqa_draft = any(is_sliding_window_gqa_draft_group(group) for group in kv_cache_groups)
+    if _is_kimi_k3_dspark_window_kv_cache_config(kv_cache_groups) or has_window_gqa_draft:
+        def inner_specs(group: KVCacheGroupSpec) -> tuple[KVCacheSpec, ...]:
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                return tuple(spec.kv_cache_specs.values())
+            return (spec,)
+
+        def max_blocks(spec: KVCacheSpec) -> int:
+            if is_sliding_window_gqa_spec(spec):
+                max_in_flight_tokens = getattr(
+                    vllm_config,
+                    "max_in_flight_tokens",
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                )
+                max_model_len = vllm_config.model_config.max_model_len
+                # The argument was renamed in upstream vLLM; keep the
+                # positional call for native SlidingWindowSpec.  A disabled
+                # hybrid manager promotes the same layer to
+                # FullAttentionSpec(sliding_window=...), which has no
+                # admission helper, so apply the identical bound here.
+                admission = getattr(spec, "max_admission_blocks_per_request", None)
+                if admission is not None:
+                    return admission(max_in_flight_tokens, max_model_len)
+                window = getattr(spec, "sliding_window", None)
+                if window is None:
+                    raise ValueError("Sliding Window-GQA spec has no sliding_window")
+                num_tokens = min(window - 1 + max_in_flight_tokens, max_model_len)
+                return cdiv(num_tokens, spec.block_size) + 1
+            return cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
+
+        nonempty_groups = [group for group in kv_cache_groups if group.layer_names]
+        specs_by_group = [inner_specs(group) for group in nonempty_groups]
+        if not specs_by_group or any(not specs for specs in specs_by_group):
+            return 0
+        # vLLM's UniformType path allocates a packed slab per scheduler block;
+        # its stride is the largest per-group sum of layer pages. Keep this
+        # accounting identical to ``_get_packed_kv_cache_layout`` so the
+        # startup admission check and the actual allocator agree even when
+        # target/indexer and draft/Mamba groups have different page sizes.
+        if all(isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in nonempty_groups):
+            group_strides: list[int] = []
+            for group in nonempty_groups:
+                group_spec = group.kv_cache_spec
+                assert isinstance(group_spec, UniformTypeKVCacheSpecs)
+                group_strides.append(
+                    sum(group_spec.kv_cache_specs[name].page_size_bytes for name in group.layer_names)
+                )
+            bytes_per_block = max(group_strides, default=0)
+            if bytes_per_block > 0:
+                blocks_needed = max(max(max_blocks(spec) for spec in specs) for specs in specs_by_group)
+                return bytes_per_block * blocks_needed
+
+        # Non-packed layouts retain the upstream group-size accounting, but
+        # still use the patched Window-GQA admission bound above.
+        page_sizes = {spec.page_size_bytes for specs in specs_by_group for spec in specs}
+        if len(page_sizes) == 1:
+            page_size = page_sizes.pop()
+            block_stride = max(len(specs) for specs in specs_by_group) * page_size
+            blocks_needed = sum(max(max_blocks(spec) for spec in specs) for specs in specs_by_group)
+            return block_stride * blocks_needed
+
     if not _is_deepseek_v4_groups(kv_cache_groups):
         return _orig_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
 
@@ -629,12 +895,72 @@ def _get_glm5_next_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
+    # This attribute is consumed later by ``validate_block_size``.  It must
+    # be refreshed on every planning pass because PP projection and scheduler
+    # re-planning can call this hook more than once.
+    vllm_config._ascend_window_gqa_dcp_block_sizes = ()
     if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
         return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
     kimi_groups = _kimi_c8_mixed_page_groups(kv_cache_spec)
     if kimi_groups is not None:
+        _mark_window_gqa_draft_groups(vllm_config, kimi_groups)
+        _annotate_window_gqa_dcp_block_sizes(vllm_config, kimi_groups)
         return kimi_groups
-    return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+    groups = _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+    _mark_window_gqa_draft_groups(vllm_config, groups)
+    _annotate_window_gqa_dcp_block_sizes(vllm_config, groups)
+    return groups
+
+
+def _mark_window_gqa_draft_groups(
+    vllm_config: VllmConfig,
+    groups: list[KVCacheGroupSpec],
+) -> None:
+    """Mark generic DSpark Window-GQA groups as replicated draft groups.
+
+    Upstream only annotates the special DeepSeek-V4 EAGLE path.  Kimi K3's
+    ordinary GQA draft is often produced by the generic hybrid grouping path,
+    so it otherwise loses the marker that drives local-DCP block tables and
+    cache admission.  Restrict this to Kimi DSpark layer names and to a pure
+    SlidingWindowSpec group; other sliding-window models retain upstream
+    behavior.
+    """
+    if getattr(getattr(vllm_config, "speculative_config", None), "method", None) != "dspark":
+        return
+    for group in groups:
+        if not any(name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) for name in group.layer_names):
+            continue
+        if is_sliding_window_gqa_spec(group.kv_cache_spec):
+            group.is_eagle_group = True
+
+
+def _annotate_window_gqa_dcp_block_sizes(
+    vllm_config: VllmConfig,
+    groups: list[KVCacheGroupSpec],
+) -> None:
+    """Record the real DCP-sharded page sizes for mixed Window-GQA K3."""
+    if (
+        vllm_config.parallel_config.decode_context_parallel_size <= 1
+        or getattr(getattr(vllm_config, "speculative_config", None), "method", None) != "dspark"
+        or not _is_kimi_k3_dspark_window_kv_cache_config(groups)
+        or not any(is_sliding_window_gqa_draft_group(group) for group in groups)
+    ):
+        return
+    vllm_config._ascend_window_gqa_dcp_block_sizes = tuple(
+        sorted(
+            {
+                spec.block_size
+                for group in groups
+                if not is_sliding_window_gqa_draft_group(group)
+                for spec in (
+                    group.kv_cache_spec.kv_cache_specs.values()
+                    if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                    else (group.kv_cache_spec,)
+                )
+                if isinstance(spec, AttentionSpec)
+            }
+        )
+    )
 
 
 def _ascend_get_kv_cache_config_from_groups(
@@ -698,6 +1024,58 @@ def _ascend_get_kv_cache_config_from_groups(
     return kv_cache_config
 
 
+_orig_sliding_window_max_memory_usage_bytes = SlidingWindowSpec.max_memory_usage_bytes
+
+
+def _ascend_sliding_window_max_memory_usage_bytes(
+    self: SlidingWindowSpec,
+    vllm_config: VllmConfig,
+) -> int:
+    """Size replicated Window-GQA pages without applying worker-wide DCP."""
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    is_window_gqa_draft = (
+        getattr(speculative_config, "method", None) == "dspark"
+        and is_sliding_window_gqa_spec(self)
+    )
+    dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+    if dcp_size <= 1 or not is_window_gqa_draft:
+        return _orig_sliding_window_max_memory_usage_bytes(self, vllm_config)
+
+    max_in_flight_tokens = getattr(
+        vllm_config,
+        "max_in_flight_tokens",
+        vllm_config.scheduler_config.max_num_batched_tokens,
+    )
+    max_blocks = self.max_admission_blocks_per_request(
+        max_in_flight_tokens,
+        vllm_config.model_config.max_model_len,
+    )
+    return max_blocks * self.page_size_bytes
+
+
+def _ascend_validate_block_size(self: VllmConfig) -> None:
+    """Validate each actual sharded group for mixed Window-GQA DSpark."""
+    block_sizes = getattr(self, "_ascend_window_gqa_dcp_block_sizes", ())
+    if not block_sizes or self.parallel_config.decode_context_parallel_size == 1:
+        return _orig_validate_block_size(self)
+
+    # EngineCore's global block size is the minimum across groups and can be
+    # the Window-GQA page size. Validate only the target MLA/DCP groups with
+    # their actual sizes; the draft is replicated and intentionally local DCP=1.
+    validation_config = copy(self)
+    validation_config.cache_config = copy(self.cache_config)
+    for block_size in block_sizes:
+        validation_config.cache_config.block_size = block_size
+        _orig_validate_block_size(validation_config)
+    logger.info(
+        "Kimi K3 Window-GQA DSpark DCP block validation: global minimum=%d, "
+        "sharded attention sizes=%s, CP interleave=%d; draft window cache uses DCP=1",
+        self.cache_config.block_size,
+        block_sizes,
+        self.parallel_config.cp_kv_cache_interleave_size,
+    )
+
+
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 assert _orig_get_packed_kv_cache_groups is not None
 vllm.v1.core.kv_cache_utils._get_packed_kv_cache_groups = _ascend_get_packed_kv_cache_groups
@@ -710,6 +1088,8 @@ vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups = _ascend_get_kv_cac
 vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups = _ascend_max_memory_usage_bytes_from_groups
 vllm.v1.core.kv_cache_utils._pool_bytes_per_block = _ascend_pool_bytes_per_block
 vllm.v1.core.kv_cache_utils.validate_kv_cache_layout = _validate_kv_cache_layout
+SlidingWindowSpec.max_memory_usage_bytes = _ascend_sliding_window_max_memory_usage_bytes
+VllmConfig.validate_block_size = _ascend_validate_block_size
 
 # Also patch the reference used by engine/core.py which imports the function directly.
 import vllm.v1.engine.core  # noqa: E402
