@@ -417,7 +417,7 @@ def test_prefill_reads_full_precision_history_exactly_once(monkeypatch, padding)
         chunked_context=chunk,
         block_table=torch.arange(13, 26, dtype=torch.int32).reshape(1, 13),
         actual_seq_lengths_q=[1],
-        c8_physical_tables={},
+        c8_history_plans={},
     )
     impl._kimi_c8_physical_table = MagicMock(wraps=impl._kimi_c8_physical_table)
 
@@ -438,7 +438,7 @@ def test_prefill_reads_full_precision_history_exactly_once(monkeypatch, padding)
     assert impl._kimi_c8_physical_table.call_count == 1
     # Each new prefill metadata owns its own mapping even if the runner
     # reuses its block-table buffer.
-    run(Ns(**{**vars(prefill), "c8_physical_tables": {}}))
+    run(Ns(**{**vars(prefill), "c8_history_plans": {}}))
     assert impl._kimi_c8_physical_table.call_count == 2
 
 

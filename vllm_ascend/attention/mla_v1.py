@@ -96,6 +96,8 @@ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
+    from vllm_ascend.attention.kimi_c8_static import C8PrefillHistory
+
 
 BUILD_METADATA_STEP_PREFILL = 0
 BUILD_METADATA_STEP_DECODE = 1
@@ -222,7 +224,7 @@ class AscendMLAPrefillMetadata:
     cos: torch.Tensor = None
     actual_seq_lengths_q: list[int] | None = None
     pcp_local_num_input_tokens: int | None = None
-    c8_physical_tables: dict[tuple, torch.Tensor] = field(default_factory=dict)
+    c8_history_plans: dict[tuple, "C8PrefillHistory"] = field(default_factory=dict)
 
 
 @dataclass
@@ -2048,14 +2050,31 @@ class AscendMLAImpl(MLAAttentionImpl):
         if iters == 0:
             return prefix_output, prefix_lse
 
+        history_plan = None
         if is_c8:
+            from vllm_ascend.attention.kimi_c8_static import C8PrefillHistory
+
             # The runner shares prefill metadata across layers in this attention group.
-            key = (context_table, self.kimi_c8_manager_block_size, self.kimi_c8_page_stride_bytes)
-            physical_table = prefill_metadata.c8_physical_tables.get(key)
-            if physical_table is None:
+            key = (
+                context_table,
+                self.kimi_c8_manager_block_size,
+                self.kimi_c8_page_stride_bytes,
+                cache_kv_c.shape,
+                cache_kv_c.device,
+            )
+            history_plan = prefill_metadata.c8_history_plans.get(key)
+            if history_plan is None:
                 physical_table = self._kimi_c8_physical_table(context_table)
-                prefill_metadata.c8_physical_tables[key] = physical_table
-            context_table = physical_table
+                lengths, starts = zip(
+                    *(
+                        _get_c8_prefill_chunk_lengths_and_starts(prefill_metadata.chunked_context, i)
+                        for i in range(iters)
+                    )
+                )
+                history_plan = C8PrefillHistory.prepare(
+                    cache_kv_c, physical_table, torch.stack(lengths), torch.stack(starts)
+                )
+                prefill_metadata.c8_history_plans[key] = history_plan
 
         num_tokens = q_nope.size(0)
         D = self.v_head_dim
@@ -2088,23 +2107,12 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
-            context_seq_len_npu = self.get_context_seq_len_npu(i, attn_metadata)
-            if is_c8:
-                from vllm_ascend.attention.kimi_c8_static import read_static_fp8_cache
-
-                c8_chunk_lengths, c8_chunk_starts = _get_c8_prefill_chunk_lengths_and_starts(
-                    prefill_metadata.chunked_context, i
-                )
-                history = read_static_fp8_cache(
-                    cache_kv_c,
-                    context_table,
-                    c8_chunk_lengths,
-                    self.fak_descale_float,
-                    starts=c8_chunk_starts,
-                    dtype=q_nope.dtype,
-                )
+            if history_plan is not None:
+                # C8 load and reload both set the recipe's fixed FP32 descale.
+                history = history_plan.read(cache_kv_c, i, self.fak_descale_float, dtype=q_nope.dtype)
                 kv_c_normed, k_pe = history.split([self.kv_lora_rank, rope_dim], dim=-1)
             else:
+                context_seq_len_npu = self.get_context_seq_len_npu(i, attn_metadata)
                 kv_c_normed = torch.empty(
                     toks, num_heads, latent_kv_dim, dtype=cache_kv_c.dtype, device=cache_kv_c.device
                 )
