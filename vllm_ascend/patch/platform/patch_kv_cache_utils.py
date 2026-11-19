@@ -327,12 +327,20 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
         return None
 
     if has_c8 and has_window_gqa:
-        # Ordinary GQA keeps its native kernel block size (usually 128/256),
-        # while the static C8 MLA target uses the 1664-token manager page.
-        # Align only the physical stride; changing the GQA block size would
-        # invalidate its FIA reshape/cache ABI.  The aligned spec is consumed
-        # by the returned group and therefore also reaches allocation and
-        # worker-side cache views.
+        # The C8 target determines the manager page width.  Do not bake a
+        # particular deployment value into the grouping code: callers may use
+        # 128, 640, 1664, etc.  FIA receives its native kernel block later
+        # through ``prepare_kernel_block_sizes``.
+        target_block_sizes = {spec.block_size for spec in target_attention_specs.values()}
+        if len(target_block_sizes) != 1:
+            return None
+        manager_block_size = target_block_sizes.pop()
+        draft_window_specs = {
+            name: replace(spec, block_size=manager_block_size, page_size_padded=None)
+            if spec.block_size != manager_block_size
+            else spec
+            for name, spec in draft_window_specs.items()
+        }
         c8_pages = [
             spec.page_size_bytes
             for spec in target_attention_specs.values()

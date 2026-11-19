@@ -242,6 +242,20 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             or getattr(impl, "is_draft_model", False) is True
         )
 
+        # Window-GQA uses the configured C8 manager page.  Its attention
+        # backend still selects the native kernel block below, so this changes
+        # scheduler/cache ownership only.
+        manager_block_size = getattr(vllm_config.cache_config, "block_size", None)
+        if (
+            is_kimi_c8_config(vllm_config)
+            and layer_is_draft
+            and is_sliding_window_gqa_spec(spec)
+            and isinstance(manager_block_size, int)
+            and manager_block_size > 0
+            and spec.block_size != manager_block_size
+        ):
+            spec = replace(spec, block_size=manager_block_size, page_size_padded=None)
+
         if isinstance(spec, MambaSpec):
             # Keep Mamba groups after attention groups. Ascend graph parameter
             # updates rely on this stable backend ordering.
@@ -382,9 +396,9 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 if spec.real_page_size_bytes <= c8_page and spec.page_size_bytes > c8_page:
                     mamba_specs[name] = replace(spec, page_size_padded=c8_page)
         # Kimi C8: derive one physical page stride for target, Window-GQA draft,
-        # and Mamba.  The draft keeps its native GQA kernel block size; only
-        # its physical page is padded to the 1664-token MLA page so allocation,
-        # slot addressing, and the mixed-page planner use the same block ID.
+        # and Mamba.  Window-GQA's manager block follows the configured cache
+        # block while its kernel block remains backend-selected, so allocation,
+        # slot addressing, and cache views share the same physical block ID.
         # Include the draft attention payload in the common-page calculation.
         # Indexer/SFA auxiliary caches have their own physical pool and must
         # not inflate the MLA page used by the Window-GQA + Mamba pool. The

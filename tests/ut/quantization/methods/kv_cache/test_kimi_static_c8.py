@@ -56,7 +56,7 @@ def test_configuration_rejects_invalid_mode(value):
         ("parallel", "cp_kv_cache_interleave_size", 128, "interleave"),
         ("transfer", "is_kv_producer", True, "KV producer"),
         ("transfer", "kv_connector", "MooncakeConnectorV1", "MooncakeConnectorV2"),
-        ("cache", "block_size", 128, "block_size=1664"),
+        ("cache", "block_size", 128, "interleave"),
     ],
 )
 def test_configuration_checks_model_runner_pd_and_parallel_boundaries(configuration, owner, field, value, error):
@@ -77,3 +77,10 @@ def test_configuration_checks_model_runner_pd_and_parallel_boundaries(configurat
         before = vars(configuration.model_config.hf_text_config).copy()
         options._validate_mla_cache_mode(configuration)
         assert vars(configuration.model_config.hf_text_config) == before
+
+
+def test_configuration_uses_input_block_size_for_c8_dcp(configuration):
+    configuration.cache_config.block_size = 640
+    configuration.parallel_config.cp_kv_cache_interleave_size = 640
+    options = AscendConfig(mla_cache_mode="C8", sparse_kv_offload_config=Ns(enabled=False))
+    options._validate_mla_cache_mode(configuration)
