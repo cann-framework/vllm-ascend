@@ -3,11 +3,14 @@
 
 from contextlib import AbstractContextManager
 from dataclasses import replace
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
+from vllm.config import get_layers_from_vllm_config
 from vllm.distributed import get_dp_group
 from vllm.logger import logger
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as upstream
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp as _dispatch_cg_and_sync_dp
@@ -132,6 +135,56 @@ def dispatch_cg_and_sync_dp(
 
 
 # Adapted from vLLM ced6857afa GPUModelRunner.initialize_kv_cache.
+def _check_attention_cp_compatibility(
+    vllm_config,
+    target_layer_names,
+    replicated_draft_layer_names: frozenset[str] = frozenset(),
+) -> None:
+    """Upstream check_attention_cp_compatibility, CP assertions scoped.
+
+    Upstream asserts MTP-with-CP-interleave and DCP decode-LSE support on every
+    attention layer. A Window-GQA DSpark draft is replicated on every DCP rank
+    and runs its attention under a local DCP size of one (the same criterion
+    that builds cp_size=1 block tables for its group), so the worker-wide CP
+    assertions do not describe it. Keep the full upstream contract for every
+    other layer, including MLA drafts that share the worker-wide DCP.
+    """
+    pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+    dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+    interleave_size = vllm_config.parallel_config.cp_kv_cache_interleave_size
+    if pcp_size * dcp_size <= 1:
+        return
+    layer_type = cast(Any, AttentionLayerBase)
+    layers = get_layers_from_vllm_config(vllm_config, layer_type)
+    for layer_name, layer in layers.items():
+        check_pcp = target_layer_names is None or layer_name in target_layer_names
+        get_attn_backend = getattr(layer, "get_attn_backend", None)
+        if pcp_size > 1 and check_pcp and get_attn_backend is not None:
+            backend = get_attn_backend()
+            assert backend.supports_pcp(), (
+                "PCP requires attention backend support, "
+                f"but {backend.get_name()} does not support PCP."
+            )
+        if layer_name in replicated_draft_layer_names:
+            continue
+        layer_impl = getattr(layer, "impl", None)
+        if layer_impl is None:
+            continue
+        if vllm_config.speculative_config is not None and interleave_size > 1:
+            assert layer_impl.supports_mtp_with_cp_non_trivial_interleave_size, (
+                "MTP with cp_kv_cache_interleave_size > 1 is not "
+                f"supported in {layer_impl.__class__.__name__}."
+            )
+        if dcp_size > 1:
+            assert layer_impl.need_to_return_lse_for_decode, (
+                "Decode Context Parallelism (DCP) requires attention "
+                "implementations to return the softmax LSE during decode, "
+                f"but {layer_impl.__class__.__name__} does not. "
+                "Try a different backend by setting "
+                "--attention-backend or disable DCP."
+            )
+
+
 def initialize_kv_cache(
     self,
     kv_cache_config: KVCacheConfig,
@@ -290,7 +343,22 @@ def initialize_kv_cache(
     )
     if self.cache_config.kv_sharing_fast_prefill and self.pcp_manager is None:
         self.fast_prefill = upstream.FastPrefillHelper(self.cudagraph_manager, self.max_num_tokens)
-    upstream.check_attention_cp_compatibility(self.vllm_config, target_attn_layer_names)
+    # A replicated Window-GQA DSpark draft runs with a local DCP size of one
+    # (cp_size=1 block tables above), so the worker-wide CP interleave and
+    # DCP LSE assertions must not apply to its layers. Every other
+    # configuration keeps the exact upstream check.
+    replicated_draft_layer_names = frozenset(
+        layer_name
+        for group in kv_cache_config.kv_cache_groups
+        if is_sliding_window_gqa_draft_group(group)
+        for layer_name in group.layer_names
+    )
+    if replicated_draft_layer_names:
+        _check_attention_cp_compatibility(
+            self.vllm_config, target_attn_layer_names, replicated_draft_layer_names
+        )
+    else:
+        upstream.check_attention_cp_compatibility(self.vllm_config, target_attn_layer_names)
     if isinstance(self.speculator, upstream.DraftModelSpeculator):
         # HACK(woosuk)
         self.speculator.set_attn(
