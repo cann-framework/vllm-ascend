@@ -1822,11 +1822,12 @@ class AscendMLAImpl(MLAAttentionImpl):
             mask_mode=0 if self.dcp_enabled else 3,
             attn_mask=None if self.dcp_enabled else decode.attn_mask,
         )
+        # Attention has completed on the main stream. Start the deferred gate
+        # before DCP packs and exchanges the output so its MIX_AIC projection
+        # overlaps the pack/AllToAll/LSE combine window.
+        self._late_fork_gate()
         if self.dcp_enabled:
             out = self._merge_dcp_attention_output(out, lse.transpose(0, 1).unsqueeze(-1).contiguous())
-        # Fork the deferred gate here: attention is complete on the main
-        # stream, so the gate only shares the pack/AllToAll/combine window.
-        self._late_fork_gate()
         return self._v_up_proj_batch_major(out), lse
 
     def _stage_gate(self, hidden_states: torch.Tensor, *, defer: bool) -> None:
