@@ -35,6 +35,15 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
     return value == "1"
 
 
+def _moe_mlp_bypass_mode() -> int | None:
+    value = os.getenv("VLLM_ASCEND_MOE_MLP_BYPASS")
+    if value is None:
+        return None
+    if value not in {"0", "1", "2", "3"}:
+        raise ValueError("VLLM_ASCEND_MOE_MLP_BYPASS must be one of 0, 1, 2, or 3, " f"got {value!r}")
+    return int(value)
+
+
 env_variables: dict[str, Callable[[], Any]] = {
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
@@ -93,6 +102,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # Bypass selected Kimi/K3 routed-expert MLP stages for debugging.
+    # Unset (default): disabled. 0: bypass GMM1, SiTU/activation, and GMM2.
+    # 1: bypass GMM1 only. 2: bypass SiTU/activation only. 3: bypass GMM2 only.
+    # Valid values are 0, 1, 2, and 3. This configuration is not sensitive.
+    "VLLM_ASCEND_MOE_MLP_BYPASS": lambda: _moe_mlp_bypass_mode(),
 }
 
 # end-env-vars-definition
