@@ -219,10 +219,22 @@ class LayerPoolKey(PoolKey):
         )
 
 
-def infer_cache_namespace(kv_cache_groups, extra_config: dict[str, Any] | None = None) -> str:
+def _get_cache_salt(extra_config: Mapping[str, Any] | None) -> str:
+    if not extra_config:
+        return "default"
+    cache_salt = extra_config.get("cache_salt")
+    if cache_salt is None:
+        for connector in extra_config.get("connectors", ()):
+            if not isinstance(connector, Mapping) or connector.get("kv_connector") != "AscendStoreConnector":
+                continue
+            cache_salt = (connector.get("kv_connector_extra_config") or {}).get("cache_salt")
+            break
+    return str(cache_salt).strip() if cache_salt is not None and str(cache_salt).strip() else "default"
+
+
+def infer_cache_namespace(kv_cache_groups, extra_config: Mapping[str, Any] | None = None) -> str:
     """Build a stable namespace for a deployed KV format and cache salt."""
-    extra_config = extra_config or {}
-    salt = str(extra_config.get("cache_salt", "default")).strip() or "default"
+    salt = _get_cache_salt(extra_config)
     is_c8 = False
     for group in kv_cache_groups or ():
         spec = getattr(group, "kv_cache_spec", None)
