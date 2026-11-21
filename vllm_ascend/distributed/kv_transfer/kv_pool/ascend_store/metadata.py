@@ -131,6 +131,8 @@ class KeyMetadata:
     cache_role: str = "kv"
     """ Family name for compress-aware hybrid cache layouts """
     cache_family: str = "default"
+    """ Deployment namespace that isolates incompatible cache formats. """
+    namespace: str = "default"
 
 
 @dataclass(order=True)
@@ -148,11 +150,13 @@ class PoolKey:
                 self.key_metadata.kv_cache_group_id,
                 self.key_metadata.cache_role,
                 self.key_metadata.cache_family,
+                self.key_metadata.namespace,
                 self.chunk_hash,
             )
         )
 
     def to_string(self):
+        namespace = f"@namespace:{self.key_metadata.namespace}" if self.key_metadata.namespace != "default" else ""
         return (
             f"{self.key_metadata.model_name}"
             f"@dcp:{self.key_metadata.dcp_rank}"
@@ -161,6 +165,7 @@ class PoolKey:
             f"@group:{self.key_metadata.kv_cache_group_id}"
             f"@cache_role:{self.key_metadata.cache_role}"
             f"@cache_family:{self.key_metadata.cache_family}"
+            f"{namespace}"
             f"@{self.chunk_hash}"
         )
 
@@ -193,12 +198,14 @@ class LayerPoolKey(PoolKey):
                 self.key_metadata.kv_cache_group_id,
                 self.key_metadata.cache_role,
                 self.key_metadata.cache_family,
+                self.key_metadata.namespace,
                 self.chunk_hash,
                 self.layer_id,
             )
         )
 
     def to_string(self):
+        namespace = f"@namespace:{self.key_metadata.namespace}" if self.key_metadata.namespace != "default" else ""
         return (
             f"{self.key_metadata.model_name}"
             f"@dcp:{self.key_metadata.dcp_rank}"
@@ -206,9 +213,24 @@ class LayerPoolKey(PoolKey):
             f"@group:{self.key_metadata.kv_cache_group_id}"
             f"@cache_role:{self.key_metadata.cache_role}"
             f"@cache_family:{self.key_metadata.cache_family}"
+            f"{namespace}"
             f"@layer_id:{self.layer_id}"
             f"@{self.chunk_hash}"
         )
+
+
+def infer_cache_namespace(kv_cache_groups, extra_config: dict[str, Any] | None = None) -> str:
+    """Build a stable namespace for a deployed KV format and cache salt."""
+    extra_config = extra_config or {}
+    salt = str(extra_config.get("cache_salt", "default")).strip() or "default"
+    is_c8 = False
+    for group in kv_cache_groups or ():
+        spec = getattr(group, "kv_cache_spec", None)
+        specs = getattr(spec, "kv_cache_specs", None)
+        values = specs.values() if specs is not None else (spec,)
+        is_c8 = is_c8 or any(getattr(item, "static_fp8_pa_nz", False) for item in values if item is not None)
+    format_name = "c8-pa-nz-v1" if is_c8 else "v1"
+    return f"{format_name}:{salt}"
 
 
 def infer_cache_family_from_ratio(compress_ratio: int | None) -> str:
@@ -375,8 +397,10 @@ class ChunkedTokenDatabase:
         prefix = self._key_prefix_cache.get(cache_key)
         if prefix is None:
             group_metadata = self.metadata[kv_cache_group_id]
+            namespace = f"@namespace:{group_metadata.namespace}" if group_metadata.namespace != "default" else ""
             prefix = (
                 f"{group_metadata.model_name}"
+                f"{namespace}"
                 f"@dcp:{group_metadata.dcp_rank}"
                 f"@head_or_tp_rank:{group_metadata.head_or_tp_rank}"
                 f"@pp_rank:{group_metadata.pp_rank}"
@@ -438,6 +462,7 @@ class ChunkedTokenDatabase:
                 kv_cache_group_id=kv_cache_group_id,
                 cache_role=cache_role,
                 cache_family=cache_family,
+                namespace=group_metadata.namespace,
             ),
             chunk_hash,
         )
