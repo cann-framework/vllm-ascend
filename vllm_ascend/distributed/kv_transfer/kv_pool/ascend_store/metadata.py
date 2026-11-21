@@ -241,6 +241,8 @@ def infer_cache_namespace(kv_cache_groups, extra_config: Mapping[str, Any] | Non
         specs = getattr(spec, "kv_cache_specs", None)
         values = specs.values() if specs is not None else (spec,)
         is_c8 = is_c8 or any(getattr(item, "static_fp8_pa_nz", False) for item in values if item is not None)
+    if not is_c8 and salt == "default":
+        return "default"
     format_name = "c8-pa-nz-v1" if is_c8 else "v1"
     return f"{format_name}:{salt}"
 
