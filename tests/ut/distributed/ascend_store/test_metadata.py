@@ -20,7 +20,10 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import torch
+
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
     ChunkedTokenDatabase,
@@ -34,6 +37,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     get_block_hashes,
     get_group_block_size,
     get_group_cache_family,
+    infer_cache_namespace,
     infer_cache_transfer_granularity,
     infer_dcp_mismatch_info,
     infer_group_block_sizes,
@@ -814,3 +818,42 @@ class TestInferDcpMismatchInfo(unittest.TestCase):
 
     def test_invalid_peer_value_treated_as_local(self):
         self.assertFalse(infer_dcp_mismatch_info("kv_consumer", {"prefill_dcp_size": "bad"}, 2, 1))
+
+
+def test_c8_namespace_is_versioned_and_salted():
+    c8_spec = AscendMLAAttentionSpec(
+        block_size=1664,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float8_e4m3fn,
+        static_fp8_pa_nz=True,
+    )
+    group = SimpleNamespace(kv_cache_spec=c8_spec)
+    assert infer_cache_namespace([group], {"cache_salt": "release-20261121"}) == "c8-pa-nz-v1:release-20261121"
+
+
+def test_c8_namespace_reads_store_connector_salt():
+    c8_spec = AscendMLAAttentionSpec(
+        block_size=1664,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float8_e4m3fn,
+        static_fp8_pa_nz=True,
+    )
+    group = SimpleNamespace(kv_cache_spec=c8_spec)
+    extra_config = {
+        "connectors": [
+            {"kv_connector": "MooncakeConnectorV2"},
+            {
+                "kv_connector": "AscendStoreConnector",
+                "kv_connector_extra_config": {"cache_salt": "release-20261121"},
+            },
+        ]
+    }
+
+    assert infer_cache_namespace([group], extra_config) == "c8-pa-nz-v1:release-20261121"
+
+
+def test_namespace_is_serialized_only_when_non_default():
+    meta = KeyMetadata("llama", 0, 0, 0, namespace="c8-pa-nz-v1:run")
+    assert "@namespace:c8-pa-nz-v1:run" in PoolKey(meta, "hash").to_string()

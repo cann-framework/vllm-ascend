@@ -705,12 +705,36 @@ class AscendConfig:
             raise ValueError("mla_cache_mode=C8 with DCP8 requires cp_kv_cache_interleave_size=1664")
         kv_transfer = getattr(vllm_config, "kv_transfer_config", None)
         if kv_transfer is not None:
+            from vllm_ascend.core.kv_cache_interface import supports_c8_pd_connector
+
             if getattr(kv_transfer, "is_kv_producer", False) and dcp != 1:
                 raise ValueError("mla_cache_mode=C8 KV producer requires decode_context_parallel_size=1")
-            if kv_transfer.kv_connector not in ("MooncakeConnectorV2", "MooncakePullConnector"):
-                raise ValueError("mla_cache_mode=C8 P/D requires MooncakeConnectorV2 or MooncakePullConnector")
+            if not supports_c8_pd_connector(vllm_config):
+                raise ValueError(
+                    "mla_cache_mode=C8 P/D requires MooncakeConnectorV2, "
+                    "MooncakePullConnector, or a supported producer MultiConnector"
+                )
             if dcp == 8 and getattr(vllm_config.cache_config, "block_size", None) != 1664:
                 raise ValueError("mla_cache_mode=C8 P/D with DCP8 requires block_size=1664")
+            if kv_transfer.kv_connector == "MultiConnector":
+                children = (kv_transfer.kv_connector_extra_config or {}).get("connectors", ())
+                store_children = [
+                    child
+                    for child in children
+                    if isinstance(child, dict) and child.get("kv_connector") == "AscendStoreConnector"
+                ]
+                if store_children:
+                    if getattr(kv_transfer, "kv_load_failure_policy", "fail") != "fail":
+                        raise ValueError("C8 Store requires kv_load_failure_policy=fail")
+                    for child in store_children:
+                        store_config = child.get("kv_connector_extra_config") or {}
+                        if store_config.get("load_async", False):
+                            raise ValueError("C8 Store requires load_async=false")
+                        if store_config.get("use_layerwise", False):
+                            raise ValueError("C8 Store first release supports bulk mode only")
+                        cache_salt = store_config.get("cache_salt")
+                        if not isinstance(cache_salt, str) or not cache_salt.strip():
+                            raise ValueError("C8 Store requires a non-empty cache_salt")
 
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):

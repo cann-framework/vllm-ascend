@@ -89,6 +89,42 @@ def requires_padded_page_layout(kv_cache_specs: Iterable[KVCacheSpec]) -> bool:
     return any(getattr(spec, "indexes_kv_by_block_stride", False) for spec in specs)
 
 
+def get_kv_connector_names(kv_transfer_config) -> tuple[str, ...]:
+    """Return registered connector names from a direct or composite config."""
+    name = getattr(kv_transfer_config, "kv_connector", None)
+    if name != "MultiConnector":
+        return (name,) if name else ()
+    extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+    return tuple(
+        child.get("kv_connector")
+        for child in extra_config.get("connectors", ())
+        if isinstance(child, dict) and child.get("kv_connector")
+    )
+
+
+def supports_c8_pd_connector(vllm_config: VllmConfig) -> bool:
+    """Whether the configured connector preserves the C8 raw MLA contract."""
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_transfer_config is None:
+        return True
+    if getattr(kv_transfer_config, "kv_connector_module_path", None) is not None:
+        return False
+
+    name = getattr(kv_transfer_config, "kv_connector", None)
+    if name in ("MooncakeConnectorV2", "MooncakePullConnector"):
+        return True
+    if name != "MultiConnector":
+        return False
+
+    names = get_kv_connector_names(kv_transfer_config)
+    p2p_names = {"MooncakeConnectorV2", "MooncakePullConnector"}
+    if sum(name in p2p_names for name in names) != 1:
+        return False
+    if getattr(kv_transfer_config, "is_kv_producer", False):
+        return len(names) == 2 and names.count("AscendStoreConnector") == 1
+    return "AscendStoreConnector" not in names and set(names) <= p2p_names | {"PreemptOffloadConnector"}
+
+
 def supports_component_major_mla_pd(vllm_config: VllmConfig) -> bool:
     """Whether PD transfer can preserve a component-major MLA cache layout.
 
@@ -111,6 +147,9 @@ def supports_component_major_mla_pd(vllm_config: VllmConfig) -> bool:
     # registry name, so conservatively fall back to the legacy layout.
     if getattr(kv_transfer_config, "kv_connector_module_path", None) is not None:
         return False
+
+    if getattr(vllm_config, "additional_config", {}).get("mla_cache_mode") == "C8":
+        return supports_c8_pd_connector(vllm_config)
 
     return getattr(kv_transfer_config, "kv_connector", None) in {
         "MooncakeConnectorV2",

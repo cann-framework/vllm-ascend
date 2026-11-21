@@ -49,6 +49,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     get_block_hashes,
     get_group_block_size,
     get_group_cache_family,
+    infer_cache_namespace,
     infer_cache_transfer_granularity,
     infer_cacheable_group_ids,
     infer_group_block_sizes,
@@ -89,6 +90,7 @@ class KVPoolScheduler:
         if self.compress_ratios is None:
             self.compress_ratios = getattr(hf_config, "compress_ratios", None)
         kv_cache_groups = kv_cache_config.kv_cache_groups if kv_cache_config is not None else None
+        self.cache_namespace = infer_cache_namespace(kv_cache_groups, extra_config)
         self.use_hybrid = uses_hybrid_kv_cache(vllm_config.scheduler_config, kv_cache_groups) or (
             self.use_block_key_layerwise and kv_cache_groups is not None and len(kv_cache_groups) > 1
         )
@@ -293,6 +295,7 @@ class KVPoolScheduler:
                                 pp_rank,
                                 kv_cache_group_id=kv_cache_group_id,
                                 cache_family=cache_family,
+                                namespace=self.cache_namespace,
                             ),
                             chunk_hash,
                         )
