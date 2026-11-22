@@ -729,6 +729,19 @@ def enabling_mlapo(vllm_config: VllmConfig) -> bool:
     return bool(config_val and is_decode_instance)
 
 
+def _is_window_gqa_dspark_draft(speculative_config: SpeculativeConfig) -> bool:
+    """Whether this DSpark run drafts with a fixed sliding-window GQA model.
+
+    Imported lazily from the proposer module, which imports the attention
+    backends and would form an import cycle with this module.
+    """
+    from vllm_ascend.spec_decode.dspark_proposer import _is_window_gqa_draft
+
+    draft_config = getattr(speculative_config, "draft_model_config", None)
+    hf_config = getattr(draft_config, "hf_config", None) if draft_config is not None else None
+    return hf_config is not None and _is_window_gqa_draft(hf_config)
+
+
 def _select_seq_lens(
     common_attn_metadata: AscendCommonAttentionMetadata,
     kv_cache_spec: AttentionSpec | None,
@@ -740,10 +753,15 @@ def _select_seq_lens(
     Defaults to the CPU mirror: ``_seq_lens_cpu`` is always available and
     updated during draft iterations, while ``seq_lens_cpu`` is None in async
     spec decode mode. Cross-attention and generic parallel drafting override
-    this with the NPU ``seq_lens``; the one exception is DSpark on the GLM5.2
+    this with the NPU ``seq_lens``; the exceptions are DSpark on the GLM5.2
     family, whose CPU mirror carries the same post-rejection-sampling lengths
-    across draft iterations, so building from it skips the NPU->CPU sync at
-    ``seq_lens.tolist()`` in the metadata build.
+    across draft iterations, and Window-GQA DSpark drafts (e.g. Kimi K3 SWA),
+    which build from the uncorrected upper-bound progression
+    (``num_computed + scheduled + draft width``) like the DCP MLA draft in
+    ``dcp_utils.prepare_draft_dcp_metadata_inputs``. Both skip the NPU->CPU
+    sync at ``seq_lens.tolist()`` in the metadata build, which otherwise
+    opens a bubble between the target and the draft (PR #17184/#17571
+    measured no meaningful acceptance impact for the same trade-off).
     """
     # Prefer _seq_lens_cpu (always available, updated during draft
     # iterations) over seq_lens_cpu (None in async spec decode mode).
@@ -760,8 +778,15 @@ def _select_seq_lens(
         seq_lens = common_attn_metadata.seq_lens
     if speculative_config is not None and speculative_config.parallel_drafting:
         # PARD / DFlash (and DSpark on other models) keep the NPU seq_lens;
-        # only DSpark on the GLM5.2 family keeps the CPU mirror above.
-        if not (speculative_config.use_dspark() and _is_glm_model(model_config)):
+        # only DSpark on the GLM5.2 family and Window-GQA drafts keep the
+        # CPU mirror above.
+        if not (
+            speculative_config.use_dspark()
+            and (
+                _is_glm_model(model_config)
+                or _is_window_gqa_dspark_draft(speculative_config)
+            )
+        ):
             seq_lens = common_attn_metadata.seq_lens
     return seq_lens
 
