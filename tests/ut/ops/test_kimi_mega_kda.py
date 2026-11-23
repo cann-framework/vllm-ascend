@@ -95,6 +95,7 @@ def runtime():
             "ensure_mega_kda_bf16",
             "ensure_mega_kda_nd",
             "mega_kda_nz_operand",
+            "mega_kda_projection_weight",
             "run_mega_recurrent_kda",
             "run_commit_recurrent_kda",
         },
