@@ -199,6 +199,16 @@ def _align_hybrid_attention_page_sizes(kv_cache_specs: dict[str, KVCacheSpec]) -
             )
 
 
+def _dspark_draft_active(vllm_config: VllmConfig) -> bool:
+    """Whether a DSpark draft model is loaded alongside the target model."""
+    spec_config = vllm_config.speculative_config
+    return (
+        spec_config is not None
+        and spec_config.method == "dspark"
+        and getattr(spec_config, "draft_model_config", None) is not None
+    )
+
+
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     """Build Ascend-specific KV cache specs for v2 worker patching."""
     from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
@@ -225,6 +235,15 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             c8_k_scale_cache_dtype = torch.float16
 
     c8_cache_dtype = kv_cache_dtype_str_to_dtype(vllm_config.cache_config.cache_dtype, vllm_config.model_config)
+
+    # Non-C8 DSpark draft: double the manager block for Window-GQA draft
+    # layers. Enabled only for MLA targets whose draft owns every ordinary
+    # sliding-window GQA layer in the model.
+    window_gqa_double_block = (
+        not is_kimi_c8_config(vllm_config)
+        and getattr(vllm_config.model_config, "use_mla", False)
+        and _dspark_draft_active(vllm_config)
+    )
 
     for layer_name, attn_module in attn_layers.items():
         if getattr(attn_module, "kv_sharing_target_layer_name", None):
@@ -255,6 +274,26 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             and spec.block_size != manager_block_size
         ):
             spec = replace(spec, block_size=manager_block_size, page_size_padded=None)
+        elif (
+            window_gqa_double_block
+            and is_sliding_window_gqa_spec(spec)
+            and isinstance(manager_block_size, int)
+            and manager_block_size > 0
+            and spec.block_size != 2 * manager_block_size
+            and spec.block_size > 0
+            and (2 * manager_block_size) % spec.block_size == 0
+        ):
+            # Without C8 the Window-GQA draft keeps its backend-native kernel
+            # block (128 tokens), so a 2048-token window spans
+            # cdiv(2047, 128) + 1 = 17 scheduler blocks, each padded up to the
+            # shared MLA/Mamba physical page.  Doubling the manager block cuts
+            # the window cost to cdiv(2047, 2 * block) + 1 blocks while the
+            # Window-GQA page stays below the MLA page (the Kimi-K3 geometry
+            # spends 2 * block * 512B on the draft versus block * 1152B on
+            # MLA), so the MLA/Mamba page remains the pool's physical stride.
+            # The backend still splits the doubled block into its native
+            # kernel blocks because the division check above holds.
+            spec = replace(spec, block_size=2 * manager_block_size, page_size_padded=None)
 
         if isinstance(spec, MambaSpec):
             # Keep Mamba groups after attention groups. Ascend graph parameter
