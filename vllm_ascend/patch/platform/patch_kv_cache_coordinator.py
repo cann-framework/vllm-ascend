@@ -93,13 +93,9 @@ def _manager_spec(spec: KVCacheSpec, kv_cache_group=None) -> KVCacheSpec:
     if isinstance(spec, UniformTypeKVCacheSpecs):
         spec = next(iter(spec.kv_cache_specs.values()))
 
-    # When the hybrid KV-cache manager is disabled, upstream represents a
-    # sliding-window layer as FullAttentionSpec(sliding_window=...).  That
-    # representation is sufficient for the attention kernel, but it selects
-    # FullAttentionManager and therefore allocates/retains every prefix block.
-    # Window-GQA DSpark is replicated per DCP rank and must use the recycling
-    # manager even in this mode. Convert only the explicitly marked draft
-    # group; target MLA/full-attention groups keep their original spec.
+    # With the hybrid manager disabled, a sliding-window layer becomes
+    # FullAttentionSpec(sliding_window=...), which selects the non-recycling
+    # manager.  Convert only the marked draft group back to SlidingWindowSpec.
     if (
         kv_cache_group is not None
         and getattr(kv_cache_group, "is_eagle_group", False)

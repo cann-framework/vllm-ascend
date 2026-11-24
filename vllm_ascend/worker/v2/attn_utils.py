@@ -236,9 +236,8 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
 
     c8_cache_dtype = kv_cache_dtype_str_to_dtype(vllm_config.cache_config.cache_dtype, vllm_config.model_config)
 
-    # Non-C8 DSpark draft: double the manager block for Window-GQA draft
-    # layers. Enabled only for MLA targets whose draft owns every ordinary
-    # sliding-window GQA layer in the model.
+    # Non-C8 DSpark: double the manager block for Window-GQA draft layers
+    # only; layer_is_draft keeps target-side sliding-window layers untouched.
     window_gqa_double_block = (
         not is_kimi_c8_config(vllm_config)
         and getattr(vllm_config.model_config, "use_mla", False)
@@ -261,9 +260,8 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             or getattr(impl, "is_draft_model", False) is True
         )
 
-        # Window-GQA uses the configured C8 manager page.  Its attention
-        # backend still selects the native kernel block below, so this changes
-        # scheduler/cache ownership only.
+        # Window-GQA uses the C8 manager page; the backend still picks its
+        # native kernel block below.
         manager_block_size = getattr(vllm_config.cache_config, "block_size", None)
         if (
             is_kimi_c8_config(vllm_config)
@@ -276,6 +274,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             spec = replace(spec, block_size=manager_block_size, page_size_padded=None)
         elif (
             window_gqa_double_block
+            and layer_is_draft
             and is_sliding_window_gqa_spec(spec)
             and isinstance(manager_block_size, int)
             and manager_block_size > 0
@@ -283,16 +282,9 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             and spec.block_size > 0
             and (2 * manager_block_size) % spec.block_size == 0
         ):
-            # Without C8 the Window-GQA draft keeps its backend-native kernel
-            # block (128 tokens), so a 2048-token window spans
-            # cdiv(2047, 128) + 1 = 17 scheduler blocks, each padded up to the
-            # shared MLA/Mamba physical page.  Doubling the manager block cuts
-            # the window cost to cdiv(2047, 2 * block) + 1 blocks while the
-            # Window-GQA page stays below the MLA page (the Kimi-K3 geometry
-            # spends 2 * block * 512B on the draft versus block * 1152B on
-            # MLA), so the MLA/Mamba page remains the pool's physical stride.
-            # The backend still splits the doubled block into its native
-            # kernel blocks because the division check above holds.
+            # Doubling the manager block halves the scheduler blocks a window
+            # spans; the draft page stays below the MLA page, and the backend
+            # still splits it into native kernel blocks.
             spec = replace(spec, block_size=2 * manager_block_size, page_size_padded=None)
 
         if isinstance(spec, MambaSpec):
@@ -434,20 +426,25 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             for name, spec in list(mamba_specs.items()):
                 if spec.real_page_size_bytes <= c8_page and spec.page_size_bytes > c8_page:
                     mamba_specs[name] = replace(spec, page_size_padded=c8_page)
-        # Kimi C8: derive one physical page stride for target, Window-GQA draft,
-        # and Mamba.  Window-GQA's manager block follows the configured cache
-        # block while its kernel block remains backend-selected, so allocation,
-        # slot addressing, and cache views share the same physical block ID.
-        # Include the draft attention payload in the common-page calculation.
-        # Indexer/SFA auxiliary caches have their own physical pool and must
-        # not inflate the MLA page used by the Window-GQA + Mamba pool. The
-        # draft keeps its native logical block size; only its physical stride
-        # must fit in the shared C8/MLA page.
-        page_pool = [
-            *c8_attention_specs,
-            *[spec for spec in kv_cache_spec.values() if is_sliding_window_gqa_spec(spec)],
-            *mamba_specs.values(),
-        ]
+        # Kimi C8: one physical page stride for target, Window-GQA draft, and
+        # Mamba; indexer/SFA auxiliary caches keep their own pools.
+        if c8_attention_specs:
+            page_pool = [
+                *c8_attention_specs,
+                *[spec for spec in kv_cache_spec.values() if is_sliding_window_gqa_spec(spec)],
+                *mamba_specs.values(),
+            ]
+        else:
+            # C8 declared but no layer produced a C8 page; keep the baseline
+            # shared-page fallback.
+            logger.warning(
+                "mla_cache_mode=C8 was declared but no target attention layer produced "
+                "a C8 static-FP8 page; using the shared non-C8 page layout."
+            )
+            page_pool = [
+                *kv_cache_spec.values(),
+                *mamba_specs.values(),
+            ]
         common_page_size = max(spec.page_size_bytes for spec in page_pool)
         c8_page_alignments = [spec.static_fp8_kernel_block_size * spec.static_fp8_width for spec in c8_attention_specs]
         if c8_page_alignments:
@@ -455,10 +452,8 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             common_page_size = _align_up(common_page_size, alignment)
         for layer_name in attention_layer_names:
             spec = kv_cache_spec[layer_name]
-            # Preserve the original C8 behavior for ordinary MLA DSpark
-            # layers.  Window-GQA is the only draft layout that must share
-            # the physical C8 page stride; regular draft MLA keeps its own
-            # cache page and therefore must remain outside this padding path.
+            # Draft MLA keeps its own page; only Window-GQA shares the C8
+            # page stride.
             if (
                 c8_attention_specs
                 and getattr(attn_layers[layer_name].impl, "is_draft_cache", False)

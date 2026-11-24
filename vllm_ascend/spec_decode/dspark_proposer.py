@@ -392,10 +392,8 @@ class AscendDSparkProposer(AscendDflashProposer):
 
     def load_model(self, model: torch.nn.Module) -> None:
         """Use the checkpoint's native Window-GQA history when no override exists."""
-        # ``AscendSpecDecodeBaseProposer.load_model`` calls the draft
-        # ``post_process`` hook with ``self.vllm_config``.  A Window-GQA draft
-        # must see the local DCP=1 topology during that hook as well; otherwise
-        # its cache layout is initialized with the target MLA DCP settings.
+        # The post_process hook must see the draft's DCP=1 topology; the
+        # target config would initialize the cache layout with MLA DCP.
         target_vllm_config = self.vllm_config
         if self._window_gqa_dcp_fallback:
             self.vllm_config = self._get_draft_forward_vllm_config()

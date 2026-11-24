@@ -88,10 +88,8 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         if self._native_num_speculative_steps is not None:
             self._use_native_window_gqa_width()
         if self._window_gqa_dcp_fallback:
-            # The generic DFlash initializer derives this from the model's
-            # non-causal flags.  Window-GQA checkpoints may still expose the
-            # MLA hook, but their FIA call uses sparse_mode=4 and must retain
-            # the checkpoint's causal setting so a mask is generated.
+            # Window-GQA FIA uses sparse_mode=4, so keep the checkpoint's
+            # causal setting (the DFlash initializer may assume non-causal).
             dflash_config = _draft_config_value(self.draft_model_config.hf_config, "dflash_config")
             self._group_causal = bool(_mapping_value(dflash_config, "causal", True))
         self._init_dcp()
@@ -135,10 +133,8 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
                 native_steps,
             )
         if self.draft_logits is not None:
-            # Current vLLM exposes this as a tensor.  A few development
-            # branches wrapped it in a ``DraftLogitsCache`` with a ``values``
-            # member, so preserve either representation while widening only
-            # the step dimension.
+            # Widen only the step dimension; handle both a plain tensor and
+            # a DraftLogitsCache-wrapped buffer.
             cache = self.draft_logits
             cache_values = cache if isinstance(cache, torch.Tensor) else getattr(cache, "values", cache)
             widened = cache_values.new_zeros(cache_values.shape[0], native_steps, cache_values.shape[2])
@@ -337,8 +333,7 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         target_attn_groups: Any,
     ) -> None:
         if self._window_gqa_dcp_fallback:
-            # Keep the shared per-group topology, but expose a scalar DCP=1
-            # view to upstream draft input preparation.
+            # Expose a scalar DCP=1 view of the shared per-group topology.
             block_tables = copy(block_tables)
             block_tables.cp_size = 1
             block_tables.cp_rank = 0
@@ -522,10 +517,8 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
     ) -> torch.Tensor:
         if self._window_gqa_dcp_fallback:
             draft_vllm_config = self.attn_vllm_config
-            # The upstream implementation already installs the complete
-            # forward context and invokes the model with the current runner
-            # contract. Temporarily swap only the config so all of those
-            # details are retained while attention sees DCP=1.
+            # Swap only the config so attention sees DCP=1; the upstream
+            # implementation retains the rest of the forward context.
             target_vllm_config = self.vllm_config
             self.vllm_config = draft_vllm_config
             try:

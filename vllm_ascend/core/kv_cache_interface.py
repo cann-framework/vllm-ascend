@@ -55,10 +55,9 @@ def is_circular_kv_cache_spec(kv_cache_spec: KVCacheSpec) -> bool:
 def is_sliding_window_gqa_spec(kv_cache_spec: KVCacheSpec) -> bool:
     """Return whether a spec is an ordinary sliding-window GQA cache.
 
-    Sliding-window MLA and circular indexer-tail specs share the upstream
-    ``SlidingWindowSpec`` base class, but they have different layouts and DCP
-    rules.  Only ordinary GQA draft pages are replicated when the target MLA
-    runs with worker-wide DCP.
+    Sliding-window MLA and circular indexer-tail specs share the
+    ``SlidingWindowSpec`` base class but follow different DCP rules; only
+    ordinary GQA draft pages are replicated under worker-wide DCP.
     """
     if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
         specs = tuple(kv_cache_spec.kv_cache_specs.values())
@@ -68,19 +67,15 @@ def is_sliding_window_gqa_spec(kv_cache_spec: KVCacheSpec) -> bool:
     if is_circular_kv_cache_spec(kv_cache_spec):
         return False
 
-    # With the hybrid KV-cache manager disabled, vLLM promotes an ordinary
-    # SlidingWindowSpec to FullAttentionSpec(sliding_window=...).  The layer
-    # still executes sliding-window attention, but its cache manager spec no
-    # longer has the SlidingWindowSpec type. Keep both representations under
-    # the same predicate so DCP fallback and replicated block tables do not
-    # depend on that scheduler option.
+    # With the hybrid manager disabled, vLLM promotes an ordinary
+    # SlidingWindowSpec to FullAttentionSpec(sliding_window=...); keep both
+    # representations under the same predicate.
     if isinstance(kv_cache_spec, SlidingWindowSpec):
         return True
     return (
         isinstance(kv_cache_spec, FullAttentionSpec)
         and kv_cache_spec.sliding_window is not None
-        # R-SWA uses a FullAttentionSpec-derived cache with a window field,
-        # but its prefix/gap semantics are different from ordinary GQA.
+        # R-SWA carries a window field but different prefix/gap semantics.
         and not hasattr(kv_cache_spec, "rswa_window")
     )
 

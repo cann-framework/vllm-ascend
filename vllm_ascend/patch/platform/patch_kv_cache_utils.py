@@ -382,27 +382,16 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
         }
 
         if not draft_attention_specs:
-            # A Window-GQA-only draft shares no block table with the target
-            # MLA layers, so the unequal groups built below have no sharing
-            # benefit: the pool's per-block stride comes from the largest
-            # group (e.g. the Mamba groups) while the draft group only fills
-            # its 5 layers, wasting (largest_group - draft_group) layer pages
-            # of physical pool bytes on every draft block allocation. Hand
-            # the specs back to vLLM's uniform-page grouping, which sizes
-            # every group by the smallest bucket (the Window-GQA draft),
-            # matching the C16 path. All draft/Mamba pages are first aligned
-            # onto the C8 target page: the platform hook may have padded the
-            # Mamba page to the bf16 attention page (larger than the C8
-            # page), and a page larger than the C8 page left in the specs
-            # would make ``unify_kv_cache_spec_page_size`` scale the target
-            # block size up instead of padding, so fall back to the custom
-            # grouping whenever a state page cannot shrink onto the C8 page.
+            # A Window-GQA-only draft gains nothing from sharing the target's
+            # block table (the pool stride would come from the larger Mamba
+            # group and waste per-layer pages).  Hand the specs back to vLLM's
+            # uniform-page grouping after aligning every page onto the C8
+            # target page, so unify_kv_cache_spec_page_size pads instead of
+            # scaling the target block.
             c8_page = min(c8_pages)
             if (
-                # A quantization-rollback or fa_quant target layer keeps a
-                # non-C8 page; the custom mixed-page grouping below handles
-                # it, while the handback would leave that page for
-                # ``unify_kv_cache_spec_page_size`` to scale the C8 blocks up.
+                # A non-C8 target page (quantization rollback or fa_quant)
+                # needs the custom mixed-page grouping below.
                 all(spec.page_size_bytes == c8_page for spec in target_attention_specs.values())
                 and all(
                     spec.real_page_size_bytes <= c8_page
@@ -1086,9 +1075,17 @@ def _ascend_sliding_window_max_memory_usage_bytes(
     vllm_config: VllmConfig,
 ) -> int:
     """Size replicated Window-GQA pages without applying worker-wide DCP."""
+    # Key the exemption on the draft checkpoint so a hypothetical
+    # sliding-window target keeps upstream's DCP assertion.  Lazy import:
+    # the proposer pulls in the attention backends.
+    from vllm_ascend.spec_decode.dspark_proposer import _is_window_gqa_draft
+
     speculative_config = getattr(vllm_config, "speculative_config", None)
+    draft_config = getattr(speculative_config, "draft_model_config", None)
     is_window_gqa_draft = (
         getattr(speculative_config, "method", None) == "dspark"
+        and draft_config is not None
+        and _is_window_gqa_draft(draft_config.hf_config)
         and is_sliding_window_gqa_spec(self)
     )
     dcp_size = vllm_config.parallel_config.decode_context_parallel_size
