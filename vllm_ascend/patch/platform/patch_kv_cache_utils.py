@@ -381,41 +381,6 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
             for name, spec in mamba_specs.items()
         }
 
-        if not draft_attention_specs:
-            # A Window-GQA-only draft gains nothing from sharing the target's
-            # block table (the pool stride would come from the larger Mamba
-            # group and waste per-layer pages).  Hand the specs back to vLLM's
-            # uniform-page grouping after aligning every page onto the C8
-            # target page, so unify_kv_cache_spec_page_size pads instead of
-            # scaling the target block.
-            c8_page = min(c8_pages)
-            if (
-                # A non-C8 target page (quantization rollback or fa_quant)
-                # needs the custom mixed-page grouping below.
-                all(spec.page_size_bytes == c8_page for spec in target_attention_specs.values())
-                and all(
-                    spec.real_page_size_bytes <= c8_page
-                    for spec in (*draft_window_specs.values(), *mamba_specs.values())
-                )
-            ):
-                kv_cache_spec.update(
-                    {
-                        name: replace(spec, page_size_padded=c8_page)
-                        if spec.page_size_bytes != c8_page
-                        else spec
-                        for name, spec in draft_window_specs.items()
-                    }
-                )
-                kv_cache_spec.update(
-                    {
-                        name: replace(spec, page_size_padded=c8_page)
-                        if spec.page_size_bytes != c8_page
-                        else spec
-                        for name, spec in mamba_specs.items()
-                    }
-                )
-                return None
-
     first_mamba_spec = next(iter(mamba_specs.values()))
     if any(spec != first_mamba_spec for spec in mamba_specs.values()):
         return None
