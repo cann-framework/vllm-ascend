@@ -1409,11 +1409,13 @@ class AscendKimiLinearForCausalLM(UpstreamKimiLinearForCausalLM, KimiMixtureOfEx
         parent_hook = getattr(super(), "process_weights_after_loading", None)
         if parent_hook is not None:
             parent_hook()
-        if not get_ascend_config().enable_mega_kda_replayssm:
-            return
+        prepare_mega = get_ascend_config().enable_mega_kda_replayssm
         for module in self.model.modules():
             if isinstance(module, AscendKimiK3DeltaAttentionBase):
-                module._prepare_mega_weights()
+                if module.uses_mixed_projection:
+                    module.prepare_prefill_gate_weights()
+                if prepare_mega:
+                    module._prepare_mega_weights()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)

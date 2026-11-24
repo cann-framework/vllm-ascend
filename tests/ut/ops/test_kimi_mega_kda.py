@@ -131,6 +131,10 @@ def runtime():
         "_release_default_kda_weights",
         "_released_mega_nd_params",
         "_forward_default",
+        "_is_eager_prefill_batch",
+        "_run_serial_prefill_qkv_bfg",
+        "_format_bfg",
+        "prepare_prefill_gate_weights",
         "_current_mega_weight_signature",
         "_forward_mega_kda",
         "_execute_mega_kda",
@@ -403,6 +407,65 @@ def test_mixed_projection_uses_original_factors(runtime):
     torch.testing.assert_close(weights.f_b, layer.fused_bfg_proj.f_b_weight)
 
 
+@pytest.mark.parametrize("fused_prefill", [True, False])
+def test_serial_prefill_uses_original_factors_and_qkv_dispatch(runtime, fused_prefill):
+    from einops import rearrange
+
+    layer = _attention(runtime)
+    layer.uses_mixed_projection = True
+    layer._prefill_fused_kda_operator = object() if fused_prefill else None
+    layer._fused_bfg_output_sizes = (2, 8, 8)
+    mx_method = type("MXFP8", (), {})
+    runtime.update(AscendW8A8MXFP8DynamicLinearMethod=mx_method, maybe_trans_nz=torch.clone, rearrange=rearrange)
+    layer.in_proj_qkvgfab.quant_method = SimpleNamespace(quant_method=mx_method())
+    packed = torch.randn(18, 32, dtype=torch.bfloat16)
+    packed[2:10].fill_(float("nan"))  # A dense F projection would propagate NaNs.
+    fused = layer.fused_bfg_proj = _linear(packed)
+    fused.f_a_weight = torch.randn(4, 32, dtype=torch.bfloat16)
+    fused.f_b_weight = torch.randn(8, 4, dtype=torch.bfloat16)
+    layer.prepare_prefill_gate_weights()
+    packed[:2].neg_()
+    layer.prepare_prefill_gate_weights()  # Refresh B/G after a checkpoint reload.
+
+    x = torch.randn(5, 32, dtype=torch.bfloat16)
+    qkv = torch.randn(5, 24, dtype=x.dtype)
+    layer._quantize_fused_qkv = MagicMock(return_value=object())
+    layer._matmul_fused_qkv = MagicMock(return_value=qkv)
+    layer._forward = MagicMock()
+    layer.o_proj = MagicMock(return_value=(x, None))
+    layer._run_overlapped_qkv_bfg = MagicMock(side_effect=AssertionError("unexpected overlap"))
+    meta = SimpleNamespace(num_prefills=1, num_decodes=0, num_spec_decodes=0)
+    runtime["is_forward_context_available"] = lambda: True
+    runtime["get_forward_context"].return_value = SimpleNamespace(
+        cudagraph_runtime_mode="none", attn_metadata={layer.prefix: meta}
+    )
+    type(layer)._forward_default(layer, x, torch.arange(5))
+    layer._quantize_fused_qkv.assert_called_once_with(x)
+    layer._matmul_fused_qkv.assert_called_once_with(layer._quantize_fused_qkv.return_value)
+    out = layer._forward.call_args.kwargs
+    assert out["mixed_qkv"] is qkv
+    assert out["beta_is_preprocessed"] is (not fused_prefill)
+    raw_beta = x @ packed[:2].T
+    torch.testing.assert_close(out["beta"], (raw_beta if fused_prefill else raw_beta.float().sigmoid()).unsqueeze(0))
+    torch.testing.assert_close(out["g1"], ((x @ fused.f_a_weight.T) @ fused.f_b_weight.T).reshape(1, 5, 2, 4))
+    torch.testing.assert_close(out["g2"], (x @ packed[10:].T).reshape(5, 2, 4))
+
+
+@pytest.mark.parametrize("counts", [(0, 1, 0), (0, 0, 1), (1, 1, 0), (1, 0, 1)])
+def test_serial_prefill_excludes_decode_and_mixed_batches(runtime, counts):
+    layer = _attention(runtime)
+    meta = SimpleNamespace(num_prefills=counts[0], num_decodes=counts[1], num_spec_decodes=counts[2])
+    ctx = SimpleNamespace(cudagraph_runtime_mode="none", attn_metadata={layer.prefix: meta})
+    runtime["is_forward_context_available"] = lambda: True
+    runtime["get_forward_context"].return_value = ctx
+    assert not layer._is_eager_prefill_batch()
+    meta.num_prefills, meta.num_decodes, meta.num_spec_decodes = 1, 0, 0
+    ctx.cudagraph_runtime_mode = "full"
+    assert not layer._is_eager_prefill_batch()
+    ctx.cudagraph_runtime_mode, ctx.attn_metadata = "none", None
+    assert not layer._is_eager_prefill_batch()
+
+
 def test_tracker_prefill_verify_reorder_single_token_reuse_and_repeat(runtime):
     tracker = runtime["MegaKDAFirstVerifyTracker"](16, torch.device("cpu"))
     slots = torch.tensor([2, 5])
@@ -509,16 +572,19 @@ def test_builder_uses_bound_capacity_and_resets_folded_prefill(runtime, graph_ba
     assert builder.build(0, common, None, drafts).mega_first_verify.tolist() == [1, 0] + [0] * (graph_batch - 2)
 
 
-def test_model_postload_visits_only_target_attention_and_mm_forwards(runtime):
+@pytest.mark.parametrize("enable_mega", [False, True])
+def test_model_postload_visits_only_target_attention_and_mm_forwards(runtime, enable_mega):
     target_type = runtime["AscendKimiK3DeltaAttention"]
     target = _attention(runtime)
+    target.uses_mixed_projection = True
+    target.prepare_prefill_gate_weights = MagicMock()
     target._prepare_mega_weights = MagicMock()
     other = nn.Linear(2, 2)
     other._prepare_mega_weights = MagicMock()
     runtime.update(
         UpstreamKimiLinearForCausalLM=nn.Module,
         AscendKimiK3DeltaAttentionBase=target_type,
-        get_ascend_config=lambda: SimpleNamespace(enable_mega_kda_replayssm=True),
+        get_ascend_config=lambda: SimpleNamespace(enable_mega_kda_replayssm=enable_mega),
     )
     _definitions(
         "vllm_ascend/models/kimi_k3.py",
@@ -530,7 +596,8 @@ def test_model_postload_visits_only_target_attention_and_mm_forwards(runtime):
     model = runtime["AscendKimiLinearForCausalLM"]()
     model.model = nn.ModuleList([target, other])
     model.process_weights_after_loading()
-    target._prepare_mega_weights.assert_called_once()
+    target.prepare_prefill_gate_weights.assert_called_once_with()
+    assert target._prepare_mega_weights.call_count == int(enable_mega)
     other._prepare_mega_weights.assert_not_called()
     _definitions(
         "vllm_ascend/models/kimi_k3.py",
@@ -542,7 +609,8 @@ def test_model_postload_visits_only_target_attention_and_mm_forwards(runtime):
     multimodal = runtime["AscendKimiK3ForConditionalGeneration"]()
     multimodal.language_model = model
     multimodal.process_weights_after_loading()
-    assert target._prepare_mega_weights.call_count == 2
+    assert target.prepare_prefill_gate_weights.call_count == 2
+    assert target._prepare_mega_weights.call_count == (2 if enable_mega else 0)
 
 
 def test_custom_op_reduces_already_projected_output_once(runtime):

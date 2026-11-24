@@ -17,8 +17,9 @@ from einops import rearrange
 from fla_npu.ops.ascendc import causal_conv1d_fn, causal_conv1d_update
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture, is_breakable_cudagraph_enabled
+from vllm.config import CUDAGraphMode
 from vllm.distributed import tensor_model_parallel_all_reduce
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import logger
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -70,7 +71,7 @@ from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import (
     AscendW8A8MXFP8DynamicLinearMethod,
 )
-from vllm_ascend.utils import npu_stream_switch
+from vllm_ascend.utils import maybe_trans_nz, npu_stream_switch
 
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
 _F_PROJ_SHARD_ID = 1
@@ -410,6 +411,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
 
     # Worker startup prepares this layer after KV-cache binding.
     _requires_kda_state_copy = True
+    _prefill_gate_weights: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def get_kv_cache_spec(self, vllm_config):
         spec = super().get_kv_cache_spec(vllm_config)
@@ -719,7 +721,10 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             )
         if self.uses_mixed_projection:
             num_tokens = hidden_states.size(0)
-            mixed_qkv, beta, g1, g2 = self._run_overlapped_qkv_bfg(hidden_states)
+            if self._prefill_gate_weights is not None and self._is_eager_prefill_batch():
+                mixed_qkv, beta, g1, g2 = self._run_serial_prefill_qkv_bfg(hidden_states, *self._prefill_gate_weights)
+            else:
+                mixed_qkv, beta, g1, g2 = self._run_overlapped_qkv_bfg(hidden_states)
             core_attn_out = torch.empty(
                 (1, num_tokens, self.local_num_heads, self.head_dim),
                 dtype=hidden_states.dtype,
@@ -1126,6 +1131,35 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             output = tensor_model_parallel_all_reduce(output)
         return output
 
+    def prepare_prefill_gate_weights(self) -> None:
+        """Extract rank-local B/G after loading; keep the original low-rank F factors."""
+        method = self.in_proj_qkvgfab.quant_method
+        if not isinstance(getattr(method, "quant_method", method), AscendW8A8MXFP8DynamicLinearMethod):
+            return
+        packed = ensure_mega_kda_nd(self.fused_bfg_proj.weight.detach())
+        beta, _, gate = packed.split(self._fused_bfg_output_sizes, dim=0)
+        self._prefill_gate_weights = (maybe_trans_nz(beta), maybe_trans_nz(gate))
+
+    def _is_eager_prefill_batch(self) -> bool:
+        # Read the live batch only in eager execution, outside Dynamo tracing.
+        if torch.compiler.is_compiling() or not is_forward_context_available():
+            return False
+        ctx = get_forward_context()
+        if ctx.cudagraph_runtime_mode != CUDAGraphMode.NONE or not isinstance(ctx.attn_metadata, dict):
+            return False
+        meta = ctx.attn_metadata.get(self.prefix)
+        return meta is not None and meta.num_prefills > 0 and meta.num_decodes == 0 and meta.num_spec_decodes == 0
+
+    def _run_serial_prefill_qkv_bfg(
+        self, hidden_states: torch.Tensor, beta_weight: torch.Tensor, gate_weight: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        fused = self.fused_bfg_proj
+        output_gate = nn.functional.linear(hidden_states, gate_weight)
+        mixed_qkv = self._matmul_fused_qkv(self._quantize_fused_qkv(hidden_states))
+        raw_gate = nn.functional.linear(nn.functional.linear(hidden_states, fused.f_a_weight), fused.f_b_weight)
+        beta = nn.functional.linear(hidden_states, beta_weight)
+        return mixed_qkv, *self._format_bfg(beta, raw_gate, output_gate)
+
     def _run_overlapped_qkv_bfg(
         self,
         hidden_states: torch.Tensor,
@@ -1181,10 +1215,11 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         self,
         fused_bfg: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        beta, raw_gate, output_gate = fused_bfg.split(
-            self._fused_bfg_output_sizes,
-            dim=-1,
-        )
+        return self._format_bfg(*fused_bfg.split(self._fused_bfg_output_sizes, dim=-1))
+
+    def _format_bfg(
+        self, beta: torch.Tensor, raw_gate: torch.Tensor, output_gate: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if getattr(self, "_prefill_fused_kda_operator", None) is None:
             beta = beta.float().sigmoid().unsqueeze(0)
         else:
