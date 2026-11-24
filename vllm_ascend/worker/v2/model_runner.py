@@ -1280,28 +1280,24 @@ class NPUModelRunner(GPUModelRunner):
         return output
 
     def _can_skip_spec_cpu_length_sync(self) -> bool:
-        """Use device lengths when the target and draft own separate lengths.
+        """Skip the staged D2H only when no host reader needs the mirror.
 
-        Window-GQA DSpark is deliberately replicated on every DCP rank.  Its
-        GQA backend derives the valid window length from the device-side
-        positions, so copying rejection-corrected target counters back to the
-        host here only adds a synchronization point and can make the next
-        draft step wait.  Keep the existing FlashMLA condition for regular
-        DSpark and add the same guarded path for Window-GQA.
+        The staged D2H refreshes ``req_states.num_computed_tokens_np`` with
+        the device's rejection-corrected counters.  Both DSpark draft
+        families build their host lengths from that mirror: the DCP MLA
+        draft through ``input_buffers.seq_lens_cpu`` and the Window-GQA
+        draft through ``input_batch.seq_lens_cpu_upper_bound`` (each is
+        ``mirror + scheduled`` before the draft width is added).  Only an
+        all-FlashMLA run, where target and draft both derive every length
+        from device state, may skip the refresh.  Window-GQA keeps the
+        staged (usually free) wait so its base stays exact, matching the
+        MLA DCP draft's semantics.
         """
         parallel = self.vllm_config.parallel_config
-        window_gqa_has_independent_lengths = (
-            getattr(self.speculator, "_window_gqa_dcp_fallback", False)
-            and getattr(self.speculator, "attn_architecture", None) == "GQA"
-            and not getattr(self.speculator, "use_dcp", True)
-        )
         if (
             self.model_config.architecture
             not in {"KimiLinearForCausalLM", "KimiK3ForCausalLM", "KimiK3ForConditionalGeneration"}
-            or not (
-                getattr(self.speculator, "_draft_mla_uses_device_lengths", False)
-                or window_gqa_has_independent_lengths
-            )
+            or not getattr(self.speculator, "_draft_mla_uses_device_lengths", False)
             # PP/PCP and offload paths have not been audited for host readers.
             or parallel.pipeline_parallel_size != 1
             or parallel.prefill_context_parallel_size != 1
@@ -1312,9 +1308,10 @@ class NPUModelRunner(GPUModelRunner):
             return False
 
         # FlashMLA derives DCP-local lengths from rejection-corrected device
-        # counters.  A replicated Window-GQA draft also owns an independent
-        # DCP=1 length stream, so it does not need the target MLA predicate.
-        return window_gqa_has_independent_lengths or all_mla_use_flashmla(self.model)
+        # counters on both the target and the draft, so no host reader of the
+        # mirror remains.  Window-GQA drafts consume the shared mirror through
+        # seq_lens_cpu_upper_bound, so they keep the staged refresh.
+        return all_mla_use_flashmla(self.model)
 
     def postprocess_sampled(
         self,
