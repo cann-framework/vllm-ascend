@@ -1252,18 +1252,12 @@ class NPUModelRunner(GPUModelRunner):
         return output
 
     def _can_skip_spec_cpu_length_sync(self) -> bool:
-        """Skip the staged D2H only when no host reader needs the mirror.
+        """Skip the staged D2H only when every length reader is on-device.
 
-        The staged D2H refreshes ``req_states.num_computed_tokens_np`` with
-        the device's rejection-corrected counters.  Both DSpark draft
-        families build their host lengths from that mirror: the DCP MLA
-        draft through ``input_buffers.seq_lens_cpu`` and the Window-GQA
-        draft through ``input_batch.seq_lens_cpu_upper_bound`` (each is
-        ``mirror + scheduled`` before the draft width is added).  Only an
-        all-FlashMLA run, where target and draft both derive every length
-        from device state, may skip the refresh.  Window-GQA keeps the
-        staged (usually free) wait so its base stays exact, matching the
-        MLA DCP draft's semantics.
+        Both DSpark draft families build host lengths from the shared
+        num_computed mirror (DCP MLA via input_buffers.seq_lens_cpu,
+        Window-GQA via seq_lens_cpu_upper_bound); only an all-FlashMLA
+        run may skip the refresh.
         """
         parallel = self.vllm_config.parallel_config
         if (
@@ -1279,10 +1273,7 @@ class NPUModelRunner(GPUModelRunner):
         ):
             return False
 
-        # FlashMLA derives DCP-local lengths from rejection-corrected device
-        # counters on both the target and the draft, so no host reader of the
-        # mirror remains.  Window-GQA drafts consume the shared mirror through
-        # seq_lens_cpu_upper_bound, so they keep the staged refresh.
+        # FlashMLA (target and draft) derives every length from device state.
         return all_mla_use_flashmla(self.model)
 
     def postprocess_sampled(
