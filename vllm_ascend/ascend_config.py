@@ -604,6 +604,8 @@ class AscendConfig:
     # This is an Ascend-specific switch and is intentionally independent of
     # vLLM's generic cache_config.use_replayssm setting.
     enable_mega_kda_replayssm: bool = False
+    # Native MXFP8 QFA for non-absorbed MLA prefill.
+    enable_mla_prefill_qfa: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
     # value (e.g. 4 = MXFP float8_e4m3 communication quantization) regardless of the
     # model's quant_type, 0 means disabled (use the model's own quant).
