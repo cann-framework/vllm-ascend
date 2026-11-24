@@ -125,6 +125,8 @@ class HardwareCapability(Enum):
     MLAPO_NATIVE_WEIGHTS = auto()
     # Accept ``fullmesh_v2`` as the MC2 communication algorithm.
     MC2_FULLMESH_V2_COMM = auto()
+    # Map ``fullmesh`` to the operator's ``fullmesh_v1`` alias.
+    MC2_FULLMESH_V1_ALIAS = auto()
     # Accept hierarchical MC2 communication, subject to its expert-count constraints.
     MC2_HIERARCHY_COMM = auto()
     # Pass TP group/rank metadata required by the newer MoE dispatch/combine ABI.
@@ -273,6 +275,7 @@ _STANDARD_CAPABILITIES = frozenset(
 )
 _A3_CAPABILITIES = _STANDARD_CAPABILITIES | {
     HardwareCapability.MC2_FULLMESH_V2_COMM,
+    HardwareCapability.MC2_FULLMESH_V1_ALIAS,
     HardwareCapability.RMS_NORM_CAST,
 }
 _DEFAULT_WORKER_CLS = "vllm_ascend.worker.worker.NPUWorker"
@@ -366,6 +369,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
                     HardwareCapability.LORA_CUSTOM_OPS,
                     HardwareCapability.MLA_FLASH,
                     HardwareCapability.MLAPO_NATIVE_WEIGHTS,
+                    HardwareCapability.MC2_FULLMESH_V2_COMM,
                     HardwareCapability.MOE_DISPATCH_EXTRA_ARGS,
                     HardwareCapability.MOE_DISPATCH_SHARED_EXPERT_ARGS,
                     HardwareCapability.MM_REDUCE_SCATTER_AI_CPU_INFERENCE,

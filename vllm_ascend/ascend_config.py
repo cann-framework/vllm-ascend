@@ -1380,7 +1380,7 @@ class AscendConfig:
         # When A3 and comm_alg == "fullmesh", dispatch/combine op need pass in "fullmesh_v1" instead of "fullmesh"
         # TODO(zzzzwwjj): Remove it when op's param is uniformed between A2/A3/A5.
         if self.mc2_comm_alg == "fullmesh" and get_current_hardware_profile().supports(
-            HardwareCapability.MC2_FULLMESH_V2_COMM
+            HardwareCapability.MC2_FULLMESH_V1_ALIAS
         ):
             return "fullmesh_v1"
         return self.mc2_comm_alg
