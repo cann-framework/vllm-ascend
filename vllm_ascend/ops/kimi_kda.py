@@ -93,6 +93,19 @@ def _is_pd_prefill_worker(vllm_config) -> bool:
     return kv_transfer_config is not None and bool(getattr(kv_transfer_config, "is_kv_producer", False))
 
 
+def _mxfp8_qkv_storage_ptrs(projections) -> set[int]:
+    # Keep only addresses. Holding tensors or storages here would prevent release.
+    pointers = set()
+    for projection in projections:
+        for name in ("weight", "weight_scale", "_mxfp8_weight_buf", "_mxfp8_scale_buf"):
+            tensor = getattr(projection, name, None)
+            if tensor is not None:
+                pointer = tensor.untyped_storage().data_ptr()
+                if pointer:
+                    pointers.add(pointer)
+    return pointers
+
+
 def release_mega_kda_nd_weights(model) -> int:
     """Release the default-path ND KDA projections on PD decode workers.
 
@@ -101,15 +114,49 @@ def release_mega_kda_nd_weights(model) -> int:
     subtracts the returned byte count from its weights accounting so the
     freed budget flows into the KV cache pool.
     """
-    released = 0
-    for module in model.modules():
-        if (
-            isinstance(module, AscendKimiK3DeltaAttention)
-            and getattr(module, "_mega_weights", None) is not None
-            and getattr(module, "_mega_pd_decode_worker", False)
-            and not getattr(module, "_mega_nd_released", False)
-        ):
-            released += module._release_default_kda_weights()
+    layers = [
+        module
+        for module in model.modules()
+        if isinstance(module, AscendKimiK3DeltaAttention)
+        and getattr(module, "_mega_weights", None) is not None
+        and getattr(module, "_mega_pd_decode_worker", False)
+        and not getattr(module, "_mega_nd_released", False)
+    ]
+    projections = [
+        layer.in_proj_qkvgfab for layer in layers if getattr(layer.in_proj_qkvgfab, "_mxfp8_transformed", False)
+    ]
+    if projections:
+        device = projections[0].weight.device
+        torch.npu.synchronize(device)
+        before = _mxfp8_qkv_storage_ptrs(projections)
+        allocated_before = torch.npu.memory_allocated(device)
+        logger.info(
+            "MegaKDA QKV release before: device=%s mxfp8_layers=%d qkv_storages=%d "
+            "allocated_bytes=%d reserved_bytes=%d",
+            device,
+            len(projections),
+            len(before),
+            allocated_before,
+            torch.npu.memory_reserved(device),
+        )
+
+    released = sum(layer._release_default_kda_weights() for layer in layers)
+
+    if projections:
+        torch.npu.synchronize(device)
+        remaining = before & _mxfp8_qkv_storage_ptrs(projections)
+        allocated_after = torch.npu.memory_allocated(device)
+        logger.info(
+            "MegaKDA QKV release after: device=%s original_qkv_storages_still_referenced=%d/%d "
+            "allocated_bytes=%d reserved_bytes=%d allocated_drop_bytes=%d all_kda_accounted_release_bytes=%d",
+            device,
+            len(remaining),
+            len(before),
+            allocated_after,
+            torch.npu.memory_reserved(device),
+            allocated_before - allocated_after,
+            released,
+        )
     return released
 
 

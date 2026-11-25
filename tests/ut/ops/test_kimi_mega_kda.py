@@ -705,6 +705,46 @@ def test_release_mega_kda_nd_weights_targets_pd_decode_layers_only(runtime):
     assert runtime["release_mega_kda_nd_weights"](model) == 0
 
 
+@pytest.mark.parametrize(
+    ("clear_params", "clear_buffers", "remaining"), [(False, False, 2), (True, False, 2), (True, True, 0)]
+)
+def test_mxfp8_release_reports_storage_aliases(clear_params, clear_buffers, remaining):
+    weight = torch.ones(8, dtype=torch.uint8)
+    scale = torch.ones(2, dtype=torch.uint8)
+    proj = SimpleNamespace(
+        weight=nn.Parameter(weight, requires_grad=False),
+        weight_scale=nn.Parameter(scale, requires_grad=False),
+        _mxfp8_weight_buf=weight,
+        _mxfp8_scale_buf=scale,
+        _mxfp8_transformed=True,
+    )
+    del weight, scale
+
+    def release():
+        if clear_params:
+            proj.weight.data = proj.weight.new_empty(0)
+            proj.weight_scale.data = proj.weight_scale.new_empty(0)
+        if clear_buffers:
+            del proj._mxfp8_weight_buf, proj._mxfp8_scale_buf
+        return 10 if clear_buffers else 0
+
+    layer = SimpleNamespace(
+        in_proj_qkvgfab=proj, _mega_weights=object(), _mega_pd_decode_worker=True, _release_default_kda_weights=release
+    )
+    npu = MagicMock()
+    npu.memory_allocated.side_effect = [100, 90 if clear_buffers else 100]
+    npu.memory_reserved.return_value = 128
+    log = MagicMock()
+    ns = {"AscendKimiK3DeltaAttention": SimpleNamespace, "torch": SimpleNamespace(npu=npu), "logger": log}
+    _definitions("vllm_ascend/ops/kimi_kda.py", {"release_mega_kda_nd_weights", "_mxfp8_qkv_storage_ptrs"}, ns)
+    assert ns["release_mega_kda_nd_weights"](SimpleNamespace(modules=lambda: [layer])) == (10 if clear_buffers else 0)
+    assert npu.synchronize.call_count == 2
+    before, after = [call.args[0] % call.args[1:] for call in log.info.call_args_list]
+    assert "qkv_storages=2 " in before
+    assert f"original_qkv_storages_still_referenced={remaining}/2 " in after
+    assert f"allocated_drop_bytes={10 if clear_buffers else 0} " in after
+
+
 def test_pd_prefill_worker_skips_mega_operand_build(runtime):
     layer = _attention(runtime)
     assert layer._mega_weights is not None
