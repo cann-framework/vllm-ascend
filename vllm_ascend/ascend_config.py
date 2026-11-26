@@ -592,6 +592,7 @@ class AscendConfig:
     enable_kv_nz: bool = False
     # Static E4M3 PA_NZ is opt-in; C16 preserves the existing MLA KV path.
     mla_cache_mode: Literal["C16", "C8"] = "C16"
+    kimi_c8_prefill_nd: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
@@ -680,6 +681,12 @@ class AscendConfig:
         return value.strip().upper()
 
     def _validate_mla_cache_mode(self, vllm_config: VllmConfig) -> None:
+        if self.kimi_c8_prefill_nd:
+            transfer = getattr(vllm_config, "kv_transfer_config", None)
+            if self.mla_cache_mode != "C8" or transfer is None or transfer.kv_connector not in (
+                "MooncakeConnectorV2", "MooncakePullConnector"
+            ):
+                raise ValueError("kimi_c8_prefill_nd requires C8 and a Mooncake pull P/D connector")
         if self.mla_cache_mode != "C8":
             return
         model = getattr(vllm_config, "model_config", None)

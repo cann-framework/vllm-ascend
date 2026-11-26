@@ -17,18 +17,22 @@ def _scatter_pa_nz_bytes_kernel(
     BLOCK_SIZE: tl.constexpr,
     PAGE_STRIDE: tl.constexpr,
     SOURCE_BLOCK_SIZE: tl.constexpr,
+    ND_LAYOUT: tl.constexpr,
 ):
     index = tl.program_id(0) * TILE + tl.arange(0, TILE)
     active = index < NUM_BYTES
     token, feature = index // WIDTH, index % WIDTH
     slot = tl.load(slots + token, mask=active, other=-1).to(tl.int64)
     safe_slot = tl.maximum(slot, 0)
-    offset = (
-        safe_slot // BLOCK_SIZE * PAGE_STRIDE
-        + feature // 32 * (BLOCK_SIZE * 32)
-        + safe_slot % BLOCK_SIZE * 32
-        + feature % 32
-    )
+    if ND_LAYOUT:
+        offset = safe_slot // BLOCK_SIZE * PAGE_STRIDE + safe_slot % BLOCK_SIZE * WIDTH + feature
+    else:
+        offset = (
+            safe_slot // BLOCK_SIZE * PAGE_STRIDE
+            + feature // 32 * (BLOCK_SIZE * 32)
+            + safe_slot % BLOCK_SIZE * 32
+            + feature % 32
+        )
     source = index
     if SOURCE_BLOCK_SIZE:
         source = (
@@ -42,7 +46,7 @@ def _scatter_pa_nz_bytes_kernel(
 
 
 def _scatter_pa_nz_bytes(
-    cache: torch.Tensor, payload: torch.Tensor, slots: torch.Tensor, *, source_block_size=0
+    cache: torch.Tensor, payload: torch.Tensor, slots: torch.Tensor, *, source_block_size=0, nd_layout=False
 ) -> None:
     count, width = slots.numel(), 576
     tile = 1024 if count >= 128 else 256
@@ -56,12 +60,22 @@ def _scatter_pa_nz_bytes(
         BLOCK_SIZE=cache.shape[3],
         PAGE_STRIDE=cache.stride(0),
         SOURCE_BLOCK_SIZE=source_block_size,
+        ND_LAYOUT=nd_layout,
     )
 
 
 def copy_prolog_kv_to_cache(source: torch.Tensor, cache: torch.Tensor, slots: torch.Tensor) -> None:
     """Scatter only this step's Prolog-128 rows into the native FA cache."""
     _scatter_pa_nz_bytes(cache.view(torch.uint8), source.view(torch.uint8), slots, source_block_size=128)
+
+
+def write_static_fp8_nd_cache(merged: torch.Tensor, cache: torch.Tensor, slots: torch.Tensor, k_descale) -> None:
+    scale = torch.as_tensor(k_descale, device=merged.device, dtype=torch.float32)
+    payload = (merged.float() / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn).view(torch.uint8)
+    if merged.shape[0]:
+        _scatter_pa_nz_bytes(
+            cache.view(torch.uint8), payload.contiguous(), slots.reshape(-1).to(torch.int64), nd_layout=True
+        )
 
 
 def write_static_fp8_cache_graph(merged: torch.Tensor, cache: torch.Tensor, slots: torch.Tensor, k_descale) -> None:

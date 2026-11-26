@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from itertools import groupby
 from typing import Any
 
 import msgspec
@@ -49,6 +50,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
     zmq_ctx,
 )
 
+_C8_FRAGMENT_TOKENS = 128
+_C8_CACHE_WIDTH = 576
+_C8_ND_BATCH_FRAGMENTS = 1024
+
 
 class MooncakePullRecvingThread(threading.Thread):
     """D-side execution thread for Mooncake pull requests.
@@ -79,11 +84,17 @@ class MooncakePullRecvingThread(threading.Thread):
         dcp_size: int,
         device: Any,
         ready_event: threading.Event,
+        kv_caches: dict | None = None,
+        kimi_c8_prefill_nd: bool = False,
     ) -> None:
         super().__init__(daemon=True, name="MooncakePullRecvingThread")
         self.engine = engine
         self.vllm_config = vllm_config
         self._kimi_c8_enabled = is_kimi_c8_config(vllm_config)
+        self._kimi_c8_prefill_nd = kimi_c8_prefill_nd
+        self._kimi_c8_nd_caches = kv_caches
+        self._kimi_c8_nd_lock = threading.Lock()
+        self._kimi_c8_nd_retained_buffers = []
         self.model_config = vllm_config.model_config
         self.kv_cache_config = kv_cache_config
         self.kv_cache_specs = kv_cache_specs
@@ -1202,6 +1213,7 @@ class MooncakePullRecvingThread(threading.Thread):
         src_list: list[int],
         dst_list: list[int],
         length_list: list[int],
+        c8_nd_fragments: list | None = None,
     ) -> None:
         """Append all layers and requests belonging to one local spec."""
         spec = self.kv_cache_specs[spec_index]
@@ -1303,6 +1315,17 @@ class MooncakePullRecvingThread(threading.Thread):
                     if is_c8:
                         local_size = self.layer_block_sizes[local_layer_index]
                         remote_size = remote_metadata.layer_block_sizes[remote_layer_index]
+                        if c8_nd_fragments is not None:
+                            remote_units = remote_size // _C8_FRAGMENT_TOKENS
+                            for _, local_ids, remote_ids in transfer_entries:
+                                for local_id, remote_id in zip(local_ids, remote_ids):
+                                    remote_page, remote_unit = divmod(remote_id, remote_units)
+                                    remote_addr = remote_base_addr + remote_page * remote_block_stride
+                                    remote_addr += remote_unit * _C8_FRAGMENT_TOKENS * _C8_CACHE_WIDTH
+                                    local_page, local_unit = divmod(local_id, local_size // _C8_FRAGMENT_TOKENS)
+                                    local_slot = local_page * local_size + local_unit * _C8_FRAGMENT_TOKENS
+                                    c8_nd_fragments.append((local_layer_index, local_slot, remote_addr))
+                            continue
                         for request_id, _, _ in transfer_entries:
                             key = (
                                 request_id,
@@ -1495,6 +1518,7 @@ class MooncakePullRecvingThread(threading.Thread):
         src_list: list[int] = []
         dst_list: list[int] = []
         length_list: list[int] = []
+        c8_nd_fragments = [] if getattr(self, "_kimi_c8_prefill_nd", False) else None
         plan_start_time = time.perf_counter()
         for spec_index, transfer_entries_by_layer in transfer_entries_by_spec.items():
             self._append_spec_transfer_addresses(
@@ -1509,9 +1533,10 @@ class MooncakePullRecvingThread(threading.Thread):
                 src_list=src_list,
                 dst_list=dst_list,
                 length_list=length_list,
+                c8_nd_fragments=c8_nd_fragments,
             )
 
-        if not src_list:
+        if not src_list and not c8_nd_fragments:
             return
         plan_elapsed_ms = (time.perf_counter() - plan_start_time) * 1000
         tp_metadata = remote_metadata.metadata_by_pcp_rank[remote_pcp_rank].metadata_by_tp_rank[remote_tp_rank]
@@ -1525,12 +1550,16 @@ class MooncakePullRecvingThread(threading.Thread):
             }
         )
         transfer_start_time = time.perf_counter()
-        ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
-        if ret < 0:
-            raise RuntimeError(
-                "Mooncake KV transfer failed for remote "
-                f"PP/PCP/TP rank {remote_pp_rank}/{remote_pcp_rank}/{remote_tp_rank}, ret={ret}"
-            )
+        if c8_nd_fragments:
+            with self._kimi_c8_nd_lock:
+                self._transfer_c8_nd_fragments(session_id, c8_nd_fragments, src_list, dst_list, length_list)
+        else:
+            ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+            if ret < 0:
+                raise RuntimeError(
+                    "Mooncake KV transfer failed for remote "
+                    f"PP/PCP/TP rank {remote_pp_rank}/{remote_pcp_rank}/{remote_tp_rank}, ret={ret}"
+                )
         transfer_elapsed_ms = (time.perf_counter() - transfer_start_time) * 1000
         logger.info(
             "KV cache transfer for requests %s took %.2f ms (%d ranges, %d bytes). "
@@ -1544,6 +1573,82 @@ class MooncakePullRecvingThread(threading.Thread):
             session_id,
             plan_elapsed_ms,
         )
+
+    def _transfer_c8_nd_fragments(self, session_id, fragments, src_list, dst_list, length_list):
+        unique = {}
+        for fragment in fragments:
+            unique.setdefault(fragment[:2], fragment)
+        fragments = sorted(unique.values(), key=lambda fragment: fragment[0])
+        for start in range(0, len(fragments), _C8_ND_BATCH_FRAGMENTS):
+            self._transfer_c8_nd_batch(
+                session_id, fragments[start : start + _C8_ND_BATCH_FRAGMENTS], src_list, dst_list, length_list
+            )
+            src_list, dst_list, length_list = [], [], []
+
+    def _transfer_c8_nd_batch(self, session_id, fragments, src_list, dst_list, length_list):
+        from vllm_ascend.device.kimi_c8_cache_write import _scatter_pa_nz_bytes
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import as_kv_cache_tensors
+
+        cache = as_kv_cache_tensors(self._kimi_c8_nd_caches[self.layer_names[fragments[0][0]]])[0]
+        fragment_bytes = _C8_FRAGMENT_TOKENS * _C8_CACHE_WIDTH
+        buffer = torch.empty(len(fragments) * fragment_bytes, dtype=torch.uint8, device=cache.device)
+        buffer_ptr = buffer.data_ptr()
+        ret = self.engine.register_memory(buffer_ptr, buffer.numel())
+        if ret != 0:
+            raise RuntimeError(f"Mooncake C8 ND staging memory registration failed: {ret}")
+        stream = None
+        pending_event = None
+        can_unregister = True
+        try:
+            for index, (_, _, remote_addr) in enumerate(fragments):
+                src_list.append(buffer_ptr + index * fragment_bytes)
+                dst_list.append(remote_addr)
+                length_list.append(fragment_bytes)
+            ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+            if ret < 0:
+                raise RuntimeError(f"Mooncake C8 ND transfer failed: {ret}")
+            stream = torch.npu.Stream(device=cache.device)
+            with torch.npu.stream(stream):
+                offset = 0
+                for layer_index, entries in groupby(fragments, key=lambda fragment: fragment[0]):
+                    entries = list(entries)
+                    cache = as_kv_cache_tensors(self._kimi_c8_nd_caches[self.layer_names[layer_index]])[0]
+                    slot_starts = torch.tensor([entry[1] for entry in entries], dtype=torch.int64, device=cache.device)
+                    slots = (slot_starts[:, None] + torch.arange(_C8_FRAGMENT_TOKENS, device=cache.device)).reshape(-1)
+                    payload = buffer[offset * fragment_bytes : (offset + len(entries)) * fragment_bytes]
+                    _scatter_pa_nz_bytes(cache.view(torch.uint8), payload, slots)
+                    offset += len(entries)
+                pending_event = torch.npu.Event()
+                pending_event.record(stream)
+            while not pending_event.query():
+                time.sleep(0.001)
+        except Exception:
+            if stream is not None:
+                try:
+                    stream.synchronize()
+                except Exception:
+                    can_unregister = False
+                    self._kimi_c8_nd_retained_buffers.append(buffer)
+                    raise
+            raise
+        finally:
+            if can_unregister:
+                try:
+                    unregister = getattr(self.engine, "unregister_memory", None)
+                    ret = (
+                        unregister(buffer_ptr)
+                        if unregister is not None
+                        else self.engine.batch_unregister_memory([buffer_ptr])
+                    )
+                    if hasattr(ret, "is_error"):
+                        failed = ret.is_error()
+                    else:
+                        failed = ret not in (0, None)
+                    if failed:
+                        raise RuntimeError(f"Mooncake C8 staging memory unregister failed: {ret}")
+                except Exception:
+                    self._kimi_c8_nd_retained_buffers.append(buffer)
+                    raise
 
     @staticmethod
     def _validate_remote_metadata(
@@ -1692,6 +1797,8 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
                 dcp_size=self.dcp_size,
                 device=torch.npu.current_device(),
                 ready_event=ready_event,
+                kv_caches=kv_caches,
+                kimi_c8_prefill_nd=getattr(getattr(self, "ascend_config", None), "kimi_c8_prefill_nd", False),
             )
             self._recving_thread.start()
             if not ready_event.wait(timeout=10):

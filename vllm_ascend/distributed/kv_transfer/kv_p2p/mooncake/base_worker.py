@@ -333,7 +333,12 @@ class MooncakeBaseConnectorWorker:
                     scalar = float(descale.detach().float().cpu().item())
                     if not math.isfinite(scalar) or scalar <= 0:
                         raise ValueError("Kimi C8 transfer descale must be finite and positive")
-                    contract = ("kimi_e4m3_pa_nz_native_v2", scalar)
+                    layout = (
+                        "kimi_e4m3_nd_to_nz_v1"
+                        if getattr(self.ascend_config, "kimi_c8_prefill_nd", False)
+                        else "kimi_e4m3_pa_nz_native_v2"
+                    )
+                    contract = (layout, scalar)
                 kimi_c8_contracts.append(contract)
                 shared_page_metadata = (
                     self._get_shared_page_metadata(caches)

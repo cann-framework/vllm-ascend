@@ -323,6 +323,7 @@ class AscendMLAMetadata:
     c8_input_positions: torch.Tensor | None = None
     c8_step_cache: dict = field(default_factory=dict)
     c8_static_fp8: bool = False
+    offload_dummy: bool = False
     c8_query_start_loc_cpu: torch.Tensor | None = None
     external_flashmla_by_layout: dict[str, FlashMLADecode] | None = None
 
@@ -532,6 +533,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             decode=decode,
             attn_state=common.attn_state,
             causal=common.causal,
+            offload_dummy=common.offload_dummy,
             external_flashmla=flash,
             external_flashmla_by_layout=flash_by_layout,
         )
@@ -769,6 +771,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             ),
             c8_static_fp8=getattr(self, "kimi_c8_static_fp8", False),
             c8_query_start_loc_cpu=query_start_loc_cpu if self.kimi_c8_static_fp8 else None,
+            offload_dummy=common_attn_metadata.offload_dummy,
         )
         if self.pcp_enabled:
             assert expanded_slot_mapping is not None
@@ -1187,6 +1190,14 @@ class AscendMLAImpl(MLAAttentionImpl):
         is_draft_cache = self._kimi_c8_enabled and is_draft_cache
         self.is_draft_cache = is_draft_cache
         self.kimi_c8_mode = self._kimi_c8_enabled and not is_draft_cache
+        transfer = self.vllm_config.kv_transfer_config
+        self.kimi_c8_prefill_nd = bool(
+            self.kimi_c8_mode
+            and getattr(ascend_config, "kimi_c8_prefill_nd", False)
+            and transfer is not None
+            and transfer.is_kv_producer
+            and not transfer.is_kv_consumer
+        )
         self.kimi_c8_static_fp8 = self.kimi_c8_mode
         if self.kimi_c8_mode:
             # Recipe C8 uses W8A8_MXFP8 projection weights plus a separate
@@ -2146,7 +2157,11 @@ class AscendMLAImpl(MLAAttentionImpl):
         )
         if projection is None:
             writer = None
-            if is_graph:
+            if getattr(self, "kimi_c8_prefill_nd", False):
+                from vllm_ascend.device.kimi_c8_cache_write import write_static_fp8_nd_cache
+
+                writer = write_static_fp8_nd_cache
+            elif is_graph:
                 from vllm_ascend.device.kimi_c8_cache_write import write_static_fp8_cache_graph
 
                 writer = write_static_fp8_cache_graph
@@ -2383,7 +2398,12 @@ class AscendMLAImpl(MLAAttentionImpl):
                         for i in range(iters)
                     )
                 )
-                history_plan = C8PrefillHistory.prepare(
+                history_type = C8PrefillHistory
+                if getattr(self, "kimi_c8_prefill_nd", False):
+                    from vllm_ascend.attention.kimi_c8_nd import C8NDHistory
+
+                    history_type = C8NDHistory
+                history_plan = history_type.prepare(
                     cache_kv_c, physical_table, torch.stack(lengths), torch.stack(starts)
                 )
                 prefill_metadata.c8_history_plans[key] = history_plan
