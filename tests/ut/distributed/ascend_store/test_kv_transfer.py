@@ -789,6 +789,69 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
         self.assertEqual([key.rsplit("@", 1)[1] for key in keys], ["h0", "h1"])
         self.assertEqual(db.masks[0], [True, True, False])
 
+    def test_bulk_capacity_failure_does_not_skip_later_cache_groups(self):
+        store = FakeStore()
+        store.requires_exists_before_put = False
+        store.put = MagicMock(side_effect=[False, True])
+        db = ChunkedTokenDatabase([KeyMetadata("m", 0, 0, 0)] * 2, [16, 16], None)
+        db.set_group_buffers({0: [1000], 1: [2000]}, {0: [16], 1: [16]})
+        thread = KVCacheStoreSendingThread(
+            m_store=store,
+            token_database=db,
+            block_size=[16, 16],
+            tp_rank=0,
+            dcp_size=8,
+            put_step=1,
+            kv_role="kv_producer",
+            ready_event=threading.Event(),
+            group_uses_align_state=[False, True],
+        )
+        request = ReqMeta(
+            req_id="long-prefill",
+            token_len_chunk=16,
+            block_ids_by_group=[[1], [1]],
+            block_hashes=["h0"],
+            kv_cache_group_ids=[0, 1],
+        )
+
+        thread._handle_stored_request(request)
+
+        assert store.put.call_count == 2
+        assert "@group:1@" in store.put.call_args.args[0][0]
+
+    def test_bulk_saves_live_intermediate_aligned_state(self):
+        block = 13312
+        db = MaskedFakeTokenDatabase(block_size=block, masks=([False, False],))
+        store = FakeStore([0, 0])
+        thread = KVCacheStoreSendingThread(
+            m_store=store,
+            token_database=db,
+            block_size=[block],
+            tp_rank=0,
+            dcp_size=8,
+            put_step=1,
+            kv_role="kv_producer",
+            ready_event=threading.Event(),
+            group_uses_align_state=[True],
+            save_live_checkpoint=True,
+        )
+        req = ReqMeta(
+            req_id="long",
+            token_len_chunk=2 * block,
+            num_prompt_tokens=131046,
+            block_ids_by_group=[[0, 7]],
+            block_hashes=["h0", "h1"],
+            skip_null_blocks_by_group=[True],
+        )
+        thread._handle_stored_request(req)
+        assert len(store.put_calls) == 1
+        assert [key.rsplit("@", 1)[1] for key in store.put_calls[0][0]] == ["h1"]
+        assert db.masks == ([False, False],)
+        store.put_calls.clear()
+        req.target_token_len += 1
+        thread._handle_stored_request(req)
+        assert not store.put_calls
+
     def test_handle_request_skips_compressed_hit_in_raw_token_domain(self):
         t, store = self._make_thread([0, 0], block_size=64)
         t.token_database.group_cache_families["kv"][0] = "c4"

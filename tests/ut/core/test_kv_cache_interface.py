@@ -19,6 +19,7 @@ from vllm_ascend.core.kv_cache_interface import (
     get_kv_cache_compression_ratio,
     get_storage_block_size,
     register_ascend_kv_cache_specs,
+    supports_c8_pd_connector,
     supports_component_major_mla_pd,
 )
 
@@ -134,3 +135,112 @@ def test_component_major_mla_pd_gate():
         )
     )
     assert not supports_component_major_mla_pd(config)
+
+
+def test_c8_producer_multiconnector_preserves_raw_mla_contract():
+    config = SimpleNamespace(
+        additional_config={"mla_cache_mode": "C8"},
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MultiConnector",
+            kv_connector_module_path=None,
+            is_kv_producer=True,
+            kv_connector_extra_config={
+                "connectors": [
+                    {"kv_connector": "MooncakeConnectorV2"},
+                    {"kv_connector": "AscendStoreConnector"},
+                ]
+            },
+        ),
+    )
+    assert supports_c8_pd_connector(config)
+    assert supports_component_major_mla_pd(config)
+
+
+def test_c8_consumer_rejects_store_before_native_pull():
+    config = SimpleNamespace(
+        additional_config={"mla_cache_mode": "C8"},
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MultiConnector",
+            kv_connector_module_path=None,
+            is_kv_producer=False,
+            kv_connector_extra_config={
+                "connectors": [
+                    {
+                        "kv_connector": "AscendStoreConnector",
+                        "kv_connector_extra_config": {"consumer_is_to_load": True},
+                    },
+                    {"kv_connector": "MooncakeConnectorV2"},
+                ]
+            },
+        ),
+    )
+    assert not supports_c8_pd_connector(config)
+    assert not supports_component_major_mla_pd(config)
+
+
+def test_c8_consumer_store_requires_first_position_and_load():
+    for connectors in (
+        [
+            {"kv_connector": "MooncakeConnectorV2"},
+            {
+                "kv_connector": "AscendStoreConnector",
+                "kv_connector_extra_config": {"consumer_is_to_load": True},
+            },
+        ],
+        [
+            {"kv_connector": "AscendStoreConnector"},
+            {"kv_connector": "MooncakeConnectorV2"},
+        ],
+    ):
+        config = SimpleNamespace(
+            additional_config={"mla_cache_mode": "C8"},
+            kv_transfer_config=SimpleNamespace(
+                kv_connector="MultiConnector",
+                kv_connector_module_path=None,
+                is_kv_producer=False,
+                kv_connector_extra_config={"connectors": connectors},
+            ),
+        )
+        assert not supports_c8_pd_connector(config)
+
+
+def test_c8_consumer_allows_p2p_without_store():
+    for connectors in (
+        [{"kv_connector": "MooncakeConnectorV2"}],
+        [
+            {"kv_connector": "MooncakeConnectorV2"},
+            {"kv_connector": "PreemptOffloadConnector"},
+        ],
+    ):
+        config = SimpleNamespace(
+            additional_config={"mla_cache_mode": "C8"},
+            kv_transfer_config=SimpleNamespace(
+                kv_connector="MultiConnector",
+                kv_connector_module_path=None,
+                is_kv_producer=False,
+                kv_connector_extra_config={"connectors": connectors},
+            ),
+        )
+        assert supports_c8_pd_connector(config)
+        assert supports_component_major_mla_pd(config)
+
+
+def test_c8_producer_store_allows_async_load():
+    config = SimpleNamespace(
+        additional_config={"mla_cache_mode": "C8"},
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MultiConnector",
+            kv_connector_module_path=None,
+            is_kv_producer=True,
+            kv_connector_extra_config={
+                "connectors": [
+                    {
+                        "kv_connector": "AscendStoreConnector",
+                        "kv_connector_extra_config": {"load_async": True},
+                    },
+                    {"kv_connector": "MooncakeConnectorV2"},
+                ]
+            },
+        ),
+    )
+    assert supports_c8_pd_connector(config)

@@ -36,14 +36,14 @@ def spec():
     )
 
 
-def execute(thread, peer, entries=None):
+def execute(thread, peer, entries=None, *, remote_tp_rank=0, remote_dcp_size=1):
     return thread._execute_tp_transfer_bucket(
         remote_pp_rank=0,
         remote_pcp_rank=0,
-        remote_tp_rank=0,
+        remote_tp_rank=remote_tp_rank,
         remote_pcp_size=1,
-        remote_tp_size=1,
-        remote_dcp_size=1,
+        remote_tp_size=remote_dcp_size,
+        remote_dcp_size=remote_dcp_size,
         transfer_entries_by_spec=entries or {0: {(0, 0): [("r", [0], [0])]}},
         remote_metadata=peer,
     )
@@ -57,10 +57,13 @@ def map_blocks(thread, remote_block, block_lists, token_counts):
     )
 
 
-@pytest.mark.parametrize("world,rank", [(1, 0), (8, 3)])
 @pytest.mark.parametrize("group", [0, 1])
-@pytest.mark.parametrize("remote_block", [768, 1664])
-def test_real_transfer_addresses_payload_and_padding(world, rank, group, remote_block):
+@pytest.mark.parametrize(
+    "world,rank,remote_world,remote_block",
+    [(1, 0, 1, 768), (1, 0, 1, 1664), (8, 3, 1, 768), (8, 3, 1, 1664), (8, 7, 8, 1664)],
+)
+def test_real_transfer_addresses_payload_and_padding(world, rank, group, remote_world, remote_block):
+    remote_page, remote_rank = divmod(rank, remote_world)
     local_size, local_stride, remote_stride = 1664, 16 * PAYLOAD, 20 * PAYLOAD
     local = torch.full((20, local_stride), 165, dtype=torch.uint8)
     remote = torch.zeros(20, remote_stride, dtype=torch.uint8)
@@ -81,7 +84,7 @@ def test_real_transfer_addresses_payload_and_padding(world, rank, group, remote_
         kimi_c8_contracts=[CONTRACT],
     )
     peer = replace(
-        make_pp_metadata(tp_base_addrs={0: [[remote.data_ptr()]]}),
+        make_pp_metadata(tp_base_addrs={remote_rank: [[remote.data_ptr()]]}),
         group_indices=[group],
         block_size=remote_block,
         layer_block_sizes=[remote_block],
@@ -109,11 +112,14 @@ def test_real_transfer_addresses_payload_and_padding(world, rank, group, remote_
         local_num_prompt_tokens=13313,
         remote_num_prompt_tokens=13313,
     )
-    buckets, affected = thread._build_transfer_block_buckets(peer, [(0, 0)], {(0, 0): [[0]]}, 1, 1, {"r": request}, {})
-    assert affected == {(0, 0): {"r"}}
-    _, local_ids, remote_ids = buckets[(0, 0)][0][(0, 0)][0]
+    buckets, affected = thread._build_transfer_block_buckets(
+        peer, [(0, 0)], {(0, 0): [list(range(remote_world))]}, 1, remote_world, {"r": request}, {}
+    )
+    bucket = (0, remote_rank)
+    assert affected == {bucket: {"r"}}
+    _, local_ids, remote_ids = buckets[bucket][0][(0, 0)][0]
     assert local_ids == list(range(13, 26))
-    assert remote_ids == list(range(rank * 13, (rank + 1) * 13))
+    assert remote_ids == list(range(remote_page * 13, (remote_page + 1) * 13))
 
     def read(_session, destinations, sources, lengths):
         for dst, src, size in zip(destinations, sources, lengths):
@@ -122,7 +128,7 @@ def test_real_transfer_addresses_payload_and_padding(world, rank, group, remote_
 
     thread.engine = MagicMock()
     thread.engine.batch_transfer_sync_read.side_effect = read
-    execute(thread, peer, buckets[(0, 0)])
+    execute(thread, peer, buckets[bucket], remote_tp_rank=remote_rank, remote_dcp_size=remote_world)
     indices = torch.cat([torch.arange(index * 128, (index + 1) * 128) for index in remote_ids])
     expected = dense.reshape(-1, 576)[indices]
     actual = local_cache[1, 0].permute(1, 0, 2).reshape(local_size, 576)
@@ -132,7 +138,7 @@ def test_real_transfer_addresses_payload_and_padding(world, rank, group, remote_
     if remote_block == local_size:
         assert args[1:] == (
             [local.data_ptr() + local_stride],
-            [remote.data_ptr() + rank * remote_stride],
+            [remote.data_ptr() + remote_page * remote_stride],
             [local_size * 576],
         )
     assert local[0].eq(165).all() and local[2:].eq(165).all()

@@ -22,6 +22,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackEncoder
 
+from vllm_ascend.ascend_config import is_kimi_c8_config
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
     get_layerwise_data_plane,
@@ -49,10 +50,13 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     get_block_hashes,
     get_group_block_size,
     get_group_cache_family,
+    infer_cache_namespace,
     infer_cache_transfer_granularity,
     infer_cacheable_group_ids,
     infer_group_block_sizes,
     infer_group_cache_families,
+    infer_store_group_block_sizes,
+    infer_store_hash_block_size,
     infer_tp_mismatch_info,
     normalize_block_ids_by_group,
     uses_hybrid_kv_cache,
@@ -89,6 +93,8 @@ class KVPoolScheduler:
         if self.compress_ratios is None:
             self.compress_ratios = getattr(hf_config, "compress_ratios", None)
         kv_cache_groups = kv_cache_config.kv_cache_groups if kv_cache_config is not None else None
+        self.dcp_size = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
+        self.cache_namespace = infer_cache_namespace(kv_cache_groups, extra_config, dcp_size=self.dcp_size)
         self.use_hybrid = uses_hybrid_kv_cache(vllm_config.scheduler_config, kv_cache_groups) or (
             self.use_block_key_layerwise and kv_cache_groups is not None and len(kv_cache_groups) > 1
         )
@@ -117,7 +123,6 @@ class KVPoolScheduler:
         # request_id -> (vllm cached tokes, kvpool cached tokens)
         self.load_specs: dict[str, LoadSpec] = {}
         self.pcp_size = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
-        self.dcp_size = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
 
         speculative_config = getattr(vllm_config, "speculative_config", None)
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
@@ -132,13 +137,8 @@ class KVPoolScheduler:
             and len(cacheable_block_sizes) != len(self.original_block_size)
         ):
             raise ValueError("AscendStore private KV state requires Mooncake block-key or non-layerwise transfer")
-        self.grouped_block_size = [block_size * self.dcp_size for block_size in self.original_block_size]
-        requested_hash_block_size = vllm_config.cache_config.prefix_match_unit
-        if not isinstance(requested_hash_block_size, int):
-            requested_hash_block_size = None
-        self.hash_block_size = (
-            requested_hash_block_size if requested_hash_block_size is not None else min(cacheable_block_sizes)
-        ) * self.dcp_size
+        self.grouped_block_size = infer_store_group_block_sizes(vllm_config, kv_cache_groups, self.dcp_size)
+        self.hash_block_size = infer_store_hash_block_size(vllm_config, cacheable_block_sizes, self.dcp_size)
         for group_id in self.cacheable_group_ids:
             group_block_size = self.grouped_block_size[group_id]
             assert group_block_size % self.hash_block_size == 0, "block_size must be divisible by hash_block_size"
@@ -157,6 +157,7 @@ class KVPoolScheduler:
         )
         self._unfinished_requests: dict[str, tuple[Request, list[list[int]]]] = {}
         self._loading_req_ids: set[str] = set()
+        self._failed_async_load_req_ids: set[str] = set()
 
         self._block_pool: BlockPool | None = None
         self.sending_event_id = 0
@@ -293,6 +294,7 @@ class KVPoolScheduler:
                                 pp_rank,
                                 kv_cache_group_id=kv_cache_group_id,
                                 cache_family=cache_family,
+                                namespace=self.cache_namespace,
                             ),
                             chunk_hash,
                         )
@@ -613,10 +615,15 @@ class KVPoolScheduler:
         # A waiting request can be looked up again before it is admitted.
         # Never retain a load plan from an earlier hit across a miss/early return.
         self.load_specs.pop(request.request_id, None)
+        if request.request_id in self._failed_async_load_req_ids:
+            return 0, False
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_load:
             return 0, False
 
         prompt_token_len = len(request.prompt_token_ids)
+        final_block_start = (
+            (request.num_tokens - 1) // self.lcm_block_size * self.lcm_block_size if self.use_eagle else None
+        )
         if self.use_block_key_layerwise:
             token_len = self._floor_to_cache_transfer_granularity(prompt_token_len)
             if token_len < self.cache_transfer_granularity:
@@ -631,6 +638,11 @@ class KVPoolScheduler:
             else:
                 token_len = prompt_token_len
 
+            if final_block_start is not None and self.use_hybrid and is_kimi_c8_config(self.vllm_config):
+                # Query the resume boundary itself. Aligned recurrent state is
+                # sparse, so a later hit does not prove the preceding block.
+                token_len = min(token_len, final_block_start)
+
             if token_len < self.cache_transfer_granularity:
                 return 0, False
 
@@ -640,6 +652,12 @@ class KVPoolScheduler:
                 )
             else:
                 if num_computed_tokens >= token_len:
+                    logger.debug(
+                        "KV pool skip lookup req=%s hbm_hit_tokens=%d store_lookup_limit=%d",
+                        request.request_id,
+                        num_computed_tokens,
+                        token_len,
+                    )
                     return 0, False
                 if self.client is None:
                     self.client = LookupKeyClient(self.vllm_config)
@@ -654,7 +672,7 @@ class KVPoolScheduler:
             return 0, False
 
         store_skip_tokens = num_external_hit_tokens
-        if self.use_eagle:
+        if final_block_start is not None:
             # Keep the draft model's recomputation zone intact: the
             # generation-point hidden states must be freshly computed, and the
             # local prefix-cache path already drops its trailing block
@@ -668,7 +686,6 @@ class KVPoolScheduler:
             # containing the last token; num_tokens - lcm_block_size equals
             # that boundary only for lcm-aligned prompts and over-trims
             # unaligned prompts whose hit stops exactly on the boundary.
-            final_block_start = (request.num_tokens - 1) // self.lcm_block_size * self.lcm_block_size
             hit_reaches_final_block = num_external_hit_tokens > final_block_start
             if hit_reaches_final_block:
                 num_external_hit_tokens = max(
@@ -980,7 +997,6 @@ class KVPoolScheduler:
             request_tracker,
             self.cache_transfer_granularity,
             load_spec=load_spec,
-            skip_save=None,
             block_hashes=request.block_hashes,
             discard_partial_chunks=self._discard_partial_chunks,
             original_block_size=self.original_block_size,
@@ -1001,6 +1017,7 @@ class KVPoolScheduler:
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
             self._preempted_req_ids.discard(finished_req_id)
+            self._failed_async_load_req_ids.discard(finished_req_id)
 
         for req_id in scheduler_output.preempted_req_ids:
             self._preempted_req_ids.update(scheduler_output.preempted_req_ids)
@@ -1113,6 +1130,19 @@ class KVPoolScheduler:
         """
         hand the connector_output, free non-null mamba blocks and so on.
         """
+        invalid_blocks = connector_output.invalid_block_ids
+        if invalid_blocks and is_kimi_c8_config(self.vllm_config):
+            invalid_blocks = invalid_blocks - {0}
+            for req_id in self._loading_req_ids:
+                unfinished = self._unfinished_requests.get(req_id)
+                if unfinished is None:
+                    # An aborted request can still have a receive in flight.
+                    continue
+                _, groups = unfinished
+                if any(not invalid_blocks.isdisjoint(group) for group in groups):
+                    # A key can still exist even when its bytes cannot be
+                    # loaded. Let the scheduler recompute instead of retrying it.
+                    self._failed_async_load_req_ids.add(req_id)
         self.update_finished_recving(connector_output.finished_recving)
 
         meta = connector_output.kv_connector_worker_meta

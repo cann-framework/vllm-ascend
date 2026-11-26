@@ -1,4 +1,5 @@
 from types import SimpleNamespace as Ns
+from unittest.mock import Mock
 
 import pytest
 from vllm.config.compilation import CUDAGraphMode as Mode
@@ -54,8 +55,8 @@ def test_configuration_rejects_invalid_mode(value):
         ("parallel", "prefill_context_parallel_size", 2, "prefill_context_parallel"),
         ("parallel", "decode_context_parallel_size", 4, "decode_context_parallel"),
         ("parallel", "cp_kv_cache_interleave_size", 128, "interleave"),
-        ("transfer", "is_kv_producer", True, "KV producer"),
-        ("transfer", "kv_connector", "MooncakeConnectorV1", "MooncakeConnectorV2"),
+        ("transfer", "is_kv_producer", True, None),
+        ("transfer", "kv_connector", "MooncakeConnectorV1", "supported Mooncake"),
         ("cache", "block_size", 128, "block_size=1664"),
     ],
 )
@@ -77,3 +78,39 @@ def test_configuration_checks_model_runner_pd_and_parallel_boundaries(configurat
         before = vars(configuration.model_config.hf_text_config).copy()
         options._validate_mla_cache_mode(configuration)
         assert vars(configuration.model_config.hf_text_config) == before
+
+
+def test_c8_dcp8_producer_allows_store_with_native_pull(configuration):
+    transfer = configuration.kv_transfer_config
+    transfer.is_kv_producer = True
+    transfer.kv_connector = "MultiConnector"
+    pull = {"kv_connector": "MooncakeConnectorV2", "kv_role": "kv_producer"}
+    transfer.kv_connector_extra_config = {
+        "connectors": [pull, {"kv_connector": "AscendStoreConnector", "kv_role": "kv_producer"}]
+    }
+    options = AscendConfig(mla_cache_mode="C8", sparse_kv_offload_config=Ns(enabled=False))
+    options._validate_mla_cache_mode(configuration)
+
+    pull["kv_connector"] = "MooncakeHybridConnector"
+    with pytest.raises(ValueError, match="requires a supported Mooncake connector"):
+        options._validate_mla_cache_mode(configuration)
+
+
+def test_c8_store_reports_async_option_ignored_at_multi_connector_level(configuration, monkeypatch):
+    configuration.kv_transfer_config = Ns(
+        kv_connector="MultiConnector",
+        is_kv_producer=True,
+        kv_connector_extra_config={
+            "load_async": True,
+            "connectors": [{"kv_connector": "MooncakeConnectorV2"}, {"kv_connector": "AscendStoreConnector"}],
+        },
+    )
+    options = AscendConfig(mla_cache_mode="C8", sparse_kv_offload_config=Ns(enabled=False))
+    warning = Mock()
+    monkeypatch.setattr("vllm_ascend.ascend_config.logger.warning", warning)
+
+    options._validate_mla_cache_mode(configuration)
+
+    warning.assert_called_once()
+    assert "AscendStoreConnector" in warning.call_args.args[0]
+    assert warning.call_args.args[1:] == ("load_async", True, False)

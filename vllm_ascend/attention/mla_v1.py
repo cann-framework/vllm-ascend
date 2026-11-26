@@ -20,7 +20,7 @@ from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.offloader.base import NoopOffloader, get_offloader
 from vllm.model_executor.utils import replace_parameter
 from vllm.utils.math_utils import cdiv, round_down
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,  # type: ignore
     AttentionCGSupport,
@@ -351,6 +351,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
     """
 
     decode_metadata_cls: type[AscendMLADecodeMetadata] = AscendMLADecodeMetadata
+    _c8_history_token_budget: int | None = None
 
     def __init__(
         self,
@@ -402,6 +403,19 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         # and freed with the model instead of living for the whole process.
         self.nope_zero_rope_cache: dict[tuple, torch.Tensor] | None = {} if self.rope_dim == 0 else None
         static_forward_context = vllm_config.compilation_config.static_forward_context
+        if self.kimi_c8_static_fp8:
+            bytes_per_row = 0
+            for name in layer_names:
+                impl = static_forward_context[name].impl
+                if getattr(impl, "head_padding", 0) > 0:
+                    # kv_b_proj output, concatenated key and contiguous value
+                    # are simultaneously live after the DCP history gather.
+                    projected_width = impl.qk_nope_head_dim + impl.v_head_dim
+                    key_width = impl.qk_nope_head_dim + impl.qk_rope_head_dim
+                    dense_width = projected_width + key_width + impl.v_head_dim
+                    bytes_per_row = max(bytes_per_row, impl.num_heads * dense_width * get_dtype_size(torch.bfloat16))
+            if bytes_per_row:
+                self._c8_history_token_budget = (1 << 30) // bytes_per_row
         # MLA layers are grouped by RoPE mode before metadata builders are created.
         self.use_mla_rope = static_forward_context[layer_names[0]].impl.use_mla_rope if layer_names else True
         self.cos_cache = None
@@ -834,6 +848,11 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             return None
         num_prefills_with_context_cpu = (chunk_plan_lens > 0).sum().item()
         workspace_size = self.chunked_prefill_workspace_size if chunk_workspace_size is None else chunk_workspace_size
+        if self._c8_history_token_budget is not None:
+            # The projection sees the global history after all-gather. Budget
+            # the total across requests, keeping one aligned chunk per request.
+            minimum_workspace = num_prefills_with_context_cpu * self.chunk_alignment
+            workspace_size = min(workspace_size, max(self._c8_history_token_budget, minimum_workspace))
         self.max_context_chunk = workspace_size // num_prefills_with_context_cpu
         self.max_context_chunk = round_down(self.max_context_chunk, self.chunk_alignment)
 

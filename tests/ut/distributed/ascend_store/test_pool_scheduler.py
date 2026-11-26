@@ -249,6 +249,22 @@ class TestGetZmqRpcPathLookup(unittest.TestCase):
 
 
 class TestKVPoolScheduler(unittest.TestCase):
+    def test_c8_dspark_only_resumes_at_a_verified_checkpoint(self):
+        config = self._make_config()
+        config.additional_config = {"mla_cache_mode": "C8"}
+        scheduler = KVPoolScheduler(config, use_layerwise=False)
+        scheduler.use_hybrid = True
+        scheduler.use_eagle = True
+        scheduler.client = MagicMock()
+        # A checkpoint exists at 64, but neither 48 nor the divergent MLA
+        # boundary at 32 has a recurrent state in Store.
+        scheduler.client.lookup.side_effect = lambda length, *args, **kwargs: 64 if length >= 64 else 32
+        request = SimpleNamespace(prompt_token_ids=list(range(64)), num_tokens=64, request_id="r1", block_hashes=[])
+
+        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 32), (0, False))
+        self.assertNotIn("r1", scheduler.load_specs)
+        self.assertEqual(scheduler.client.lookup.call_args.args[0], 48)
+
     def _make_config(self, kv_role="kv_producer", extra_config=None, block_size=16):
         return make_config(kv_role, extra_config, block_size)
 
@@ -1047,6 +1063,20 @@ class TestKVPoolSchedulerUpdateConnectorOutput(unittest.TestCase):
         scheduler = KVPoolScheduler(config, use_layerwise=False)
         scheduler._block_pool = MagicMock()
         return scheduler
+
+    def test_c8_failed_async_load_allows_local_recompute(self):
+        scheduler = self._make_scheduler()
+        scheduler.vllm_config.additional_config = {"mla_cache_mode": "C8"}
+        request = SimpleNamespace(prompt_token_ids=list(range(64)), num_tokens=64, request_id="r1", block_hashes=[])
+        scheduler.client = MagicMock()
+        scheduler.client.lookup.return_value = 48
+        scheduler._loading_req_ids.add("r1")
+        scheduler._unfinished_requests["r1"] = (request, [[3], [7]])
+
+        scheduler.update_connector_output(KVConnectorOutput(invalid_block_ids={7}, finished_recving={"r1"}))
+
+        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (0, False))
+        scheduler.client.lookup.assert_not_called()
 
     def test_completed_event_frees_blocks(self):
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (

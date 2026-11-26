@@ -958,6 +958,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         group_uses_align_state: list[bool] | None = None,
         enable_kv_event: bool = False,
         worker: Any = None,
+        save_live_checkpoint: bool = False,
     ):
         super().__init__(
             m_store, token_database, block_size, tp_rank, tp_size, dcp_size, ready_event, name="KVCacheSendingThread"
@@ -967,6 +968,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.put_step = put_step
         self.kv_role = kv_role
         self.group_uses_align_state = group_uses_align_state or []
+        self.save_live_checkpoint = save_live_checkpoint
         self.enable_kv_event = enable_kv_event
         self.completed_events_lock = threading.Lock()
         self.completed_events: dict[int, int] = {}
@@ -1129,6 +1131,19 @@ class KVCacheStoreSendingThread(KVTransferThread):
             group_store_mask = (
                 store_masks[group_id] if store_masks is not None and group_id < len(store_masks) else None
             )
+            align_state_group = group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]
+            if (
+                self.save_live_checkpoint
+                and align_state_group
+                and group_store_mask
+                and req_meta.num_prompt_tokens is not None
+                and req_meta.target_token_len == token_len < req_meta.num_prompt_tokens
+                and token_len == len(group_store_mask) * group_block_size
+                and not group_store_mask[-1]
+            ):
+                # This chunk produced a checkpoint before the final prompt boundary.
+                # Keep its hash while the state slot is still live; null slots are skipped below.
+                group_store_mask = [*group_store_mask[:-1], True]
             if group_store_mask is not None and not group_store_mask:
                 continue
 
@@ -1139,7 +1154,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
             key_block_ids: list[int] = []
             block_ids = req_meta.block_ids_by_group[group_id]
             skip_null_blocks = self._skip_null_blocks(req_meta, group_id)
-            align_state_group = group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]
 
             def chunk_filter(
                 start: int,
@@ -1257,7 +1271,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if current_event is not None:
                 current_event.synchronize()
             if self.m_store.put(keys, addrs, sizes) is False:
-                return
+                logger.debug("Store bulk PUT failed for request=%s group=%d", req_id, group_id)
+                continue
             if self.enable_kv_event and stored_events:
                 self.update_kv_event(stored_events)
 
@@ -1276,6 +1291,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         invalid_block_ids_lock: threading.Lock | None = None,
         worker: Any = None,
         record_operation: Callable[[str, float, int], None] | None = None,
+        report_hybrid_load_errors: bool = False,
     ):
         super().__init__(
             m_store,
@@ -1291,6 +1307,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         self._invalid_block_ids_lock = invalid_block_ids_lock or threading.Lock()
         self.worker = worker
         self._record_operation_cb = record_operation
+        self.report_hybrid_load_errors = report_hybrid_load_errors
 
     def _handle_request(self, req_meta: ReqMeta):
         try:
@@ -1382,38 +1399,13 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 self._mark_failed_requests([req_meta])
                 self.set_finished_request(req_id)
                 return
-            if ret is not None and any(r != 0 for r in ret):
-                missing_block_ids = record_failed_blocks(
-                    block_id_list_c,
-                    ret,
-                )
-                if len(req_meta.block_ids_by_group) == 1:
+            if ret is None or any(code != 0 for code in ret):
+                missing_block_ids = record_failed_blocks(block_id_list_c, ret)
+                if self.report_hybrid_load_errors or len(req_meta.block_ids_by_group) == 1:
+                    if self.report_hybrid_load_errors:
+                        req_meta.can_save = False
                     with self._invalid_block_ids_lock:
                         self._invalid_block_ids.update(missing_block_ids)
-                elif missing_block_ids:
-                    logger.error(
-                        "KV load failed for hybrid request %s. "
-                        "Skip invalid-block fallback to avoid scheduler crash. "
-                        "failed_blocks=%s",
-                        req_id,
-                        missing_block_ids,
-                    )
-            elif ret is None:
-                missing_block_ids = record_failed_blocks(
-                    block_id_list_c,
-                    [1] * len(block_id_list_c),
-                )
-                if len(req_meta.block_ids_by_group) == 1:
-                    with self._invalid_block_ids_lock:
-                        self._invalid_block_ids.update(missing_block_ids)
-                elif missing_block_ids:
-                    logger.error(
-                        "KV load failed for hybrid request %s. "
-                        "Skip invalid-block fallback to avoid scheduler crash. "
-                        "failed_blocks=%s",
-                        req_id,
-                        missing_block_ids,
-                    )
             logger.debug(
                 "KV pool async recv backend get returned request=%s token_len=%d groups=%s keys=%d",
                 req_id,
@@ -2307,12 +2299,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
 def record_failed_blocks(
     block_ids: list[int],
-    ret_codes: list[int],
+    ret_codes: list[int] | None,
 ) -> set[int]:
-    failed_blocks: set[int] = set()
-    for block_id, code in zip(block_ids, ret_codes):
-        if code != 0:
-            failed_blocks.add(block_id)
+    failed_blocks = (
+        set(block_ids) if ret_codes is None else {block_id for block_id, code in zip(block_ids, ret_codes) if code != 0}
+    )
     if failed_blocks:
         logger.error(
             "Failed to load blocks. failed_count=%d, failed_blocks=%s. Check block availability and memory state.",
