@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CANNBot FlashKDA TND prefill ABI used by Kimi K3's fused prefill path."""
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import import_module
@@ -14,6 +15,10 @@ from vllm.logger import logger
 class PrefillFusedKDAOperators:
     prefill: Callable
     metadata: Callable
+    prolog: Callable | None = None
+    dev: Callable | None = None
+    prolog_metadata: Callable | None = None
+    dev_metadata: Callable | None = None
 
 
 class PrefillKDAMetadataWorkspace:
@@ -134,12 +139,69 @@ def load_prefill_fused_kda_operator() -> PrefillFusedKDAOperators | None:
     try:
         prefill = import_module("ops.flash_kda").flash_kda
         metadata = import_module("ops.flash_kda_metadata").flash_kda_metadata
+        # K31's optimized prefill keeps projection, convolution, gate
+        # activation and KDA in two kernels.  Older DSL drops do not expose
+        # these modules, so retain the FlashKDA path as a compatibility mode.
+        try:
+            prolog = import_module("ops.kda_prolog").kda_prolog
+            prolog_metadata = import_module("ops.kda_prolog_metadata").kda_prolog_metadata
+            dev = import_module("ops.flash_kda_dev").flash_kda_dev
+            dev_metadata = import_module("ops.flash_kda_dev_metadata").flash_kda_dev_metadata
+        except (ImportError, AttributeError):
+            prolog = prolog_metadata = dev = dev_metadata = None
     except (ImportError, AttributeError) as error:
         logger.warning_once("CANNBot KDA prefill is unavailable; using AscendC prefill: %s", error)
         return None
     if not callable(prefill) or not callable(metadata):
         raise TypeError("ops.flash_kda.flash_kda and ops.flash_kda_metadata.flash_kda_metadata must be callable")
-    return PrefillFusedKDAOperators(prefill, metadata)
+    return PrefillFusedKDAOperators(prefill, metadata, prolog, dev, prolog_metadata, dev_metadata)
+
+
+def run_prefill_kda_prolog(
+    operator: PrefillFusedKDAOperators,
+    hidden: torch.Tensor,
+    qkv_weight: torch.Tensor,
+    decay_a_weight: torch.Tensor,
+    decay_b_weight: torch.Tensor,
+    beta_weight: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    cache_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    initial_state_mode: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    lower_bound: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Execute the K31 ``kda_prolog + flash_kda_dev`` prefill composition."""
+    if (
+        operator.prolog is None
+        or operator.dev is None
+        or operator.prolog_metadata is None
+        or operator.dev_metadata is None
+    ):
+        raise RuntimeError("KDA prolog operators are unavailable in the installed DSL")
+    heads = a_log.numel()
+    stub = hidden.new_empty((hidden.shape[0], heads, dt_bias.shape[-1]))
+    prolog_meta = operator.prolog_metadata(
+        hidden, qkv_weight, conv_state, cache_indices, cu_seqlens, initial_state_mode
+    )
+    dev_meta = operator.dev_metadata(
+        stub, stub, recurrent_state, "TND", cu_seqlens
+    )
+    q, k, v, prefix, beta, _ = operator.prolog(
+        hidden, qkv_weight, decay_a_weight, decay_b_weight, beta_weight,
+        conv_weight, conv_state, a_log, dt_bias, metadata=prolog_meta,
+        cache_indices=cache_indices, cu_seqlens=cu_seqlens,
+        initial_state_mode=initial_state_mode, lower_bound=lower_bound,
+    )
+    output, final_state = operator.dev(
+        q, k, v, prefix, beta, math.sqrt(dt_bias.shape[-1]) ** -1,
+        recurrent_state, a_log, dt_bias, lower_bound, "TND", dev_meta
+    )
+    return output, final_state
 
 
 def run_prefill_fused_kda(

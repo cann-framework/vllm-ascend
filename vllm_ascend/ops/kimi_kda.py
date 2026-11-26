@@ -61,6 +61,7 @@ from vllm_ascend.ops.kimi_mega_kda import (
 from vllm_ascend.ops.kimi_prefill_fused_kda import (
     load_prefill_fused_kda_operator,
     run_prefill_fused_kda,
+    run_prefill_kda_prolog,
 )
 from vllm_ascend.ops.linear_op import KimiOProjMMReduceScatterOp
 from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
@@ -735,6 +736,65 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
             return self.o_proj(core_attn_out)[0]
         return super().forward(hidden_states, positions)
+
+    def _try_prefill_kda_prolog(self, g2: torch.Tensor, core_attn_out: torch.Tensor) -> bool:
+        """Run the K31 fused prolog path for a pure BF16 prefill batch."""
+        operator = getattr(self, "_prefill_fused_kda_operator", None)
+        prepared = getattr(self, "_prefill_kda_weights", None)
+        # The Prolog ABI requires load-time, separately prepared NZ weights.
+        # Do not pass checkpoint-layout tensors here; until the loader creates
+        # this bundle the established FlashKDA path remains authoritative.
+        if operator is None or operator.prolog is None or prepared is None:
+            return False
+        raw = self._get_kda_forward_metadata()
+        metadata = raw.get(self.prefix) if isinstance(raw, dict) else None
+        if not isinstance(metadata, GDNAttentionMetadata) or metadata.num_decodes or metadata.num_spec_decodes:
+            return False
+        prefill = metadata.non_spec_prefill_metadata
+        if prefill is None or metadata.prefill_state_indices is None or metadata.prefill_has_initial_state is None:
+            return False
+        if any(weight.dtype != torch.bfloat16 for weight in prepared.values()):
+            return False
+        state_copy = getattr(self, "_ascend_kda_state_copy", None)
+        if state_copy is None or not getattr(self, "_kda_state_copy_ready", False):
+            return False
+        conv_meta = prefill.causal_conv1d
+        if conv_meta is None:
+            return False
+        indices = metadata.prefill_state_indices
+        flags = metadata.prefill_has_initial_state.to(dtype=torch.int32).contiguous()
+        keep = prefill.chunk.keep_meta
+        if keep is not None:
+            query_start_loc = torch.cat(
+                (metadata.prefill_query_start_loc[:1], metadata.prefill_query_start_loc[1:][keep])
+            )
+        else:
+            query_start_loc = metadata.prefill_query_start_loc
+        if keep is not None:
+            indices, flags = indices[keep], flags[keep]
+        initial = state_copy.gather(self.kv_cache[1], indices, flags).float()
+        if query_start_loc is None:
+            return False
+        cache_indices = _normalize_causal_cache_indices(conv_meta.cache_indices).to(dtype=torch.int32)
+        output, final = run_prefill_kda_prolog(
+            operator,
+            prepared["hidden"][: metadata.num_actual_tokens],
+            prepared["qkv"], prepared["decay_a"], prepared["decay_b"], prepared["beta"], prepared["conv"],
+            self.kv_cache[0],
+            cache_indices, query_start_loc.to(dtype=torch.int32).contiguous(),
+            flags,
+            initial,
+            self.A_log,
+            self.dt_bias.reshape(self.local_num_heads, self.head_dim),
+            lower_bound=self.gate_lower_bound,
+        )
+        state_copy.scatter(self.kv_cache[1], final, indices)
+        core_attn_out[:, : output.shape[0]].copy_(output.unsqueeze(0))
+        output_view = core_attn_out[:, : output.shape[0]]
+        self.o_norm.forward_oot(output_view, g2[: output.shape[0]], out=output_view)
+        core_attn_out[:, output.shape[0] :].zero_()
+        maybe_save_kv_layer_to_connector("", [])
+        return True
 
     def _get_kda_forward_metadata(self):
         # Both callers execute inside the runtime/custom-op boundary, never tracing.
@@ -1475,6 +1535,14 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         record_attention_compute_start()
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+        if (
+            attn_metadata.num_prefills > 0
+            and attn_metadata.num_decodes == 0
+            and attn_metadata.num_spec_decodes == 0
+            and not torch.compiler.is_compiling()
+            and self._try_prefill_kda_prolog(g2, core_attn_out)
+        ):
+            return
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         g1 = g1[:, :num_actual_tokens]
         g2 = g2[:num_actual_tokens]
