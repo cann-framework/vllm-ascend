@@ -162,6 +162,8 @@ def _attention(ns, *, batch=4, spec_len=8):
     layer.tp_size = 2
     layer.uses_mixed_projection = False
     layer.use_mega_kda_replayssm = True
+    layer._mega_pd_decode_worker = False
+    layer._mega_pd_prefill_worker = False
     layer._mega_operator = MagicMock()
     layer._commit_operator = MagicMock()
     layer._mega_weights = None
@@ -449,6 +451,34 @@ def test_serial_prefill_uses_original_factors_and_qkv_dispatch(runtime, fused_pr
     torch.testing.assert_close(out["beta"], (raw_beta if fused_prefill else raw_beta.float().sigmoid()).unsqueeze(0))
     torch.testing.assert_close(out["g1"], ((x @ fused.f_a_weight.T) @ fused.f_b_weight.T).reshape(1, 5, 2, 4))
     torch.testing.assert_close(out["g2"], (x @ packed[10:].T).reshape(5, 2, 4))
+
+
+@pytest.mark.parametrize("producer,consumer", [(False, True), (True, False), (True, True), (False, False)])
+@pytest.mark.parametrize("previously_prepared", [False, True])
+def test_prefill_gate_weights_skip_only_dedicated_decode(runtime, producer, consumer, previously_prepared):
+    layer = _attention(runtime)
+    layer._mega_pd_prefill_worker = producer
+    layer._mega_pd_decode_worker = consumer
+    layer._fused_bfg_output_sizes = (2, 8, 8)
+    mx_method = type("MXFP8", (), {})
+    convert = MagicMock(side_effect=torch.clone)
+    runtime.update(AscendW8A8MXFP8DynamicLinearMethod=mx_method, maybe_trans_nz=convert)
+    layer.in_proj_qkvgfab.quant_method = SimpleNamespace(quant_method=mx_method())
+    packed = torch.randn(18, 32, dtype=torch.bfloat16)
+    layer.fused_bfg_proj = _linear(packed)
+    layer._prefill_gate_weights = (torch.empty(1), torch.empty(1)) if previously_prepared else None
+
+    layer.prepare_prefill_gate_weights()
+
+    if consumer and not producer:
+        assert layer._prefill_gate_weights is None
+        convert.assert_not_called()
+    else:
+        assert convert.call_count == 2
+        beta, gate = layer._prefill_gate_weights
+        torch.testing.assert_close(beta, packed[:2])
+        torch.testing.assert_close(gate, packed[10:])
+    assert layer.fused_bfg_proj.weight.numel() == packed.numel()
 
 
 @pytest.mark.parametrize("counts", [(0, 1, 0), (0, 0, 1), (1, 1, 0), (1, 0, 1)])

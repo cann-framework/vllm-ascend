@@ -1180,6 +1180,9 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
 
     def prepare_prefill_gate_weights(self) -> None:
         """Extract rank-local B/G after loading; keep the original low-rank F factors."""
+        self._prefill_gate_weights = None
+        if self._mega_pd_decode_worker and not self._mega_pd_prefill_worker:
+            return
         method = self.in_proj_qkvgfab.quant_method
         if not isinstance(getattr(method, "quant_method", method), AscendW8A8MXFP8DynamicLinearMethod):
             return
