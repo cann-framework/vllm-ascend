@@ -545,6 +545,42 @@ class TestKVPPPoolWorker(unittest.TestCase):
         stored.remove(keys[-1])
         assert worker.lookup_scheduler(128, ["checkpoint"]) == 0
 
+    def test_sub_tp_dcp_c8_lookup_uses_real_tp_owner_and_dcp_shard_keys(self):
+        for dcp_size in (2, 4):
+            with self.subTest(dcp_size=dcp_size):
+                worker = make_worker(self, tp_size=8, dcp_size=dcp_size, use_mla=True)
+                worker.vllm_config.additional_config = {"mla_cache_mode": "C8"}
+                model_name = worker.metadata[0].model_name
+                block_tokens = 16 * dcp_size
+
+                # Aligned KDA state group: 8 real (tp_rank % dcp_size, tp_rank) owner keys, zero ghost keys.
+                worker.group_uses_align_state = [True]
+                aligned_stored = {
+                    PoolKey(KeyMetadata(model_name, rank, rank % dcp_size, 0), "checkpoint").to_string()
+                    for rank in range(8)
+                }
+                worker.m_store.exists.side_effect = lambda keys, s=aligned_stored: [int(k in s) for k in keys]
+                self.assertEqual(worker.lookup_scheduler(block_tokens, ["checkpoint"]), block_tokens)
+                aligned_keys = worker.m_store.exists.call_args.args[0]
+                self.assertEqual(len(aligned_keys), 8)
+                self.assertEqual(set(aligned_keys), aligned_stored)
+                aligned_stored.remove(aligned_keys[-1])
+                self.assertEqual(worker.lookup_scheduler(block_tokens, ["checkpoint"]), 0)
+
+                # MLA group: exactly dcp_size shards with head_or_tp_rank=0.
+                worker.group_uses_align_state = [False]
+                mla_stored = {
+                    PoolKey(KeyMetadata(model_name, 0, dcp_rank, 0), "checkpoint").to_string()
+                    for dcp_rank in range(dcp_size)
+                }
+                worker.m_store.exists.side_effect = lambda keys, s=mla_stored: [int(k in s) for k in keys]
+                self.assertEqual(worker.lookup_scheduler(block_tokens, ["checkpoint"]), block_tokens)
+                mla_keys = worker.m_store.exists.call_args.args[0]
+                self.assertEqual(len(mla_keys), dcp_size)
+                self.assertEqual(set(mla_keys), mla_stored)
+                mla_stored.remove(mla_keys[-1])
+                self.assertEqual(worker.lookup_scheduler(block_tokens, ["checkpoint"]), 0)
+
 
 class _SparseSWAHitManager:
     """SWA manager: right-to-left search for a cached aligned segment tail."""

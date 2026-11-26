@@ -53,7 +53,10 @@ def test_configuration_rejects_invalid_mode(value):
         ("root", "use_v2_model_runner", False, "RunnerV2"),
         ("root", "speculative_config", Ns(method="eagle"), "DSpark"),
         ("parallel", "prefill_context_parallel_size", 2, "prefill_context_parallel"),
-        ("parallel", "decode_context_parallel_size", 4, "decode_context_parallel"),
+        ("parallel", "decode_context_parallel_size", 2, None),
+        ("parallel", "decode_context_parallel_size", 4, None),
+        ("parallel", "decode_context_parallel_size", 3, "decode_context_parallel"),
+        ("parallel", "decode_context_parallel_size", 16, "decode_context_parallel"),
         ("parallel", "cp_kv_cache_interleave_size", 128, "interleave"),
         ("transfer", "is_kv_producer", True, None),
         ("transfer", "kv_connector", "MooncakeConnectorV1", "supported Mooncake"),
@@ -119,3 +122,33 @@ def test_c8_store_reports_async_option_ignored_at_multi_connector_level(configur
     warning.assert_called_once()
     assert "AscendStoreConnector" in warning.call_args.args[0]
     assert warning.call_args.args[1:] == ("load_async", True, False)
+
+
+@pytest.mark.parametrize("dcp", [2, 4, 8])
+def test_c8_dcp_enforces_interleave_block_size_and_store_prefix_caching(configuration, dcp):
+    configuration.parallel_config.decode_context_parallel_size = dcp
+    transfer = configuration.kv_transfer_config
+    transfer.is_kv_producer = True
+    transfer.kv_connector = "MultiConnector"
+    transfer.kv_connector_extra_config = {
+        "connectors": [
+            {"kv_connector": "MooncakeConnectorV2", "kv_role": "kv_producer"},
+            {"kv_connector": "AscendStoreConnector", "kv_role": "kv_producer"},
+        ]
+    }
+    options = AscendConfig(mla_cache_mode="C8", sparse_kv_offload_config=Ns(enabled=False))
+    options._validate_mla_cache_mode(configuration)
+
+    configuration.parallel_config.cp_kv_cache_interleave_size = 128
+    with pytest.raises(ValueError, match="interleave"):
+        options._validate_mla_cache_mode(configuration)
+    configuration.parallel_config.cp_kv_cache_interleave_size = 1664
+
+    configuration.cache_config.block_size = 128
+    with pytest.raises(ValueError, match="block_size=1664"):
+        options._validate_mla_cache_mode(configuration)
+    configuration.cache_config.block_size = 1664
+
+    configuration.cache_config.enable_prefix_caching = False
+    with pytest.raises(ValueError, match="enable_prefix_caching"):
+        options._validate_mla_cache_mode(configuration)

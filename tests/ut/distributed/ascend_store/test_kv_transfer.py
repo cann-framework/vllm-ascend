@@ -28,6 +28,7 @@ from vllm.distributed.kv_events import BlockStored
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ChunkedTokenDatabase,
     KeyMetadata,
+    PoolKey,
     LayerBlockRange,
     LayerLoadTask,
     LayerBatchReqMeta,
@@ -577,6 +578,95 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
                             saved.extend(keys)
                     self.assertEqual(len(saved), 6)
                     self.assertEqual(len(set(saved)), 6)
+
+    def test_sub_tp_dcp_shards_mla_puts_across_identical_replicas(self):
+        hashes = [f"h{i}" for i in range(8)]
+        for dcp_size in (2, 4):
+            with self.subTest(dcp_size=dcp_size):
+                saved_mla: list[str] = []
+                for tp_rank in range(8):
+                    dcp_rank = tp_rank % dcp_size
+                    db = ChunkedTokenDatabase([KeyMetadata("m", 0, dcp_rank, 0)], [16], None)
+                    db.set_group_buffers({0: [1000]}, {0: [16]})
+                    store = FakeStore([0] * 8)
+                    thread = KVCacheStoreSendingThread(
+                        m_store=store,
+                        token_database=db,
+                        block_size=[16],
+                        tp_rank=tp_rank,
+                        tp_size=8,
+                        pcp_rank=0,
+                        pcp_size=1,
+                        dcp_size=dcp_size,
+                        put_step=8,
+                        kv_role="kv_producer",
+                        ready_event=threading.Event(),
+                        group_uses_align_state=[False],
+                    )
+                    req = ReqMeta(
+                        req_id="r1",
+                        token_len_chunk=128,
+                        block_ids_by_group=[list(range(1, 9))],
+                        block_hashes=hashes,
+                        kv_cache_group_ids=[0],
+                    )
+                    thread.add_stored_request("r1")
+                    thread.request_queue.put(req)
+                    thread._handle_request(req)
+                    keys = [key for call in store.put_calls for key in call[0]]
+                    self.assertEqual(len(keys), 8 // (8 // dcp_size))
+                    saved_mla.extend(keys)
+
+                expected_mla = {
+                    PoolKey(KeyMetadata("m", 0, dcp_rank, 0), h).to_string()
+                    for dcp_rank in range(dcp_size)
+                    for h in hashes
+                }
+                self.assertEqual(len(saved_mla), len(expected_mla))
+                self.assertEqual(set(saved_mla), expected_mla)
+
+                # Aligned state group must still be saved by every TP owner without replica sharding.
+                saved_align: list[str] = []
+                for tp_rank in range(8):
+                    dcp_rank = tp_rank % dcp_size
+                    db = ChunkedTokenDatabase([KeyMetadata("m", tp_rank, dcp_rank, 0)], [16], None)
+                    db.set_group_buffers({0: [2000]}, {0: [16]})
+                    store = FakeStore([0] * 8)
+                    thread = KVCacheStoreSendingThread(
+                        m_store=store,
+                        token_database=db,
+                        block_size=[16],
+                        tp_rank=tp_rank,
+                        tp_size=8,
+                        pcp_rank=0,
+                        pcp_size=1,
+                        dcp_size=dcp_size,
+                        put_step=8,
+                        kv_role="kv_producer",
+                        ready_event=threading.Event(),
+                        group_uses_align_state=[True],
+                    )
+                    req = ReqMeta(
+                        req_id="r1",
+                        token_len_chunk=128,
+                        block_ids_by_group=[list(range(1, 9))],
+                        block_hashes=hashes,
+                        kv_cache_group_ids=[0],
+                    )
+                    thread.add_stored_request("r1")
+                    thread.request_queue.put(req)
+                    thread._handle_request(req)
+                    keys = [key for call in store.put_calls for key in call[0]]
+                    self.assertEqual(len(keys), 8)
+                    saved_align.extend(keys)
+
+                expected_align = {
+                    PoolKey(KeyMetadata("m", tp_rank, tp_rank % dcp_size, 0), h).to_string()
+                    for tp_rank in range(8)
+                    for h in hashes
+                }
+                self.assertEqual(len(saved_align), len(expected_align))
+                self.assertEqual(set(saved_align), expected_align)
 
     def test_handle_request_save_decisions(self):
         cases = [

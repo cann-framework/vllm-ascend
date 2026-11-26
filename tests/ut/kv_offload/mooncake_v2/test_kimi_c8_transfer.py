@@ -341,3 +341,54 @@ def test_unequal_pages_transfer_exactly_the_history_before_tail_recompute(length
     history_end = length - int(truncated)
     offsets = [i for i in range(12) if rank * 1536 + i * 128 < history_end]
     assert mapped == ([(0, [108 + i for i in offsets], [240 + rank * 12 + i for i in offsets])] if offsets else [])
+
+
+@pytest.mark.parametrize("remote_dcp", [2, 4])
+@pytest.mark.parametrize("prompt_len", [500, 1664, 1665, 3328, 3329, 13313, 227287])
+def test_c8_sub_tp_dcp_producer_to_dcp8_consumer_maps_exact_prompt_pages(remote_dcp, prompt_len):
+    page = 1664
+    local_dcp = 8
+    c8_spec = replace(spec(), block_size=page)
+    remote_blocks = list(range(100, 100 + (prompt_len + page * remote_dcp - 1) // (page * remote_dcp)))
+    local_blocks = list(range(500, 500 + (prompt_len + page * local_dcp - 1) // (page * local_dcp)))
+    expected_pages = (prompt_len + page - 1) // page
+
+    transferred: dict[int, tuple[int, int]] = {}
+    for d_rank in range(local_dcp):
+        thread = make_thread(dcp_size=local_dcp, dcp_rank=d_rank, tp_size=8, tp_rank=d_rank)
+        thread._kimi_c8_enabled = True
+        mapped = thread._compute_group_block_ids(
+            request_id="req",
+            remote_tp_rank_groups=[list(range(8))],
+            remote_dcp_size=remote_dcp,
+            spec_index=0,
+            local_block_size=page,
+            remote_block_size=page,
+            local_group_block_ids=local_blocks,
+            local_full_group_block_ids=local_blocks,
+            remote_group_block_ids=remote_blocks,
+            local_num_prompt_tokens=prompt_len,
+            remote_num_prompt_tokens=prompt_len,
+            num_computed_tokens=0,
+            local_block_size_scale=1,
+            remote_block_size_scale=1,
+            spec=c8_spec,
+            selection_index=d_rank,
+        )
+        for remote_tp_rank, local_kblocks, remote_kblocks in mapped:
+            assert len(local_kblocks) == len(remote_kblocks)
+            assert len(local_kblocks) % 13 == 0
+            for idx in range(0, len(local_kblocks), 13):
+                local_page_id = local_kblocks[idx] // 13
+                remote_page_id = remote_kblocks[idx] // 13
+                assert local_kblocks[idx : idx + 13] == list(range(local_page_id * 13, (local_page_id + 1) * 13))
+                assert remote_kblocks[idx : idx + 13] == list(range(remote_page_id * 13, (remote_page_id + 1) * 13))
+                local_pos = local_blocks.index(local_page_id)
+                global_page = local_pos * local_dcp + d_rank
+                assert global_page not in transferred
+                transferred[global_page] = (remote_tp_rank % remote_dcp, remote_blocks.index(remote_page_id))
+
+    assert sorted(transferred) == list(range(expected_pages))
+    for global_page, (src_dcp_rank, src_block_idx) in transferred.items():
+        assert src_dcp_rank == global_page % remote_dcp
+        assert src_block_idx == global_page // remote_dcp

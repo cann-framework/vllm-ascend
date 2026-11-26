@@ -1162,7 +1162,21 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 # Request progress is not a durable save watermark on this branch.
                 return not should_skip(start, start + group_block_size)
 
-            tp_replicas = self.put_step if self.dcp_size <= 1 and not align_state_group else 1
+            if align_state_group:
+                tp_replicas = 1
+                tp_replica_rank = 0
+            elif self.dcp_size <= 1:
+                tp_replicas = self.put_step
+                tp_replica_rank = self.tp_rank % tp_replicas
+            elif self.pcp_size == 1 and self.put_step % self.dcp_size == 0:
+                # Under PCP=1 with DCP < put_step (e.g., TP=8, DCP=2, MLA),
+                # ranks sharing (dcp_rank, head_or_tp_rank) hold identical KV
+                # shards at stride dcp_size; shard PUTs across those replicas.
+                tp_replicas = self.put_step // self.dcp_size
+                tp_replica_rank = (self.tp_rank % self.put_step) // self.dcp_size
+            else:
+                tp_replicas = 1
+                tp_replica_rank = 0
             # PCP=2, TP=4, KV heads=2, tp_replicas=2:
             # PCP  TP (KV 0 / KV 1)  shard_rank  filtered candidates
             #  0        0 / 2            0      0, 4, ...
@@ -1176,7 +1190,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 kv_cache_group_id=group_id,
                 skip_null_blocks=skip_null_blocks,
                 chunk_filter=chunk_filter,
-                shard_rank=self.pcp_rank * tp_replicas + self.tp_rank % tp_replicas,
+                shard_rank=self.pcp_rank * tp_replicas + tp_replica_rank,
                 shard_size=self.pcp_size * tp_replicas,
                 chunk_mask=group_store_mask,
             )

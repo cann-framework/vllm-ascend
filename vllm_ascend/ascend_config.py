@@ -406,6 +406,9 @@ class RlConfig:
         os.environ["VLLM_SERVER_DEV_MODE"] = "1"
 
 
+SUPPORTED_C8_DCP_SIZES = (1, 2, 4, 8)
+
+
 @config
 class AscendConfig:
     """Configuration Object for additional_config from vllm.configs.
@@ -700,18 +703,18 @@ class AscendConfig:
         if getattr(parallel, "prefill_context_parallel_size", 1) != 1:
             raise ValueError("mla_cache_mode=C8 currently requires prefill_context_parallel_size=1")
         dcp = getattr(parallel, "decode_context_parallel_size", 1)
-        if dcp not in (1, 8):
-            raise ValueError("mla_cache_mode=C8 currently supports decode_context_parallel_size=1 or 8")
-        if dcp == 8 and getattr(parallel, "cp_kv_cache_interleave_size", None) != 1664:
-            raise ValueError("mla_cache_mode=C8 with DCP8 requires cp_kv_cache_interleave_size=1664")
+        if dcp not in SUPPORTED_C8_DCP_SIZES:
+            raise ValueError("mla_cache_mode=C8 currently supports decode_context_parallel_size in (1, 2, 4, 8)")
+        if dcp > 1 and getattr(parallel, "cp_kv_cache_interleave_size", None) != 1664:
+            raise ValueError(f"mla_cache_mode=C8 with DCP{dcp} requires cp_kv_cache_interleave_size=1664")
         kv_transfer = getattr(vllm_config, "kv_transfer_config", None)
         if kv_transfer is not None:
             from vllm_ascend.core.kv_cache_interface import supports_c8_pd_connector
 
             if not supports_c8_pd_connector(vllm_config):
                 raise ValueError("mla_cache_mode=C8 P/D requires a supported Mooncake connector using V2/Pull")
-            if dcp == 8 and getattr(vllm_config.cache_config, "block_size", None) != 1664:
-                raise ValueError("mla_cache_mode=C8 P/D with DCP8 requires block_size=1664")
+            if dcp > 1 and getattr(vllm_config.cache_config, "block_size", None) != 1664:
+                raise ValueError(f"mla_cache_mode=C8 P/D with DCP{dcp} requires block_size=1664")
             if kv_transfer.kv_connector == "MultiConnector":
                 extra_config = kv_transfer.kv_connector_extra_config or {}
                 children = extra_config.get("connectors", ())
@@ -721,8 +724,8 @@ class AscendConfig:
                     if isinstance(child, dict) and child.get("kv_connector") == "AscendStoreConnector"
                 ]
                 if store_children:
-                    if dcp == 8 and not vllm_config.cache_config.enable_prefix_caching:
-                        raise ValueError("C8 DCP8 Store requires enable_prefix_caching for KDA checkpoint hashes")
+                    if dcp > 1 and not vllm_config.cache_config.enable_prefix_caching:
+                        raise ValueError(f"C8 DCP{dcp} Store requires enable_prefix_caching for KDA checkpoint hashes")
                     if getattr(kv_transfer, "kv_load_failure_policy", "fail") not in ("fail", "recompute"):
                         raise ValueError("C8 Store requires kv_load_failure_policy=fail or recompute")
                     for child in store_children:

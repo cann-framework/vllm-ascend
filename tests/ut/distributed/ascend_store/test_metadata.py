@@ -832,10 +832,11 @@ def test_c8_namespace_is_versioned_and_salted():
     )
     group = SimpleNamespace(kv_cache_spec=c8_spec)
     assert infer_cache_namespace([group], {"cache_salt": "release-20261121"}) == "c8-pa-nz-v1:release-20261121"
-    assert (
-        infer_cache_namespace([group], {"cache_salt": "release-20261121"}, dcp_size=8)
-        == "c8-pa-nz-v2-dcp8:release-20261121"
-    )
+    for dcp_size in (2, 4, 8):
+        assert (
+            infer_cache_namespace([group], {"cache_salt": "release-20261121"}, dcp_size=dcp_size)
+            == f"c8-pa-nz-v2-dcp{dcp_size}:release-20261121"
+        )
 
 
 def test_c8_namespace_reads_store_connector_salt():
@@ -901,3 +902,37 @@ def test_namespace_position_matches_chunked_token_prefix():
     database = ChunkedTokenDatabase([meta], [16], None)
 
     assert key.to_string() == database._get_key_prefix(0) + "hash"
+
+
+def test_c8_store_sub_tp_dcp_keys_use_end_of_logical_block():
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    for dcp_size in (2, 4):
+        config = SimpleNamespace(
+            additional_config={"mla_cache_mode": "C8"},
+            cache_config=SimpleNamespace(prefix_match_unit=None, enable_prefix_caching=True, block_size=1664),
+        )
+        hash_size = infer_store_hash_block_size(config, [1664, 1664], dcp_size)
+        groups = [
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=1664)),
+            SimpleNamespace(kv_cache_spec=MambaSpec(block_size=1664, shapes=((4,),), dtypes=(torch.float32,))),
+        ]
+        sizes = infer_store_group_block_sizes(config, groups, dcp_size)
+        logical_block = 1664 * dcp_size
+        assert hash_size == 1664
+        assert sizes == [logical_block, 1664]
+        db = ChunkedTokenDatabase([KeyMetadata("model", 0, 0, 0)] * 2, sizes, None, hash_block_size=hash_size)
+        hashes = [f"h{index}" for index in range(2 * dcp_size)]
+        assert list(
+            db._iter_token_chunks(
+                logical_block,
+                hashes[:dcp_size],
+                kv_cache_group_id=1,
+                block_ids=[0] * (dcp_size - 1) + [2],
+                skip_null_blocks=True,
+            )
+        ) == [(logical_block - 1664, logical_block, f"h{dcp_size - 1}", 2)]
+        assert get_block_hashes(hashes, logical_block, hash_size)[:] == [
+            f"h{dcp_size - 1}",
+            f"h{2 * dcp_size - 1}",
+        ]
