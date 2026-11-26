@@ -156,6 +156,25 @@ def test_c8_producer_multiconnector_preserves_raw_mla_contract():
     assert supports_component_major_mla_pd(config)
 
 
+def test_c8_store_rejects_dual_role_and_null_backend():
+    transfer = SimpleNamespace(
+        kv_connector="MultiConnector",
+        kv_role="kv_both",
+        is_kv_producer=True,
+        kv_connector_extra_config={
+            "connectors": [
+                {"kv_connector": "MooncakeConnectorV2"},
+                {"kv_connector": "AscendStoreConnector"},
+            ]
+        },
+    )
+    config = SimpleNamespace(kv_transfer_config=transfer)
+    assert not supports_c8_pd_connector(config)
+    transfer.kv_role = "kv_producer"
+    transfer.kv_connector_extra_config["connectors"][1]["kv_connector_extra_config"] = {"backend": None}
+    assert not supports_c8_pd_connector(config)
+
+
 def test_c8_consumer_rejects_store_before_native_pull():
     config = SimpleNamespace(
         additional_config={"mla_cache_mode": "C8"},
@@ -178,7 +197,7 @@ def test_c8_consumer_rejects_store_before_native_pull():
     assert not supports_component_major_mla_pd(config)
 
 
-def test_c8_consumer_store_requires_first_position_and_load():
+def test_c8_consumer_rejects_store_regardless_of_order_and_load():
     for connectors in (
         [
             {"kv_connector": "MooncakeConnectorV2"},

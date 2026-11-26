@@ -1183,7 +1183,7 @@ def _validate_kv_load_failure_policy(vllm_config: VllmConfig) -> None:
             raise AssertionError("C8 hybrid recompute requires producer-side Mooncake Store.")
         children = kv_transfer_config.kv_connector_extra_config["connectors"]
         store = next(child for child in children if child["kv_connector"] == "AscendStoreConnector")
-        if not store.get("kv_connector_extra_config", {}).get("load_async", False):
+        if not (store.get("kv_connector_extra_config") or {}).get("load_async", False):
             raise AssertionError("C8 hybrid recompute requires load_async=true on the Store connector.")
 
 

@@ -1884,7 +1884,7 @@ class TestNPUPlatform(TestBase):
         )
 
         _validate_kv_load_failure_policy(vllm_config)
-        vllm_config.kv_transfer_config.kv_connector_extra_config["connectors"][0]["kv_connector_extra_config"].clear()
+        vllm_config.kv_transfer_config.kv_connector_extra_config["connectors"][0]["kv_connector_extra_config"] = None
         with pytest.raises(AssertionError, match="load_async=true"):
             _validate_kv_load_failure_policy(vllm_config)
 

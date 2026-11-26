@@ -721,6 +721,8 @@ class AscendConfig:
                     if isinstance(child, dict) and child.get("kv_connector") == "AscendStoreConnector"
                 ]
                 if store_children:
+                    if dcp == 8 and not vllm_config.cache_config.enable_prefix_caching:
+                        raise ValueError("C8 DCP8 Store requires enable_prefix_caching for KDA checkpoint hashes")
                     if getattr(kv_transfer, "kv_load_failure_policy", "fail") not in ("fail", "recompute"):
                         raise ValueError("C8 Store requires kv_load_failure_policy=fail or recompute")
                     for child in store_children:

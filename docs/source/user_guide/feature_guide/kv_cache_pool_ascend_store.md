@@ -476,6 +476,7 @@ For C8 P/D with producer-side Store reuse, set per-connector options on the
 }
 ```
 
+C8 DCP8 producers using Store require local prefix caching enabled so the engine supplies a hash at each KDA checkpoint.
 Hybrid C8 supports `kv_load_failure_policy="recompute"` on the producer with
 `load_async=true` on its Store child. Use `"fail"` for synchronous loads and
 on the decoder. After upgrading the C8 DCP8 layout, warm the new namespace.

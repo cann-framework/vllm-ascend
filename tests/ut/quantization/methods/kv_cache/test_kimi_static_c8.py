@@ -19,7 +19,7 @@ def configuration():
             prefill_context_parallel_size=1, decode_context_parallel_size=8, cp_kv_cache_interleave_size=1664
         ),
         kv_transfer_config=Ns(is_kv_producer=False, kv_connector="MooncakePullConnector"),
-        cache_config=Ns(block_size=1664),
+        cache_config=Ns(block_size=1664, enable_prefix_caching=True),
         use_v2_model_runner=True,
         speculative_config=None,
     )
@@ -90,6 +90,11 @@ def test_c8_dcp8_producer_allows_store_with_native_pull(configuration):
     }
     options = AscendConfig(mla_cache_mode="C8", sparse_kv_offload_config=Ns(enabled=False))
     options._validate_mla_cache_mode(configuration)
+
+    configuration.cache_config.enable_prefix_caching = False
+    with pytest.raises(ValueError, match="enable_prefix_caching"):
+        options._validate_mla_cache_mode(configuration)
+    configuration.cache_config.enable_prefix_caching = True
 
     pull["kv_connector"] = "MooncakeHybridConnector"
     with pytest.raises(ValueError, match="requires a supported Mooncake connector"):

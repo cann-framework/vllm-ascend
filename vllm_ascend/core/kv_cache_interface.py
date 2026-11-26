@@ -133,7 +133,9 @@ def supports_c8_pd_connector(vllm_config: VllmConfig) -> bool:
         return False
 
     extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
-    connectors = [child for child in extra_config.get("connectors", ()) if isinstance(child, dict)]
+    connectors = extra_config.get("connectors", ())
+    if any(not isinstance(child, dict) or child.get("kv_connector_module_path") for child in connectors):
+        return False
     names = tuple(child.get("kv_connector") for child in connectors)
     store_count = names.count("AscendStoreConnector")
     if store_count > 1 or sum(name in c8_remote_names for name in names) != 1:
@@ -142,15 +144,13 @@ def supports_c8_pd_connector(vllm_config: VllmConfig) -> bool:
         return False
 
     if getattr(kv_transfer_config, "is_kv_producer", False):
-        if store_count != 1 or len(names) != 2:
+        if getattr(kv_transfer_config, "kv_role", None) == "kv_both" or store_count != 1 or len(names) != 2:
             return False
-        if any(
-            child.get("kv_connector_module_path") or child.get("kv_role", "kv_producer") != "kv_producer"
-            for child in connectors
-        ):
+        if any(child.get("kv_role", "kv_producer") != "kv_producer" for child in connectors):
             return False
         store_extra = connectors[names.index("AscendStoreConnector")].get("kv_connector_extra_config") or {}
-        return store_extra.get("backend", "mooncake").lower() == "mooncake"
+        backend = store_extra.get("backend", "mooncake")
+        return isinstance(backend, str) and backend.lower() == "mooncake"
 
     # MultiConnector picks a single source. A partial Store hit on D would
     # prevent V2 from pulling the remaining producer blocks.
