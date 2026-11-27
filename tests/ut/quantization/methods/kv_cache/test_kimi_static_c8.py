@@ -226,3 +226,43 @@ def test_c8_prefill_history_block_fast_path_and_fallbacks_are_bit_exact(padded_s
         )
         expected = _dequantize_static_fp8(ref_rows, scale, torch.bfloat16).unsqueeze(1)
         assert torch.equal(actual, expected)
+
+
+def test_c8_prefill_history_read_raw_and_dequant_contract():
+    from vllm_ascend.attention.kimi_c8_static import (
+        C8PrefillHistory,
+        _dequantize_static_fp8,
+        pa_nz_cache_view,
+        supports_npu_fp8_anti_quant,
+        write_static_fp8_cache,
+    )
+
+    torch.manual_seed(17)
+    num_blocks, block_size = 4, 128
+    backing = torch.zeros(num_blocks * block_size * 576, dtype=torch.uint8)
+    cache = pa_nz_cache_view(backing, num_blocks, block_size)
+    merged = torch.randn(num_blocks * block_size, 576, dtype=torch.bfloat16)
+    scale = torch.tensor([0.1372941], dtype=torch.float32)
+    write_static_fp8_cache(merged, cache, torch.arange(num_blocks * block_size, dtype=torch.int64), scale)
+
+    table = torch.tensor([[2, 0], [3, 1]], dtype=torch.int32)
+    lengths = torch.tensor([[128, 64], [0, 0]], dtype=torch.int32)
+    starts = torch.tensor([[0, 0], [0, 0]], dtype=torch.int32)
+    history = C8PrefillHistory.prepare(cache, table, lengths, starts)
+
+    raw0 = history.read_raw(cache, 0)
+    assert raw0.dtype == torch.uint8
+    assert raw0.shape == (192, 1, 576)
+    assert torch.equal(
+        _dequantize_static_fp8(raw0, scale, torch.bfloat16), history.read(cache, 0, scale, dtype=torch.bfloat16)
+    )
+
+    raw_empty = history.read_raw(cache, 1)
+    assert raw_empty.dtype == torch.uint8
+    assert raw_empty.shape == (0, 1, 576)
+    deq_empty = _dequantize_static_fp8(raw_empty, scale, torch.bfloat16)
+    assert deq_empty.dtype == torch.bfloat16
+    assert deq_empty.shape == (0, 1, 576)
+
+    assert not supports_npu_fp8_anti_quant(torch.device("cpu"), torch.bfloat16)
+    assert not supports_npu_fp8_anti_quant(torch.device("cpu"), torch.float32)

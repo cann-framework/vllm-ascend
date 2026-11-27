@@ -2379,6 +2379,16 @@ class AscendMLAImpl(MLAAttentionImpl):
         assert 0 <= index < iters
         return prefill_metadata.chunked_context.chunk_seq_lens_npu[index]
 
+    def _reorg_packed_kvcache(
+        self,
+        packed_kv_c_k_pe: torch.Tensor,
+        chunked_context: ChunkedContextMetadata,
+        chunk_idx: int,
+        toks: int,
+    ) -> torch.Tensor:
+        del chunked_context, chunk_idx, toks
+        return packed_kv_c_k_pe
+
     def _reorg_kvcache(
         self,
         kv_c_normed: torch.Tensor,
@@ -2391,6 +2401,29 @@ class AscendMLAImpl(MLAAttentionImpl):
         del chunked_context, chunk_idx, toks, packed_kv_c_k_pe
         return kv_c_normed, k_pe
 
+    def _use_c8_npu_anti_quant(self, device: torch.device, dtype: torch.dtype) -> bool:
+        cache = getattr(self, "_c8_npu_anti_quant_cache", None)
+        if cache is None:
+            cache = {}
+            self._c8_npu_anti_quant_cache = cache
+        key = (device.type, dtype)
+        supported = cache.get(key)
+        if supported is None:
+            from vllm_ascend.attention.kimi_c8_static import supports_npu_fp8_anti_quant
+
+            supported = supports_npu_fp8_anti_quant(device, dtype)
+            cache[key] = supported
+        return supported
+
+    def _project_c8_prefill_kv(self, kv_c_normed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+        w_uv_prefill = getattr(self, "_c8_w_uv_prefill", None)
+        if w_uv_prefill is None or getattr(self, "W_UK_T", None) is None:
+            return None
+        w_uk_2d = self.W_UK_T.reshape(self.num_heads * self.qk_nope_head_dim, self.kv_lora_rank)
+        k_nope = torch.matmul(kv_c_normed, w_uk_2d.t()).view(-1, self.num_heads, self.qk_nope_head_dim)
+        v = torch.matmul(kv_c_normed, w_uv_prefill).view(-1, self.num_heads, self.v_head_dim)
+        return k_nope, v
+
     def _compute_prefill_context(
         self,
         q_nope: torch.Tensor,
@@ -2400,6 +2433,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_metadata: AscendMLAMetadata,
         prefix_output: torch.Tensor,
         prefix_lse: torch.Tensor,
+        *,
+        precomputed_query: torch.Tensor | None = None,
     ):
         assert len(kv_c_and_k_pe_cache) > 1 or getattr(self, "kimi_c8_static_fp8", False)
         prefill_metadata = attn_metadata.prefill
@@ -2421,8 +2456,13 @@ class AscendMLAImpl(MLAAttentionImpl):
             return prefix_output, prefix_lse
 
         history_plan = None
+        c8_dequant_fn = None
+        use_c8_anti_quant = False
         if is_c8:
-            from vllm_ascend.attention.kimi_c8_static import C8PrefillHistory
+            from vllm_ascend.attention.kimi_c8_static import C8PrefillHistory, _dequantize_static_fp8
+
+            c8_dequant_fn = _dequantize_static_fp8
+            use_c8_anti_quant = self._use_c8_npu_anti_quant(cache_kv_c.device, q_nope.dtype)
 
             # The runner shares prefill metadata across layers in this attention group.
             key = (
@@ -2460,7 +2500,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         has_context = False
 
         if self.head_padding > 0:
-            query = torch.cat((q_nope, q_pe), dim=-1)
+            query = precomputed_query if precomputed_query is not None else torch.cat((q_nope, q_pe), dim=-1)
 
         common_kwargs = {
             "num_heads": self.num_heads,
@@ -2477,11 +2517,27 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
-            packed_kv_c_k_pe = None
             if history_plan is not None:
-                # C8 load and reload both set the recipe's fixed FP32 descale.
-                packed_kv_c_k_pe = history_plan.read(cache_kv_c, i, self.fak_descale_float, dtype=q_nope.dtype)
-                kv_c_normed, k_pe = packed_kv_c_k_pe.split([self.kv_lora_rank, rope_dim], dim=-1)
+                # All-gather and unpad raw uint8 FP8 rows before dequantizing:
+                # halves DCP HCCL traffic, skips padding rows, and is bit-exact
+                # because C8 shares one layer-wide static FP32 descale.
+                raw_packed = history_plan.read_raw(cache_kv_c, i)
+                raw_packed = self._reorg_packed_kvcache(
+                    raw_packed,
+                    chunked_context=prefill_metadata.chunked_context,
+                    chunk_idx=i,
+                    toks=toks,
+                )
+                if raw_packed.numel() == 0:
+                    continue
+                assert c8_dequant_fn is not None
+                packed_kv = c8_dequant_fn(
+                    raw_packed,
+                    self.fak_descale_float,
+                    q_nope.dtype,
+                    use_npu_anti_quant=use_c8_anti_quant,
+                )
+                kv_c_normed, k_pe = packed_kv.split([self.kv_lora_rank, rope_dim], dim=-1)
             else:
                 context_seq_len_npu = self.get_context_seq_len_npu(i, attn_metadata)
                 kv_c_normed = torch.empty(
@@ -2509,26 +2565,23 @@ class AscendMLAImpl(MLAAttentionImpl):
                 )
                 if rope_dim == 0:
                     k_pe = kv_c_normed.new_empty(toks, num_heads, 0)
-            kv_c_normed, k_pe = self._reorg_kvcache(
-                kv_c_normed,
-                k_pe,
-                chunked_context=prefill_metadata.chunked_context,
-                chunk_idx=i,
-                toks=toks,
-                packed_kv_c_k_pe=packed_kv_c_k_pe,
-            )
-            if kv_c_normed.numel() == 0:
-                continue
+                kv_c_normed, k_pe = self._reorg_kvcache(
+                    kv_c_normed,
+                    k_pe,
+                    chunked_context=prefill_metadata.chunked_context,
+                    chunk_idx=i,
+                    toks=toks,
+                )
+                if kv_c_normed.numel() == 0:
+                    continue
             kv_c_normed = kv_c_normed.reshape(-1, latent_kv_dim) if is_c8 else kv_c_normed.squeeze()
             if self.fa_quant_layer and self.support_fp8_attention and not is_c8:
                 kv_c_normed = torch.mul(kv_c_normed.to(self.fak_descale_float.dtype), self.fak_descale_float).to(
                     torch.bfloat16
                 )
-            w_uv_prefill = getattr(self, "_c8_w_uv_prefill", None) if is_c8 else None
-            if w_uv_prefill is not None and getattr(self, "W_UK_T", None) is not None:
-                w_uk_2d = self.W_UK_T.reshape(self.num_heads * self.qk_nope_head_dim, self.kv_lora_rank)
-                k_nope = torch.matmul(kv_c_normed, w_uk_2d.t()).view(-1, self.num_heads, self.qk_nope_head_dim)
-                v = torch.matmul(kv_c_normed, w_uv_prefill).view(-1, self.num_heads, self.v_head_dim)
+            projected_kv = self._project_c8_prefill_kv(kv_c_normed) if is_c8 else None
+            if projected_kv is not None:
+                k_nope, v = projected_kv
             else:
                 kv_nope = self.kv_b_proj(kv_c_normed.contiguous())[0].view(
                     -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
@@ -2722,7 +2775,14 @@ class AscendMLAImpl(MLAAttentionImpl):
         )
 
         attn_output, attn_lse = self._compute_prefill_context(
-            q_nope, q_pe, kv_c_and_k_pe_cache, self.qk_rope_head_dim, attn_metadata, attn_output, attn_lse
+            q_nope,
+            q_pe,
+            kv_c_and_k_pe_cache,
+            self.qk_rope_head_dim,
+            attn_metadata,
+            attn_output,
+            attn_lse,
+            precomputed_query=query if self.head_padding > 0 else None,
         )
 
         attn_output = attn_output.reshape([num_tokens, self.num_heads * self.v_head_dim])
@@ -4469,11 +4529,19 @@ class AscendMLAImpl(MLAAttentionImpl):
             prefill_k_pe, prefill_k_c_normed = (kv[num_decode_tokens:num_actual_tokens] for kv in written_kv)
         if skip_kv_b_proj:
             return PrefillMLAPreprocessResult(prefill_q_nope, prefill_q_pe)
-        prefill_k_nope, prefill_value = (
-            self.kv_b_proj(prefill_k_c_normed)[0]
-            .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        projected_kv = (
+            self._project_c8_prefill_kv(prefill_k_c_normed.reshape(-1, self.kv_lora_rank))
+            if getattr(self, "kimi_c8_static_fp8", False)
+            else None
         )
+        if projected_kv is not None:
+            prefill_k_nope, prefill_value = projected_kv
+        else:
+            prefill_k_nope, prefill_value = (
+                self.kv_b_proj(prefill_k_c_normed)[0]
+                .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+                .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            )
         prefill_k_pe = prefill_k_pe.view(prefill_q_c.shape[0], self.num_kv_heads, self.qk_rope_head_dim)
         prefill_k_pe = prefill_k_pe.expand((*prefill_k_nope.shape[:-1], -1))
         return PrefillMLAPreprocessResult(prefill_q_nope, prefill_q_pe, prefill_k_nope, prefill_k_pe, prefill_value)
