@@ -1147,6 +1147,7 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
         chunked_context: ChunkedContextMetadata,
         chunk_idx: int,
         toks: int,
+        packed_kv_c_k_pe: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         reorg and unpad kvcache after cp local gather to tp layout for attn kernel.
@@ -1182,15 +1183,12 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
         max_seq_len = chunked_context.max_seq_lens[chunk_idx]
         chunk_size: int = chunked_context.chunk_size
         kv_rank_offsets = chunked_context.kv_rank_offsets[chunk_idx]
-        cache_kv_c_k_pe = torch.cat([kv_c_normed, k_pe], dim=-1)
+        cache_kv_c_k_pe = (
+            packed_kv_c_k_pe.contiguous() if packed_kv_c_k_pe is not None else torch.cat([kv_c_normed, k_pe], dim=-1)
+        )
         cache_kv_c_k_pe = self._dcp_all_gather(cache_kv_c_k_pe, 0)
 
-        allgatered_kv_c_normed, allgatered_k_pe = cache_kv_c_k_pe.split(
-            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
-
-        kv_c_segments = []
-        k_pe_segments = []
+        spans: list[tuple[int, int]] = []
         src_token_idx = 0
         max_seq_len_check = 0
         for row, local_context_lens in enumerate(local_context_lens_allranks):
@@ -1218,17 +1216,27 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
                 )
                 if local_chunk_len != 0:
                     src_start = kv_rank_offsets[rank] + src_token_idx
-                    kv_c_segment = allgatered_kv_c_normed[src_start : src_start + local_chunk_len]
-                    k_pe_segment = allgatered_k_pe[src_start : src_start + local_chunk_len]
-                    kv_c_segments.append(kv_c_segment)
-                    k_pe_segments.append(k_pe_segment)
+                    src_end = src_start + local_chunk_len
+                    if spans and spans[-1][1] == src_start:
+                        spans[-1] = (spans[-1][0], src_end)
+                    else:
+                        spans.append((src_start, src_end))
                     cur_seq_len += local_chunk_len
             max_seq_len_check = max(max_seq_len_check, cur_seq_len)
             src_token_idx += padded_local_chunk_seq_len
-        if not kv_c_segments:
+        if not spans:
             return kv_c_normed[:0], k_pe[:0]
-        reorganized_kv_c_normed = torch.cat(kv_c_segments, dim=0)
-        reorganized_k_pe = torch.cat(k_pe_segments, dim=0)
+        if len(spans) == 1:
+            span_start, span_end = spans[0]
+            reorganized_packed = cache_kv_c_k_pe[span_start:span_end]
+        else:
+            reorganized_packed = torch.cat(
+                [cache_kv_c_k_pe[span_start:span_end] for span_start, span_end in spans],
+                dim=0,
+            )
+        reorganized_kv_c_normed, reorganized_k_pe = reorganized_packed.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
         assert reorganized_kv_c_normed.shape[0] == sum_seq_len, (
             "DCP MLA KV reorg length mismatch: "
             f"actual={reorganized_kv_c_normed.shape[0]}, "

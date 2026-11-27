@@ -2386,7 +2386,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         chunked_context: ChunkedContextMetadata,
         chunk_idx: int,
         toks: int,
+        packed_kv_c_k_pe: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        del chunked_context, chunk_idx, toks, packed_kv_c_k_pe
         return kv_c_normed, k_pe
 
     def _compute_prefill_context(
@@ -2475,10 +2477,11 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
+            packed_kv_c_k_pe = None
             if history_plan is not None:
                 # C8 load and reload both set the recipe's fixed FP32 descale.
-                history = history_plan.read(cache_kv_c, i, self.fak_descale_float, dtype=q_nope.dtype)
-                kv_c_normed, k_pe = history.split([self.kv_lora_rank, rope_dim], dim=-1)
+                packed_kv_c_k_pe = history_plan.read(cache_kv_c, i, self.fak_descale_float, dtype=q_nope.dtype)
+                kv_c_normed, k_pe = packed_kv_c_k_pe.split([self.kv_lora_rank, rope_dim], dim=-1)
             else:
                 context_seq_len_npu = self.get_context_seq_len_npu(i, attn_metadata)
                 kv_c_normed = torch.empty(
@@ -2512,6 +2515,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 chunked_context=prefill_metadata.chunked_context,
                 chunk_idx=i,
                 toks=toks,
+                packed_kv_c_k_pe=packed_kv_c_k_pe,
             )
             if kv_c_normed.numel() == 0:
                 continue
@@ -2526,7 +2530,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 k_nope = torch.matmul(kv_c_normed, w_uk_2d.t()).view(-1, self.num_heads, self.qk_nope_head_dim)
                 v = torch.matmul(kv_c_normed, w_uv_prefill).view(-1, self.num_heads, self.v_head_dim)
             else:
-                kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+                kv_nope = self.kv_b_proj(kv_c_normed.contiguous())[0].view(
                     -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
                 )
                 k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
