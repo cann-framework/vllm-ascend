@@ -59,7 +59,9 @@ def test_pa_nz_flag_preserves_c8_target_draft_and_pcp_routes(enabled, pcp, mode,
     scope = {
         "torch": torch,
         "get_current_vllm_config": lambda: config,
-        "get_ascend_config": lambda: SimpleNamespace(mla_cache_mode=mode, enable_kv_nz=False),
+        "get_ascend_config": lambda: SimpleNamespace(
+            mla_cache_mode=mode, enable_kv_nz=False, enable_mla_prefill_qfa=False
+        ),
         "get_current_hardware_profile": lambda: SimpleNamespace(supports=lambda _: True),
         "HardwareCapability": SimpleNamespace(FP8_ATTENTION="fp8", MLA_FLASH="mla"),
         "is_pcp_decode_sharding_enabled": lambda _: False,

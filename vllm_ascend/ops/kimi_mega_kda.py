@@ -175,6 +175,30 @@ def ensure_mega_kda_nd(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def mega_kda_projection_weight(layer) -> torch.Tensor:
+    """Build a BF16 [out,in] view/copy without changing the Linear operands.
+
+    MXFP8 weights have already completed the ModelSlim post-load finalizer:
+    [K,N] (optionally single-group NZ) and paired E8M0 scales [K/64,N,2].
+    This runs once before profiling/capture, never in the decode hot path.
+    """
+    weight = layer.weight.detach()
+    if weight.dtype == torch.bfloat16:
+        return ensure_mega_kda_nd(weight)
+    if weight.device.type == "npu":
+        weight = torch_npu.npu_format_cast(weight, ACL_FORMAT_FRACTAL_ND, customize_dtype=torch.float8_e4m3fn)
+    scales = layer.weight_scale.detach().view(torch.uint8)
+    if getattr(layer, "_mxfp8_gmm_nz_layout", False):
+        weight, scales = weight.squeeze(0), scales.squeeze(0)
+    weight = weight.float().transpose(0, 1)
+    exponents = scales.transpose(0, 1).reshape(weight.shape[0], -1)
+    scales = torch.pow(2.0, exponents.float() - 127)
+    scales = scales.masked_fill(exponents == 255, float("nan"))
+    weight = (weight * scales.repeat_interleave(32, dim=-1)[:, : weight.shape[1]]).to(torch.bfloat16)
+    prefix, suffix = getattr(layer, "mxfp8_tp_padding", (0, 0))
+    return weight[:, prefix : weight.shape[1] - suffix].contiguous()
+
+
 def run_mega_recurrent_kda(
     hidden_states: torch.Tensor,
     weights: MegaKDAWeights,

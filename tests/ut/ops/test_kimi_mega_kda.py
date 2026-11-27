@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from torch import nn
+from torch.multiprocessing.reductions import StorageWeakRef
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -51,6 +52,7 @@ def runtime():
     ns = {
         "__name__": __name__,
         "torch": torch,
+        "StorageWeakRef": StorageWeakRef,
         "nn": nn,
         "Module": nn.Module,
         "dataclass": dataclass,
@@ -95,6 +97,7 @@ def runtime():
             "ensure_mega_kda_bf16",
             "ensure_mega_kda_nd",
             "mega_kda_nz_operand",
+            "mega_kda_projection_weight",
             "run_mega_recurrent_kda",
             "run_commit_recurrent_kda",
         },
@@ -130,13 +133,21 @@ def runtime():
         "_release_default_kda_weights",
         "_released_mega_nd_params",
         "_forward_default",
+        "_is_eager_prefill_batch",
+        "_run_serial_prefill_qkv_bfg",
+        "_format_bfg",
+        "prepare_prefill_gate_weights",
         "_current_mega_weight_signature",
         "_forward_mega_kda",
         "_execute_mega_kda",
         "_prepare_mega_replayssm",
         "_allocate_mega_output",
     }
-    _definitions("vllm_ascend/ops/kimi_kda.py", {"_restore_token_rows", "_MegaKDAPlan", "_MegaKDAReplayPlan"}, ns)
+    _definitions(
+        "vllm_ascend/ops/kimi_kda.py",
+        {"_restore_token_rows", "_MegaKDAPlan", "_MegaKDAReplayPlan", "_mxfp8_qkv_storages"},
+        ns,
+    )
     _definitions("vllm_ascend/ops/kimi_kda.py", {"AscendKimiK3DeltaAttention"}, ns, methods=methods, bases="Module")
     return ns
 
@@ -157,6 +168,8 @@ def _attention(ns, *, batch=4, spec_len=8):
     layer.tp_size = 2
     layer.uses_mixed_projection = False
     layer.use_mega_kda_replayssm = True
+    layer._mega_pd_decode_worker = False
+    layer._mega_pd_prefill_worker = False
     layer._mega_operator = MagicMock()
     layer._commit_operator = MagicMock()
     layer._mega_weights = None
@@ -402,6 +415,93 @@ def test_mixed_projection_uses_original_factors(runtime):
     torch.testing.assert_close(weights.f_b, layer.fused_bfg_proj.f_b_weight)
 
 
+@pytest.mark.parametrize("fused_prefill", [True, False])
+def test_serial_prefill_uses_original_factors_and_qkv_dispatch(runtime, fused_prefill):
+    from einops import rearrange
+
+    layer = _attention(runtime)
+    layer.uses_mixed_projection = True
+    layer._prefill_fused_kda_operator = object() if fused_prefill else None
+    layer._fused_bfg_output_sizes = (2, 8, 8)
+    mx_method = type("MXFP8", (), {})
+    runtime.update(AscendW8A8MXFP8DynamicLinearMethod=mx_method, maybe_trans_nz=torch.clone, rearrange=rearrange)
+    layer.in_proj_qkvgfab.quant_method = SimpleNamespace(quant_method=mx_method())
+    packed = torch.randn(18, 32, dtype=torch.bfloat16)
+    packed[2:10].fill_(float("nan"))  # A dense F projection would propagate NaNs.
+    fused = layer.fused_bfg_proj = _linear(packed)
+    fused.f_a_weight = torch.randn(4, 32, dtype=torch.bfloat16)
+    fused.f_b_weight = torch.randn(8, 4, dtype=torch.bfloat16)
+    layer.prepare_prefill_gate_weights()
+    packed[:2].neg_()
+    layer.prepare_prefill_gate_weights()  # Refresh B/G after a checkpoint reload.
+
+    x = torch.randn(5, 32, dtype=torch.bfloat16)
+    qkv = torch.randn(5, 24, dtype=x.dtype)
+    layer._quantize_fused_qkv = MagicMock(return_value=object())
+    layer._matmul_fused_qkv = MagicMock(return_value=qkv)
+    layer._forward = MagicMock()
+    layer.o_proj = MagicMock(return_value=(x, None))
+    layer._run_overlapped_qkv_bfg = MagicMock(side_effect=AssertionError("unexpected overlap"))
+    meta = SimpleNamespace(num_prefills=1, num_decodes=0, num_spec_decodes=0)
+    runtime["is_forward_context_available"] = lambda: True
+    runtime["get_forward_context"].return_value = SimpleNamespace(
+        cudagraph_runtime_mode="none", attn_metadata={layer.prefix: meta}
+    )
+    type(layer)._forward_default(layer, x, torch.arange(5))
+    layer._quantize_fused_qkv.assert_called_once_with(x)
+    layer._matmul_fused_qkv.assert_called_once_with(layer._quantize_fused_qkv.return_value)
+    out = layer._forward.call_args.kwargs
+    assert out["mixed_qkv"] is qkv
+    assert out["beta_is_preprocessed"] is (not fused_prefill)
+    raw_beta = x @ packed[:2].T
+    torch.testing.assert_close(out["beta"], (raw_beta if fused_prefill else raw_beta.float().sigmoid()).unsqueeze(0))
+    torch.testing.assert_close(out["g1"], ((x @ fused.f_a_weight.T) @ fused.f_b_weight.T).reshape(1, 5, 2, 4))
+    torch.testing.assert_close(out["g2"], (x @ packed[10:].T).reshape(5, 2, 4))
+
+
+@pytest.mark.parametrize("producer,consumer", [(False, True), (True, False), (True, True), (False, False)])
+@pytest.mark.parametrize("previously_prepared", [False, True])
+def test_prefill_gate_weights_skip_only_dedicated_decode(runtime, producer, consumer, previously_prepared):
+    layer = _attention(runtime)
+    layer._mega_pd_prefill_worker = producer
+    layer._mega_pd_decode_worker = consumer
+    layer._fused_bfg_output_sizes = (2, 8, 8)
+    mx_method = type("MXFP8", (), {})
+    convert = MagicMock(side_effect=torch.clone)
+    runtime.update(AscendW8A8MXFP8DynamicLinearMethod=mx_method, maybe_trans_nz=convert)
+    layer.in_proj_qkvgfab.quant_method = SimpleNamespace(quant_method=mx_method())
+    packed = torch.randn(18, 32, dtype=torch.bfloat16)
+    layer.fused_bfg_proj = _linear(packed)
+    layer._prefill_gate_weights = (torch.empty(1), torch.empty(1)) if previously_prepared else None
+
+    layer.prepare_prefill_gate_weights()
+
+    if consumer and not producer:
+        assert layer._prefill_gate_weights is None
+        convert.assert_not_called()
+    else:
+        assert convert.call_count == 2
+        beta, gate = layer._prefill_gate_weights
+        torch.testing.assert_close(beta, packed[:2])
+        torch.testing.assert_close(gate, packed[10:])
+    assert layer.fused_bfg_proj.weight.numel() == packed.numel()
+
+
+@pytest.mark.parametrize("counts", [(0, 1, 0), (0, 0, 1), (1, 1, 0), (1, 0, 1)])
+def test_serial_prefill_excludes_decode_and_mixed_batches(runtime, counts):
+    layer = _attention(runtime)
+    meta = SimpleNamespace(num_prefills=counts[0], num_decodes=counts[1], num_spec_decodes=counts[2])
+    ctx = SimpleNamespace(cudagraph_runtime_mode="none", attn_metadata={layer.prefix: meta})
+    runtime["is_forward_context_available"] = lambda: True
+    runtime["get_forward_context"].return_value = ctx
+    assert not layer._is_eager_prefill_batch()
+    meta.num_prefills, meta.num_decodes, meta.num_spec_decodes = 1, 0, 0
+    ctx.cudagraph_runtime_mode = "full"
+    assert not layer._is_eager_prefill_batch()
+    ctx.cudagraph_runtime_mode, ctx.attn_metadata = "none", None
+    assert not layer._is_eager_prefill_batch()
+
+
 def test_tracker_prefill_verify_reorder_single_token_reuse_and_repeat(runtime):
     tracker = runtime["MegaKDAFirstVerifyTracker"](16, torch.device("cpu"))
     slots = torch.tensor([2, 5])
@@ -508,16 +608,19 @@ def test_builder_uses_bound_capacity_and_resets_folded_prefill(runtime, graph_ba
     assert builder.build(0, common, None, drafts).mega_first_verify.tolist() == [1, 0] + [0] * (graph_batch - 2)
 
 
-def test_model_postload_visits_only_target_attention_and_mm_forwards(runtime):
+@pytest.mark.parametrize("enable_mega", [False, True])
+def test_model_postload_visits_only_target_attention_and_mm_forwards(runtime, enable_mega):
     target_type = runtime["AscendKimiK3DeltaAttention"]
     target = _attention(runtime)
+    target.uses_mixed_projection = True
+    target.prepare_prefill_gate_weights = MagicMock()
     target._prepare_mega_weights = MagicMock()
     other = nn.Linear(2, 2)
     other._prepare_mega_weights = MagicMock()
     runtime.update(
         UpstreamKimiLinearForCausalLM=nn.Module,
         AscendKimiK3DeltaAttentionBase=target_type,
-        get_ascend_config=lambda: SimpleNamespace(enable_mega_kda_replayssm=True),
+        get_ascend_config=lambda: SimpleNamespace(enable_mega_kda_replayssm=enable_mega),
     )
     _definitions(
         "vllm_ascend/models/kimi_k3.py",
@@ -529,7 +632,8 @@ def test_model_postload_visits_only_target_attention_and_mm_forwards(runtime):
     model = runtime["AscendKimiLinearForCausalLM"]()
     model.model = nn.ModuleList([target, other])
     model.process_weights_after_loading()
-    target._prepare_mega_weights.assert_called_once()
+    target.prepare_prefill_gate_weights.assert_called_once_with()
+    assert target._prepare_mega_weights.call_count == int(enable_mega)
     other._prepare_mega_weights.assert_not_called()
     _definitions(
         "vllm_ascend/models/kimi_k3.py",
@@ -541,7 +645,8 @@ def test_model_postload_visits_only_target_attention_and_mm_forwards(runtime):
     multimodal = runtime["AscendKimiK3ForConditionalGeneration"]()
     multimodal.language_model = model
     multimodal.process_weights_after_loading()
-    assert target._prepare_mega_weights.call_count == 2
+    assert target.prepare_prefill_gate_weights.call_count == 2
+    assert target._prepare_mega_weights.call_count == (2 if enable_mega else 0)
 
 
 def test_custom_op_reduces_already_projected_output_once(runtime):
@@ -615,12 +720,51 @@ def test_released_default_path_fails_loudly(runtime):
         forward_default(layer, hidden, torch.arange(8))
 
 
+@pytest.mark.parametrize("hidden_alias", [False, True])
+def test_mxfp8_qkv_offload_releases_storage_and_preserves_mega_operand(runtime, hidden_alias):
+    layer = _attention(runtime)
+    layer._mega_pd_decode_worker = True
+    proj = layer.in_proj_qkvgfab
+    proj.weight = nn.Parameter(torch.ones(32, 24, dtype=torch.float8_e4m3fn), requires_grad=False)
+    proj.weight_scale = nn.Parameter(torch.full((1, 24, 2), 127, dtype=torch.uint8), requires_grad=False)
+    proj._mxfp8_weight_buf = proj.weight.detach()
+    proj._mxfp8_scale_buf = proj.weight_scale.detach()
+    proj._mxfp8_transformed = True
+    refs = [StorageWeakRef(t.untyped_storage()) for t in (proj.weight, proj.weight_scale)]
+    expected = sum(t.untyped_storage().nbytes() for t in (proj.weight, proj.weight_scale))
+    alias = proj.weight.detach() if hidden_alias else None
+    x = torch.randn(2, 32, dtype=torch.bfloat16)
+    operand = layer._mega_weights.qkv
+    pointer = operand.data_ptr()
+    before = torch.nn.functional.linear(x, operand)
+    released = layer._release_default_kda_weights()
+    assert released == (48 if hidden_alias else expected)
+    assert layer._mega_nd_released
+    assert proj.weight.numel() == proj.weight_scale.numel() == 0
+    assert not hasattr(proj, "_mxfp8_weight_buf")
+    assert not hasattr(proj, "_mxfp8_scale_buf")
+    cpu_weight, cpu_scale = proj._mega_qkv_cpu_weights
+    assert cpu_weight.device.type == cpu_scale.device.type == "cpu"
+    assert cpu_weight.shape == (32, 24)
+    assert torch.equal(cpu_weight.float(), torch.ones(32, 24))
+    assert torch.equal(cpu_scale, torch.full((1, 24, 2), 127, dtype=torch.uint8))
+    assert sum(not ref.expired() for ref in refs) == int(hidden_alias)
+    del alias
+    assert all(ref.expired() for ref in refs)
+    assert layer._mega_weights.qkv.data_ptr() == pointer
+    torch.testing.assert_close(torch.nn.functional.linear(x, operand), before, rtol=0, atol=0)
+    assert layer.o_proj.weight.numel() > 0
+    assert layer._release_default_kda_weights() == 0
+
+
 def test_release_mega_kda_nd_weights_targets_pd_decode_layers_only(runtime):
     _definitions("vllm_ascend/ops/kimi_kda.py", {"release_mega_kda_nd_weights"}, runtime)
     eligible = _attention(runtime)
     eligible._mega_pd_decode_worker = True
     plain = _attention(runtime)
-    model = SimpleNamespace(modules=lambda: [eligible, plain])
+    both = _attention(runtime)
+    both._mega_pd_decode_worker = both._mega_pd_prefill_worker = True
+    model = SimpleNamespace(modules=lambda: [eligible, plain, both])
     nz_pointer = eligible._mega_weights.qkv.data_ptr()
 
     released = runtime["release_mega_kda_nd_weights"](model)
@@ -632,8 +776,85 @@ def test_release_mega_kda_nd_weights_targets_pd_decode_layers_only(runtime):
     # Non-PD-decode layers keep their ND weights and stay unreleased.
     assert not plain._mega_nd_released
     assert plain.in_proj_qkvgfab.weight.numel() > 0
+    assert not both._mega_nd_released
+    assert both.in_proj_qkvgfab.weight.numel() > 0
     # A second call is a no-op (idempotent across repeated profile runs).
     assert runtime["release_mega_kda_nd_weights"](model) == 0
+
+
+def test_mxfp8_offload_copy_failure_preserves_device_operands(runtime, monkeypatch):
+    layer = _attention(runtime)
+    layer._mega_pd_decode_worker = True
+    proj = layer.in_proj_qkvgfab
+    proj._mxfp8_transformed = True
+    proj.weight_scale = nn.Parameter(torch.ones(2, dtype=torch.uint8), requires_grad=False)
+    proj._mxfp8_weight_buf = proj.weight.detach()
+    proj._mxfp8_scale_buf = proj.weight_scale.detach()
+    pointer = proj.weight.data_ptr()
+    real_to = torch.Tensor.to
+
+    def fail_scale_copy(tensor, *args, **kwargs):
+        if tensor.dtype == torch.uint8:
+            raise RuntimeError("CPU copy failed")
+        return real_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", fail_scale_copy)
+    with pytest.raises(RuntimeError, match="CPU copy failed"):
+        layer._release_default_kda_weights()
+    assert not layer._mega_nd_released
+    assert not hasattr(proj, "_mega_qkv_cpu_weights")
+    assert proj.weight.data_ptr() == proj._mxfp8_weight_buf.data_ptr() == pointer
+    assert proj.weight_scale.data_ptr() == proj._mxfp8_scale_buf.data_ptr()
+
+
+@pytest.mark.parametrize(
+    ("clear_params", "clear_buffers", "remaining"), [(False, False, 2), (True, False, 2), (True, True, 0)]
+)
+@pytest.mark.parametrize("hidden_alias", [False, True])
+def test_mxfp8_release_reports_storage_aliases(clear_params, clear_buffers, remaining, hidden_alias):
+    weight = torch.ones(8, dtype=torch.uint8)
+    scale = torch.ones(2, dtype=torch.uint8)
+    proj = SimpleNamespace(
+        weight=nn.Parameter(weight, requires_grad=False),
+        weight_scale=nn.Parameter(scale, requires_grad=False),
+        _mxfp8_weight_buf=weight,
+        _mxfp8_scale_buf=scale,
+        _mxfp8_transformed=True,
+    )
+    del weight, scale
+    alias = proj.weight.detach() if hidden_alias else None
+
+    def release():
+        if clear_params:
+            proj.weight.data = proj.weight.new_empty(0)
+            proj.weight_scale.data = proj.weight_scale.new_empty(0)
+        if clear_buffers:
+            del proj._mxfp8_weight_buf, proj._mxfp8_scale_buf
+        return 10 if clear_buffers else 0
+
+    layer = SimpleNamespace(
+        in_proj_qkvgfab=proj, _mega_weights=object(), _mega_pd_decode_worker=True, _release_default_kda_weights=release
+    )
+    npu = MagicMock()
+    npu.memory_allocated.side_effect = [100, 90 if clear_buffers else 100]
+    npu.memory_reserved.return_value = 128
+    log = MagicMock()
+    ns = {
+        "AscendKimiK3DeltaAttention": SimpleNamespace,
+        "torch": SimpleNamespace(npu=npu),
+        "logger": log,
+        "StorageWeakRef": StorageWeakRef,
+    }
+    _definitions("vllm_ascend/ops/kimi_kda.py", {"release_mega_kda_nd_weights", "_mxfp8_qkv_storages"}, ns)
+    assert ns["release_mega_kda_nd_weights"](SimpleNamespace(modules=lambda: [layer])) == (10 if clear_buffers else 0)
+    assert npu.synchronize.call_count == 2
+    before, after = [call.args[0] % call.args[1:] for call in log.info.call_args_list]
+    assert "qkv_storages=2 " in before
+    assert f"original_qkv_storages_still_referenced={remaining}/2 " in after
+    assert f"original_qkv_storages_alive={max(remaining, int(hidden_alias))}/2 " in after
+    assert f"allocated_drop_bytes={10 if clear_buffers else 0} " in after
+    assert log.warning.called == bool(remaining or hidden_alias)
+    del alias
 
 
 def test_pd_prefill_worker_skips_mega_operand_build(runtime):

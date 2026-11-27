@@ -16,9 +16,11 @@ import torch_npu
 from einops import rearrange
 from fla_npu.ops.ascendc import causal_conv1d_fn, causal_conv1d_update
 from torch import nn
+from torch.multiprocessing.reductions import StorageWeakRef
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture, is_breakable_cudagraph_enabled
+from vllm.config import CUDAGraphMode
 from vllm.distributed import tensor_model_parallel_all_reduce
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import logger
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -55,6 +57,7 @@ from vllm_ascend.ops.kimi_mega_kda import (
     load_commit_recurrent_kda_operator,
     load_mega_kda_operator,
     mega_kda_nz_operand,
+    mega_kda_projection_weight,
     run_commit_recurrent_kda,
     run_mega_recurrent_kda,
 )
@@ -69,7 +72,7 @@ from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import (
     AscendW8A8MXFP8DynamicLinearMethod,
 )
-from vllm_ascend.utils import npu_stream_switch
+from vllm_ascend.utils import maybe_trans_nz, npu_stream_switch
 
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
 _F_PROJ_SHARD_ID = 1
@@ -91,6 +94,20 @@ def _is_pd_prefill_worker(vllm_config) -> bool:
     return kv_transfer_config is not None and bool(getattr(kv_transfer_config, "is_kv_producer", False))
 
 
+def _mxfp8_qkv_storages(projections) -> dict[int, tuple[StorageWeakRef, int]]:
+    # Weak storage handles also detect owners outside the projection attributes.
+    storages = {}
+    for projection in projections:
+        for name in ("weight", "weight_scale", "_mxfp8_weight_buf", "_mxfp8_scale_buf"):
+            tensor = getattr(projection, name, None)
+            if tensor is not None:
+                storage = tensor.untyped_storage()
+                pointer = storage.data_ptr()
+                if pointer:
+                    storages[pointer] = (StorageWeakRef(storage), storage.nbytes())
+    return storages
+
+
 def release_mega_kda_nd_weights(model) -> int:
     """Release the default-path ND KDA projections on PD decode workers.
 
@@ -99,15 +116,56 @@ def release_mega_kda_nd_weights(model) -> int:
     subtracts the returned byte count from its weights accounting so the
     freed budget flows into the KV cache pool.
     """
-    released = 0
-    for module in model.modules():
-        if (
-            isinstance(module, AscendKimiK3DeltaAttention)
-            and getattr(module, "_mega_weights", None) is not None
-            and getattr(module, "_mega_pd_decode_worker", False)
-            and not getattr(module, "_mega_nd_released", False)
-        ):
-            released += module._release_default_kda_weights()
+    layers = [
+        module
+        for module in model.modules()
+        if isinstance(module, AscendKimiK3DeltaAttention)
+        and getattr(module, "_mega_weights", None) is not None
+        and getattr(module, "_mega_pd_decode_worker", False)
+        and not getattr(module, "_mega_pd_prefill_worker", False)
+        and not getattr(module, "_mega_nd_released", False)
+    ]
+    projections = [
+        layer.in_proj_qkvgfab for layer in layers if getattr(layer.in_proj_qkvgfab, "_mxfp8_transformed", False)
+    ]
+    if projections:
+        device = projections[0].weight.device
+        torch.npu.synchronize(device)
+        before = _mxfp8_qkv_storages(projections)
+        allocated_before = torch.npu.memory_allocated(device)
+        logger.info(
+            "MegaKDA QKV release before: device=%s mxfp8_layers=%d qkv_storages=%d "
+            "allocated_bytes=%d reserved_bytes=%d",
+            device,
+            len(projections),
+            len(before),
+            allocated_before,
+            torch.npu.memory_reserved(device),
+        )
+
+    released = sum(layer._release_default_kda_weights() for layer in layers)
+
+    if projections:
+        torch.npu.synchronize(device)
+        remaining = before.keys() & _mxfp8_qkv_storages(projections).keys()
+        alive = sum(not ref.expired() for ref, _ in before.values())
+        allocated_after = torch.npu.memory_allocated(device)
+        logger.info(
+            "MegaKDA QKV release after: device=%s original_qkv_storages_still_referenced=%d/%d "
+            "original_qkv_storages_alive=%d/%d "
+            "allocated_bytes=%d reserved_bytes=%d allocated_drop_bytes=%d all_kda_accounted_release_bytes=%d",
+            device,
+            len(remaining),
+            len(before),
+            alive,
+            len(before),
+            allocated_after,
+            torch.npu.memory_reserved(device),
+            allocated_before - allocated_after,
+            released,
+        )
+        if alive:
+            logger.warning("MegaKDA QKV release retained %d original storages through external references", alive)
     return released
 
 
@@ -409,6 +467,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
 
     # Worker startup prepares this layer after KV-cache binding.
     _requires_kda_state_copy = True
+    _prefill_gate_weights: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def get_kv_cache_spec(self, vllm_config):
         spec = super().get_kv_cache_spec(vllm_config)
@@ -718,7 +777,10 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             )
         if self.uses_mixed_projection:
             num_tokens = hidden_states.size(0)
-            mixed_qkv, beta, g1, g2 = self._run_overlapped_qkv_bfg(hidden_states)
+            if self._prefill_gate_weights is not None and self._is_eager_prefill_batch():
+                mixed_qkv, beta, g1, g2 = self._run_serial_prefill_qkv_bfg(hidden_states, *self._prefill_gate_weights)
+            else:
+                mixed_qkv, beta, g1, g2 = self._run_overlapped_qkv_bfg(hidden_states)
             core_attn_out = torch.empty(
                 (1, num_tokens, self.local_num_heads, self.head_dim),
                 dtype=hidden_states.dtype,
@@ -890,13 +952,13 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
 
     def _build_mega_weights(self) -> MegaKDAWeights:
         """Prepare the external operator operands once after weight loading."""
-        o_proj_weight = ensure_mega_kda_nd(self.o_proj.weight.detach())
+        o_proj_weight = mega_kda_projection_weight(self.o_proj)
         o_norm_weight = self.o_norm.weight.detach()
         if o_norm_weight.dtype != torch.float32:
             o_norm_weight = o_norm_weight.to(torch.float32)
         conv = ensure_mega_kda_bf16(ensure_mega_kda_nd(self.get_parameter(_PACKED_CONV_WEIGHT_NAME).detach()))
         if self.uses_mixed_projection:
-            weight = ensure_mega_kda_nd(self.in_proj_qkvgfab.weight.detach())
+            weight = mega_kda_projection_weight(self.in_proj_qkvgfab)
             fused = self.fused_bfg_proj
             fused_weight = ensure_mega_kda_nd(fused.weight.detach())
             output_dim = getattr(fused.weight, "output_dim", 0)
@@ -910,7 +972,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 self.local_projection_size,
             )
         else:
-            weight = ensure_mega_kda_nd(self.in_proj_qkvgfab.weight.detach())
+            weight = mega_kda_projection_weight(self.in_proj_qkvgfab)
             local_projection = self.local_projection_size
             qkv_end = 3 * local_projection
             gate_end = qkv_end + local_projection
@@ -919,7 +981,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             gate_src = weight[qkv_end:gate_end]
             f_a_src = weight[gate_end:f_a_end]
             beta_src = weight[f_a_end : f_a_end + self.local_num_heads]
-            f_b_src = ensure_mega_kda_nd(self.f_b_proj.weight.detach())
+            f_b_src = mega_kda_projection_weight(self.f_b_proj)
         return MegaKDAWeights(
             qkv=mega_kda_nz_operand(qkv_src),
             f_a=mega_kda_nz_operand(f_a_src),
@@ -950,15 +1012,27 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             self.gate_lower_bound is None
             or getattr(self.conv1d, "bias", None) is not None
             or any(
-                not isinstance(layer.quant_method, UnquantizedLinearMethod)
-                or layer.weight.dtype != torch.bfloat16
-                or layer.weight.ndim != 2
+                not (
+                    (
+                        isinstance(layer.quant_method, UnquantizedLinearMethod)
+                        and layer.weight.dtype == torch.bfloat16
+                        and layer.weight.ndim == 2
+                    )
+                    or (
+                        isinstance(
+                            getattr(layer.quant_method, "quant_method", layer.quant_method),
+                            AscendW8A8MXFP8DynamicLinearMethod,
+                        )
+                        and getattr(layer, "_mxfp8_transformed", False)
+                        and layer.weight.dtype == torch.float8_e4m3fn
+                    )
+                )
                 or getattr(layer, "bias", None) is not None
                 for layer in layers
             )
         ):
             logger.warning_once(
-                "MegaKDA requires bias-free, unquantized BF16 KDA projections and a bounded gate; "
+                "MegaKDA requires bias-free BF16 or finalized MXFP8 KDA projections and a bounded gate; "
                 "using the existing KDA path."
             )
             return False
@@ -978,11 +1052,39 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         Only valid on a PD decode worker: every request arrives with its KV
         and KDA state already transferred, so decode and verify always run
         through the MegaKDA operator and the default (prefill/recompute) KDA
-        path is dead. Releasing the ND originals keeps the NZ operand set the
-        single resident copy, restoring the pre-MegaKDA weight footprint.
-        Returns the number of device bytes freed.
+        path is dead. BF16 projections are released; finalized MXFP8 QKV and
+        scales are backed up on CPU before dropping their device aliases.
+        Other projections are retained in the MXFP8 case. Returns the number
+        of device bytes freed, excluding MXFP8 storages with external owners.
         """
+        if getattr(self, "_mega_nd_released", False):
+            return 0
+        projection = self.in_proj_qkvgfab
+        if getattr(projection, "_mxfp8_transformed", False):
+            # Preserve the finalized quantized operands on CPU. Only QKV is
+            # offloaded here; other projections retain their current storage.
+            # Decode/Verify keep using the independent MegaKDA BF16/NZ operands.
+            storages = _mxfp8_qkv_storages([projection])
+            weight = projection.weight.detach()
+            if weight.device.type == "npu":
+                weight = torch_npu.npu_format_cast(weight, 2, customize_dtype=torch.float8_e4m3fn)
+            cpu_weight = weight.to(device="cpu", copy=True)
+            del weight
+            cpu_scale = projection.weight_scale.detach().to(device="cpu", copy=True)
+            projection._mega_qkv_cpu_weights = (cpu_weight, cpu_scale)
+            projection.weight.data = projection.weight.new_empty(0)
+            projection.weight_scale.data = projection.weight_scale.new_empty(0)
+            for name in ("_mxfp8_weight_buf", "_mxfp8_scale_buf"):
+                if hasattr(projection, name):
+                    delattr(projection, name)
+            self._mega_nd_released = True
+            logger.info_once("MegaKDA MXFP8 QKV operands offloaded to CPU on the PD decode worker for %s", self.prefix)
+            # Only credit storages that really died; external aliases must not
+            # inflate the KV cache budget. No device transfers occur in forward.
+            return sum(size for ref, size in storages.values() if ref.expired())
         released = 0
+        if any(param.dtype != torch.bfloat16 for param in self._released_mega_nd_params()):
+            return released
         for param in self._released_mega_nd_params():
             released += param.numel() * param.element_size()
             param.data = torch.empty(0, dtype=param.dtype, device=param.device)
@@ -1016,6 +1118,9 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             weights.extend((self.fused_bfg_proj.weight, self.fused_bfg_proj.f_a_weight, self.fused_bfg_proj.f_b_weight))
         else:
             weights.append(self.f_b_proj.weight)
+        projections = [self.in_proj_qkvgfab, self.o_proj]
+        projections += [self.fused_bfg_proj] if self.uses_mixed_projection else [self.f_b_proj]
+        weights.extend(layer.weight_scale for layer in projections if hasattr(layer, "weight_scale"))
         signature = []
         for weight in weights:
             try:
@@ -1106,6 +1211,38 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             output = tensor_model_parallel_all_reduce(output)
         return output
 
+    def prepare_prefill_gate_weights(self) -> None:
+        """Extract rank-local B/G after loading; keep the original low-rank F factors."""
+        self._prefill_gate_weights = None
+        if self._mega_pd_decode_worker and not self._mega_pd_prefill_worker:
+            return
+        method = self.in_proj_qkvgfab.quant_method
+        if not isinstance(getattr(method, "quant_method", method), AscendW8A8MXFP8DynamicLinearMethod):
+            return
+        packed = ensure_mega_kda_nd(self.fused_bfg_proj.weight.detach())
+        beta, _, gate = packed.split(self._fused_bfg_output_sizes, dim=0)
+        self._prefill_gate_weights = (maybe_trans_nz(beta), maybe_trans_nz(gate))
+
+    def _is_eager_prefill_batch(self) -> bool:
+        # Read the live batch only in eager execution, outside Dynamo tracing.
+        if torch.compiler.is_compiling() or not is_forward_context_available():
+            return False
+        ctx = get_forward_context()
+        if ctx.cudagraph_runtime_mode != CUDAGraphMode.NONE or not isinstance(ctx.attn_metadata, dict):
+            return False
+        meta = ctx.attn_metadata.get(self.prefix)
+        return meta is not None and meta.num_prefills > 0 and meta.num_decodes == 0 and meta.num_spec_decodes == 0
+
+    def _run_serial_prefill_qkv_bfg(
+        self, hidden_states: torch.Tensor, beta_weight: torch.Tensor, gate_weight: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        fused = self.fused_bfg_proj
+        output_gate = nn.functional.linear(hidden_states, gate_weight)
+        mixed_qkv = self._matmul_fused_qkv(self._quantize_fused_qkv(hidden_states))
+        raw_gate = nn.functional.linear(nn.functional.linear(hidden_states, fused.f_a_weight), fused.f_b_weight)
+        beta = nn.functional.linear(hidden_states, beta_weight)
+        return mixed_qkv, *self._format_bfg(beta, raw_gate, output_gate)
+
     def _run_overlapped_qkv_bfg(
         self,
         hidden_states: torch.Tensor,
@@ -1161,10 +1298,11 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         self,
         fused_bfg: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        beta, raw_gate, output_gate = fused_bfg.split(
-            self._fused_bfg_output_sizes,
-            dim=-1,
-        )
+        return self._format_bfg(*fused_bfg.split(self._fused_bfg_output_sizes, dim=-1))
+
+    def _format_bfg(
+        self, beta: torch.Tensor, raw_gate: torch.Tensor, output_gate: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if getattr(self, "_prefill_fused_kda_operator", None) is None:
             beta = beta.float().sigmoid().unsqueeze(0)
         else:
