@@ -485,6 +485,8 @@ class AscendKimiMoE(nn.Module):
         # Keep routing and stream decisions inside the runtime MoE op. The
         # gate remains registered only here for checkpoint compatibility.
         object.__setattr__(self.experts, "_kimi_gate", self.gate)
+        object.__setattr__(self.experts, "_is_kimi_moe", True)
+        object.__setattr__(self.experts.routed_experts, "_is_kimi_moe", True)
         object.__setattr__(
             self.experts,
             "_kimi_router_stream",

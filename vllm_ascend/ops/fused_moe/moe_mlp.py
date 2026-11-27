@@ -19,6 +19,7 @@ import torch
 import torch_npu
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
+from vllm_ascend import envs
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
@@ -35,6 +36,10 @@ def apply_moe_mlp(
     Unified MoE MLP entry.
     Quant path is dispatched by each FusedMoEMethod with explicit typed kernel flags.
     """
+
+    bypass_mode = envs.VLLM_ASCEND_MOE_MLP_BYPASS
+    if bypass_mode is not None:
+        return _apply_bypassed_moe_mlp(mlp_compute_input, quant_method, bypass_mode)
 
     # When LoRA adapter is used in quantized weight, use individual lora impl.
     if mlp_compute_input.quant.is_quant and mlp_compute_input.lora_context is not None:
@@ -60,6 +65,121 @@ def apply_moe_mlp(
     before_gmm2_evt = torch.npu.current_stream().record_event()
     hidden_states = quant_method.apply_gmm2(mlp_compute_input, hidden_states, act_out_scale)
     return hidden_states, before_gmm2_evt
+
+
+def _apply_bypassed_moe_mlp(
+    mlp_compute_input: MoEMlpComputeInput,
+    quant_method,
+    bypass_mode: int,
+) -> tuple[torch.Tensor, torch.npu.Event]:
+    input_hidden_states = mlp_compute_input.hidden_states
+    input_shape = tuple(input_hidden_states.shape)
+    input_device = input_hidden_states.device
+    input_dtype = input_hidden_states.dtype
+    if input_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        input_dtype = torch.bfloat16
+
+    def debug_tensor(output_size: int) -> torch.Tensor:
+        return torch.zeros((*input_shape[:-1], output_size), device=input_device, dtype=input_dtype)
+
+    final_hidden_size = input_shape[-1]
+
+    if bypass_mode == 0:
+        hidden_states = debug_tensor(final_hidden_size)
+        before_gmm2_evt = torch.npu.current_stream().record_event()
+        return hidden_states, before_gmm2_evt
+
+    if bypass_mode in (1, 2):
+        gmm1_output_size = _infer_gmm1_output_size(mlp_compute_input, quant_method)
+
+    if bypass_mode == 1:
+        hidden_states = debug_tensor(gmm1_output_size)
+        _after_gmm1(mlp_compute_input)
+        hidden_states = _unified_apply_activation(mlp_compute_input, hidden_states, quant_method)
+        hidden_states, act_out_scale = quant_method.apply_act_quant(mlp_compute_input, hidden_states)
+    elif bypass_mode == 2:
+        hidden_states = quant_method.apply_gmm1(mlp_compute_input)
+        _after_gmm1(mlp_compute_input)
+        activation_output_size = gmm1_output_size // 2
+        hidden_states = debug_tensor(activation_output_size)
+        hidden_states, act_out_scale = quant_method.apply_act_quant(mlp_compute_input, hidden_states)
+    else:
+        if quant_method.supports_fused_activation(mlp_compute_input.activation):
+            hidden_states, act_out_scale = quant_method.apply_gmm1_act_quant(mlp_compute_input)
+        else:
+            hidden_states = quant_method.apply_gmm1(mlp_compute_input)
+            _after_gmm1(mlp_compute_input)
+            hidden_states = _unified_apply_activation(mlp_compute_input, hidden_states, quant_method)
+            hidden_states, act_out_scale = quant_method.apply_act_quant(mlp_compute_input, hidden_states)
+
+    before_gmm2_evt = torch.npu.current_stream().record_event()
+    if bypass_mode == 3:
+        hidden_states = debug_tensor(final_hidden_size)
+    else:
+        hidden_states = quant_method.apply_gmm2(mlp_compute_input, hidden_states, act_out_scale)
+    return hidden_states, before_gmm2_evt
+
+
+def _after_gmm1(mlp_compute_input: MoEMlpComputeInput) -> None:
+    if mlp_compute_input.shared_expert_schedule is not None:
+        mlp_compute_input.shared_expert_schedule.after_gmm1()
+
+
+
+def _infer_gmm1_output_size(mlp_compute_input: MoEMlpComputeInput, quant_method) -> int:
+    layer = mlp_compute_input.layer
+    moe_config = getattr(layer, "moe_config", None)
+    intermediate_size = getattr(moe_config, "intermediate_size_per_partition", None)
+    if isinstance(intermediate_size, int) and intermediate_size > 0:
+        return 2 * intermediate_size
+    input_size = mlp_compute_input.hidden_states.shape[-1]
+    weight = _get_mlp_weight(mlp_compute_input, quant_method, "w1")
+    return _infer_projection_output_size(weight, input_size, "GMM1")
+
+
+def _get_mlp_weight(mlp_compute_input: MoEMlpComputeInput, quant_method, name: str) -> torch.Tensor | None:
+    layer = mlp_compute_input.layer
+    layer_names = ("w13_weight_list", "w13_weight") if name == "w1" else ("w2_weight_list", "w2_weight")
+    if layer is not None:
+        for layer_name in layer_names:
+            weight = _first_tensor(getattr(layer, layer_name, None))
+            if weight is not None:
+                return weight
+
+    weight = _first_tensor(getattr(mlp_compute_input.weights, name, None))
+    if weight is not None:
+        return weight
+
+    if layer is not None:
+        weights = quant_method.get_mlp_weights(layer)
+        return _first_tensor(getattr(weights, name, None))
+    return None
+
+
+def _first_tensor(value) -> torch.Tensor | None:
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            tensor = _first_tensor(item)
+            if tensor is not None:
+                return tensor
+    return None
+
+
+def _infer_projection_output_size(weight: torch.Tensor | None, input_size: int, projection_name: str) -> int:
+    if weight is None or weight.ndim < 2:
+        raise ValueError(f"Cannot infer {projection_name} output size for MoE bypass")
+
+    dimension_a = int(weight.shape[-2])
+    dimension_b = int(weight.shape[-1])
+    if dimension_a == input_size and dimension_b != input_size:
+        return dimension_b
+    if dimension_b == input_size and dimension_a != input_size:
+        return dimension_a
+    raise ValueError(
+        f"Cannot infer {projection_name} output size: weight shape={tuple(weight.shape)}, input_size={input_size}"
+    )
 
 
 def _unified_apply_activation(

@@ -2146,7 +2146,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         )
         if projection is None:
             writer = None
-            if is_graph:
+            if is_graph or actual > num_decode:
                 from vllm_ascend.device.kimi_c8_cache_write import write_static_fp8_cache_graph
 
                 writer = write_static_fp8_cache_graph
