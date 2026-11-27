@@ -2415,6 +2415,36 @@ class AscendMLAImpl(MLAAttentionImpl):
             cache[key] = supported
         return supported
 
+    def _dequantize_c8_history(
+        self,
+        raw_packed: torch.Tensor,
+        scale: torch.Tensor,
+        dtype: torch.dtype,
+        *,
+        use_npu_anti_quant: bool,
+    ) -> tuple[torch.Tensor, bool]:
+        from vllm_ascend.attention.kimi_c8_static import (
+            _dequantize_static_fp8,
+            is_unsupported_npu_anti_quant_error,
+        )
+
+        if use_npu_anti_quant:
+            try:
+                return (
+                    _dequantize_static_fp8(raw_packed, scale, dtype, use_npu_anti_quant=True),
+                    True,
+                )
+            except Exception as exc:
+                if not is_unsupported_npu_anti_quant_error(exc):
+                    raise
+                cache = getattr(self, "_c8_npu_anti_quant_cache", None)
+                if cache is None:
+                    cache = {}
+                    self._c8_npu_anti_quant_cache = cache
+                cache[(raw_packed.device.type, dtype)] = False
+                use_npu_anti_quant = False
+        return _dequantize_static_fp8(raw_packed, scale, dtype, use_npu_anti_quant=False), use_npu_anti_quant
+
     def _project_c8_prefill_kv(self, kv_c_normed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
         w_uv_prefill = getattr(self, "_c8_w_uv_prefill", None)
         if w_uv_prefill is None or getattr(self, "W_UK_T", None) is None:
@@ -2456,12 +2486,10 @@ class AscendMLAImpl(MLAAttentionImpl):
             return prefix_output, prefix_lse
 
         history_plan = None
-        c8_dequant_fn = None
         use_c8_anti_quant = False
         if is_c8:
-            from vllm_ascend.attention.kimi_c8_static import C8PrefillHistory, _dequantize_static_fp8
+            from vllm_ascend.attention.kimi_c8_static import C8PrefillHistory
 
-            c8_dequant_fn = _dequantize_static_fp8
             use_c8_anti_quant = self._use_c8_npu_anti_quant(cache_kv_c.device, q_nope.dtype)
 
             # The runner shares prefill metadata across layers in this attention group.
@@ -2530,8 +2558,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 )
                 if raw_packed.numel() == 0:
                     continue
-                assert c8_dequant_fn is not None
-                packed_kv = c8_dequant_fn(
+                packed_kv, use_c8_anti_quant = self._dequantize_c8_history(
                     raw_packed,
                     self.fak_descale_float,
                     q_nope.dtype,

@@ -266,3 +266,111 @@ def test_c8_prefill_history_read_raw_and_dequant_contract():
 
     assert not supports_npu_fp8_anti_quant(torch.device("cpu"), torch.bfloat16)
     assert not supports_npu_fp8_anti_quant(torch.device("cpu"), torch.float32)
+
+
+@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("all_valid", [True, False])
+def test_c8_quantize_and_write_plan_preserve_caller_input(input_dtype, all_valid):
+    from vllm_ascend.attention.kimi_c8_static import (
+        C8CacheWritePlan,
+        pa_nz_cache_view,
+        quantize_static_fp8,
+    )
+
+    sample = torch.tensor([4.0, -8.0, 1000.0, -1000.0], dtype=input_dtype)
+    sample_before = sample.clone()
+    _ = quantize_static_fp8(sample, 2.0)
+    assert torch.equal(sample, sample_before)
+
+    num_blocks, block_size = 2, 128
+    backing = torch.zeros(num_blocks * block_size * 576, dtype=torch.uint8)
+    cache = pa_nz_cache_view(backing, num_blocks, block_size)
+    merged = torch.randn(16, 576, dtype=input_dtype) * 10.0
+    merged_before = merged.clone()
+    slots = torch.arange(16, dtype=torch.int64)
+    if not all_valid:
+        slots[0] = -1
+    plan = C8CacheWritePlan.prepare(cache, slots)
+    assert plan.all_valid is all_valid
+    plan.write(merged, cache, slots, torch.tensor([2.0], dtype=torch.float32))
+    assert torch.equal(merged, merged_before)
+
+
+def test_c8_anti_quant_probe_checks_real_layout_parity_and_errors():
+    from vllm_ascend.attention.kimi_c8_static import (
+        K3_MLA_CACHE_WIDTH,
+        _probe_npu_fp8_anti_quant,
+        supports_npu_fp8_anti_quant,
+    )
+
+    assert supports_npu_fp8_anti_quant(torch.device("cpu"), torch.bfloat16) is False
+    assert supports_npu_fp8_anti_quant(torch.device("npu"), torch.float32) is False
+
+    seen: dict[str, object] = {}
+
+    def exact_ref_anti_quant(x, s, *, dst_dtype):
+        seen["shape"] = tuple(x.shape)
+        seen["dtype"] = x.dtype
+        seen["nonzero"] = int((x.view(torch.uint8) != 0).sum().item())
+        return x.float().mul(s).to(dst_dtype)
+
+    assert _probe_npu_fp8_anti_quant(exact_ref_anti_quant, torch.device("cpu"), torch.bfloat16) is True
+    assert seen["shape"] == (2, 1, K3_MLA_CACHE_WIDTH)
+    assert seen["dtype"] == torch.float8_e4m3fn
+    assert seen["nonzero"] == 2 * K3_MLA_CACHE_WIDTH
+
+    def wrong_anti_quant(x, s, *, dst_dtype):
+        return torch.zeros(x.shape, dtype=dst_dtype, device=x.device)
+
+    assert _probe_npu_fp8_anti_quant(wrong_anti_quant, torch.device("cpu"), torch.bfloat16) is False
+
+    def unsupported_anti_quant(x, s, *, dst_dtype):
+        raise RuntimeError("AclNN_Parameter_Error(EZ1001): dtype not support")
+
+    assert _probe_npu_fp8_anti_quant(unsupported_anti_quant, torch.device("cpu"), torch.bfloat16) is False
+
+    def oom_anti_quant(x, s, *, dst_dtype):
+        raise RuntimeError("NPU out of memory")
+
+    with pytest.raises(RuntimeError, match="out of memory"):
+        _probe_npu_fp8_anti_quant(oom_anti_quant, torch.device("cpu"), torch.bfloat16)
+
+
+def test_c8_dequant_disables_anti_quant_cache_after_unsupported_error(monkeypatch):
+    from vllm_ascend.attention import kimi_c8_static
+    from vllm_ascend.attention.mla_v1 import AscendMLAImpl
+
+    impl = AscendMLAImpl.__new__(AscendMLAImpl)
+    impl._c8_npu_anti_quant_cache = {("cpu", torch.bfloat16): True}
+    raw = torch.tensor([[[0x38, 0x3C]]], dtype=torch.uint8)
+    scale = torch.tensor([0.1372941], dtype=torch.float32)
+
+    calls = {"anti_quant": 0}
+    orig_dequant = kimi_c8_static._dequantize_static_fp8
+
+    def fake_dequant(x, s, dtype, *, use_npu_anti_quant=False):
+        if use_npu_anti_quant:
+            calls["anti_quant"] += 1
+            raise RuntimeError("AclNN_Parameter_Error(EZ1001): not implemented for shape")
+        return orig_dequant(x, s, dtype, use_npu_anti_quant=False)
+
+    monkeypatch.setattr(kimi_c8_static, "_dequantize_static_fp8", fake_dequant)
+
+    out1, flag1 = impl._dequantize_c8_history(raw, scale, torch.bfloat16, use_npu_anti_quant=True)
+    assert flag1 is False
+    assert impl._c8_npu_anti_quant_cache[("cpu", torch.bfloat16)] is False
+    assert calls["anti_quant"] == 1
+
+    # Subsequent chunk must skip the failing fast path completely.
+    out2, flag2 = impl._dequantize_c8_history(raw, scale, torch.bfloat16, use_npu_anti_quant=flag1)
+    assert flag2 is False
+    assert calls["anti_quant"] == 1
+    assert torch.equal(out1, out2)
+
+    # Non-unsupported RuntimeErrors (e.g. OOM) must not be swallowed.
+    def fake_oom(x, s, dtype, *, use_npu_anti_quant=False):
+        raise RuntimeError("NPU out of memory")
+
+    monkeypatch.setattr(kimi_c8_static, "_dequantize_static_fp8", fake_oom)
+    with pytest.raises(RuntimeError, match="out of memory"):
+        impl._dequantize_c8_history(raw, scale, torch.bfloat16, use_npu_anti_quant=True)
