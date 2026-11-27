@@ -1,5 +1,6 @@
 import importlib
 import math
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -64,6 +65,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
     AscendStoreKVConnectorStats,
 )
+
+# Deduplicate repeated Store lookups for waiting requests blocked at the head
+# of the scheduler queue across consecutive chunked-prefill steps.
+WAITING_LOOKUP_CACHE_TTL_SECONDS = 5.0
+MAX_WAITING_LOOKUP_CACHE_SIZE = 256
 
 
 class KVPoolScheduler:
@@ -158,6 +164,8 @@ class KVPoolScheduler:
         self._unfinished_requests: dict[str, tuple[Request, list[list[int]]]] = {}
         self._loading_req_ids: set[str] = set()
         self._failed_async_load_req_ids: set[str] = set()
+        # request_id -> (token_len, num_computed_tokens, num_external_hit_tokens, timestamp)
+        self._waiting_lookup_cache: dict[str, tuple[int, int, int, float]] = {}
 
         self._block_pool: BlockPool | None = None
         self.sending_event_id = 0
@@ -616,10 +624,12 @@ class KVPoolScheduler:
         # Never retain a load plan from an earlier hit across a miss/early return.
         self.load_specs.pop(request.request_id, None)
         if request.request_id in self._failed_async_load_req_ids:
+            self._waiting_lookup_cache.pop(request.request_id, None)
             return 0, False
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_load:
             return 0, False
 
+        reused_waiting_lookup = False
         prompt_token_len = len(request.prompt_token_ids)
         final_block_start = (
             (request.num_tokens - 1) // self.lcm_block_size * self.lcm_block_size if self.use_eagle else None
@@ -659,14 +669,36 @@ class KVPoolScheduler:
                         token_len,
                     )
                     return 0, False
-                if self.client is None:
-                    self.client = LookupKeyClient(self.vllm_config)
-                num_external_hit_tokens = self.client.lookup(
-                    token_len,
-                    request.block_hashes,
-                    self.kv_cache_group_ids,
-                    hbm_hit_tokens=num_computed_tokens,
-                )
+                now = time.monotonic()
+                cached_lookup = self._waiting_lookup_cache.get(request.request_id)
+                if (
+                    cached_lookup is not None
+                    and cached_lookup[0] == token_len
+                    and cached_lookup[1] == num_computed_tokens
+                    and (now - cached_lookup[3]) < WAITING_LOOKUP_CACHE_TTL_SECONDS
+                ):
+                    num_external_hit_tokens = cached_lookup[2]
+                    reused_waiting_lookup = True
+                else:
+                    if self.client is None:
+                        self.client = LookupKeyClient(self.vllm_config)
+                    num_external_hit_tokens = self.client.lookup(
+                        token_len,
+                        request.block_hashes,
+                        self.kv_cache_group_ids,
+                        hbm_hit_tokens=num_computed_tokens,
+                    )
+                    if (
+                        request.request_id not in self._waiting_lookup_cache
+                        and len(self._waiting_lookup_cache) >= MAX_WAITING_LOOKUP_CACHE_SIZE
+                    ):
+                        self._waiting_lookup_cache.pop(next(iter(self._waiting_lookup_cache)))
+                    self._waiting_lookup_cache[request.request_id] = (
+                        token_len,
+                        num_computed_tokens,
+                        num_external_hit_tokens,
+                        now,
+                    )
 
         if num_external_hit_tokens == 0:
             return 0, False
@@ -704,7 +736,8 @@ class KVPoolScheduler:
         else:
             need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
-        logger.info(
+        log_fn = logger.debug if reused_waiting_lookup else logger.info
+        log_fn(
             "Reqid: %s, Total tokens %d, local hit: %d, total hit: %d, external load: %d",
             request.request_id,
             request.num_tokens,
@@ -750,6 +783,7 @@ class KVPoolScheduler:
         if num_external_tokens > 0:
             local_block_ids = normalize_block_ids_by_group(blocks.get_block_ids())
 
+        self._waiting_lookup_cache.pop(request.request_id, None)
         self._unfinished_requests[request.request_id] = (request, local_block_ids)
         if request.request_id not in self.load_specs:
             # No KV tokens from external KV cache, return
@@ -1019,12 +1053,21 @@ class KVPoolScheduler:
             self._unfinished_requests.pop(finished_req_id, None)
             self._preempted_req_ids.discard(finished_req_id)
             self._failed_async_load_req_ids.discard(finished_req_id)
+            self._waiting_lookup_cache.pop(finished_req_id, None)
+
+        if scheduler_output.finished_req_ids and self._waiting_lookup_cache:
+            # A finished request may have persisted new prefixes to Store; drop
+            # cached zero-hit entries so waiting requests re-probe immediately.
+            stale_zero_hits = [req_id for req_id, entry in self._waiting_lookup_cache.items() if entry[2] == 0]
+            for req_id in stale_zero_hits:
+                self._waiting_lookup_cache.pop(req_id, None)
 
         for req_id in scheduler_output.preempted_req_ids:
             self._preempted_req_ids.update(scheduler_output.preempted_req_ids)
             self._request_trackers.pop(req_id, None)
             self._unfinished_requests.pop(req_id, None)
             self._loading_req_ids.discard(req_id)
+            self._waiting_lookup_cache.pop(req_id, None)
 
         meta = AscendConnectorMetadata(
             scheduler_output.preempted_req_ids,

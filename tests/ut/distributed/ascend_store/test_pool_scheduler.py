@@ -1647,3 +1647,68 @@ def test_layerwise_partial_tail_preserves_zero_external_load(pool_hit_tokens):
     assert load_spec.vllm_cached_tokens == aligned_local_tokens
     assert load_spec.kvpool_cached_tokens == pool_hit_tokens
     assert load_spec.can_load
+
+
+def test_waiting_lookup_cache_deduplicates_and_invalidates(monkeypatch):
+    scheduler = KVPoolScheduler(make_config(block_size=16, extra_config={"load_async": True}), use_layerwise=False)
+    scheduler.client = MagicMock()
+    scheduler.client.lookup.return_value = 48
+    req_hit = SimpleNamespace(
+        request_id="blocked-hit",
+        prompt_token_ids=list(range(64)),
+        num_tokens=64,
+        block_hashes=[b"h"] * 4,
+    )
+    now = [100.0]
+    import vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler as pool_scheduler_mod
+
+    monkeypatch.setattr(pool_scheduler_mod.time, "monotonic", lambda: now[0])
+
+    # Repeated blocked-head probes reuse cached Store lookup result.
+    for _ in range(10):
+        assert scheduler.get_num_new_matched_tokens(req_hit, 0) == (48, True)
+    assert scheduler.client.lookup.call_count == 1
+    assert req_hit.request_id in scheduler.load_specs
+
+    # Local prefix growth forces a fresh lookup.
+    scheduler.client.lookup.return_value = 48
+    assert scheduler.get_num_new_matched_tokens(req_hit, 16) == (32, True)
+    assert scheduler.client.lookup.call_count == 2
+
+    # Admission via update_state_after_alloc invalidates the cache entry.
+    blocks = MagicMock()
+    blocks.get_block_ids.return_value = [[1, 2, 3]]
+    scheduler.update_state_after_alloc(req_hit, blocks, 32)
+    assert req_hit.request_id not in scheduler._waiting_lookup_cache
+
+    # Zero-hit waiting requests are invalidated when another request finishes
+    # (so newly persisted prefixes are picked up), while TTL also expires hits.
+    req_miss = SimpleNamespace(
+        request_id="blocked-miss",
+        prompt_token_ids=list(range(64)),
+        num_tokens=64,
+        block_hashes=[b"m"] * 4,
+    )
+    scheduler.client.lookup.return_value = 0
+    assert scheduler.get_num_new_matched_tokens(req_miss, 0) == (0, False)
+    assert scheduler.get_num_new_matched_tokens(req_miss, 0) == (0, False)
+    assert scheduler.client.lookup.call_count == 3
+
+    finished_output = SimpleNamespace(
+        finished_req_ids={"other-done"},
+        preempted_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[], new_block_ids=[]),
+        num_scheduled_tokens={},
+    )
+    scheduler.build_connector_meta(finished_output)
+    assert req_miss.request_id not in scheduler._waiting_lookup_cache
+
+    scheduler.client.lookup.return_value = 32
+    assert scheduler.get_num_new_matched_tokens(req_miss, 0) == (32, True)
+    assert scheduler.client.lookup.call_count == 4
+
+    # Advancing past TTL forces a fresh Store lookup.
+    now[0] += 10.0
+    assert scheduler.get_num_new_matched_tokens(req_miss, 0) == (32, True)
+    assert scheduler.client.lookup.call_count == 5

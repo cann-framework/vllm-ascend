@@ -682,3 +682,37 @@ def test_native_dcp_keeps_request_batch_40(monkeypatch, metadata_op, graph):
     assert fa.call_args.kwargs["cu_seqlens_q"].shape == (41,)
     assert fa.call_args.kwargs["seqused_q"].tolist() == [4] * 40
     assert fa.call_args.kwargs["mask_mode"] == 0 and fa.call_args.kwargs["max_seqlen_q"] == -1
+
+
+def test_c8_history_budget_caps_chunk_at_384mib_and_supports_dcp2(builder, monkeypatch):
+    config = builder.vllm_config
+    config.parallel_config.decode_context_parallel_size = 2
+    config.parallel_config.cp_kv_cache_interleave_size = 1664
+    impl = config.compilation_config.static_forward_context["mla"].impl
+    impl.head_padding, impl.num_heads = 4, 12
+    impl.qk_nope_head_dim, impl.qk_rope_head_dim, impl.v_head_dim = 128, 64, 128
+    group = Ns(world_size=2, rank_in_group=0, ranks=[0, 1])
+    monkeypatch.setattr(mla_cp, "get_dcp_group", lambda: group)
+    monkeypatch.setattr(common_cp, "get_dcp_group", lambda: group)
+
+    zeros = torch.zeros
+
+    def cpu_zeros(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return zeros(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "zeros", cpu_zeros)
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+    dcp = mla_cp.AscendMlaDCPMetadataBuilder(builder.kv_cache_spec, ["mla"], config, torch.device("cpu"))
+    dcp.chunked_prefill_enabled = True
+    dcp.chunked_prefill_workspace_size = 64 * 1664 * 2
+    dcp.chunked_prefill_workspace = torch.empty(0)
+    dcp.num_prefills = 1
+    dcp.query_lens = torch.tensor([13312], dtype=torch.int32)
+    dcp.seq_lens = torch.tensor([349440 + 13312], dtype=torch.int32)
+    metadata = dcp.build_chunked_metadata(0, Ns(num_reqs=1))
+
+    bytes_per_row = 12 * ((128 + 128) + (128 + 64) + 128) * 2
+    assert int(metadata.chunk_seq_lens.sum(dim=1).max()) * bytes_per_row <= mla_v1.C8_HISTORY_WORKSPACE_BUDGET_BYTES
+    assert dcp.max_context_chunk == 26624
+    assert metadata.chunk_size == 13312

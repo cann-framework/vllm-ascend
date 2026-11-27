@@ -2,6 +2,7 @@ from types import SimpleNamespace as Ns
 from unittest.mock import Mock
 
 import pytest
+import torch
 from vllm.config.compilation import CUDAGraphMode as Mode
 
 from vllm_ascend.ascend_config import AscendConfig
@@ -152,3 +153,76 @@ def test_c8_dcp_enforces_interleave_block_size_and_store_prefix_caching(configur
     configuration.cache_config.enable_prefix_caching = False
     with pytest.raises(ValueError, match="enable_prefix_caching"):
         options._validate_mla_cache_mode(configuration)
+
+
+@pytest.mark.parametrize("padded_stride", [False, True])
+@pytest.mark.parametrize("with_invalid_slots", [False, True])
+def test_c8_cache_write_plan_matches_write_static_fp8_cache(padded_stride, with_invalid_slots):
+    from vllm_ascend.attention.kimi_c8_static import C8CacheWritePlan, pa_nz_cache_view, write_static_fp8_cache
+
+    torch.manual_seed(7)
+    num_blocks, block_size = 4, 128
+    page_stride = (block_size + 128) * 576 if padded_stride else block_size * 576
+    backing_ref = torch.zeros(num_blocks * page_stride, dtype=torch.uint8)
+    backing_opt = torch.zeros(num_blocks * page_stride, dtype=torch.uint8)
+    cache_ref = pa_nz_cache_view(backing_ref, num_blocks, block_size, page_stride_bytes=page_stride)
+    cache_opt = pa_nz_cache_view(backing_opt, num_blocks, block_size, page_stride_bytes=page_stride)
+
+    merged = torch.randn(300, 576, dtype=torch.bfloat16)
+    slots = torch.arange(300, dtype=torch.int64)
+    if with_invalid_slots:
+        slots[::17] = -1
+    scale = torch.tensor([1.25], dtype=torch.float32)
+
+    write_static_fp8_cache(merged, cache_ref, slots, scale)
+    plan = C8CacheWritePlan.prepare(cache_opt, slots)
+    assert plan.all_valid is (not with_invalid_slots)
+    plan.write(merged, cache_opt, slots, scale)
+
+    assert torch.equal(backing_ref, backing_opt)
+
+    bad_slots = torch.tensor([num_blocks * block_size], dtype=torch.int64)
+    with pytest.raises(ValueError, match="capacity"):
+        C8CacheWritePlan.prepare(cache_opt, bad_slots)
+
+
+@pytest.mark.parametrize("padded_stride", [False, True])
+def test_c8_prefill_history_block_fast_path_and_fallbacks_are_bit_exact(padded_stride):
+    from vllm_ascend.attention.kimi_c8_static import (
+        C8PrefillHistory,
+        _dequantize_static_fp8,
+        _gather_static_fp8_rows,
+        pa_nz_cache_view,
+        write_static_fp8_cache,
+    )
+
+    torch.manual_seed(11)
+    num_blocks, block_size = 8, 128
+    page_stride = (block_size + 128) * 576 if padded_stride else block_size * 576
+    backing = torch.zeros(num_blocks * page_stride, dtype=torch.uint8)
+    cache = pa_nz_cache_view(backing, num_blocks, block_size, page_stride_bytes=page_stride)
+    merged = torch.randn(num_blocks * block_size, 576, dtype=torch.bfloat16)
+    write_static_fp8_cache(merged, cache, torch.arange(num_blocks * block_size, dtype=torch.int64), 1.0)
+
+    table = torch.tensor([[5, 2, 7, 0], [3, 1, 6, 4]], dtype=torch.int32)
+    # Chunk 0: both reqs aligned full blocks (fast path)
+    # Chunk 1: req 0 full block + req 1 partial tail (fast path)
+    # Chunk 2: unaligned start on req 0 (fallback path)
+    # Chunk 3: interior partial block on req 0 + full block on req 1 (fallback path)
+    lengths = torch.tensor([[256, 128], [128, 73], [90, 0], [50, 128]], dtype=torch.int32)
+    starts = torch.tensor([[0, 0], [256, 128], [37, 0], [0, 128]], dtype=torch.int32)
+    scale = torch.tensor([1.0], dtype=torch.float32)
+
+    history = C8PrefillHistory.prepare(cache, table, lengths, starts)
+    assert history.chunk_block_ids[0] is not None
+    assert history.chunk_block_ids[1] is not None
+    assert history.chunk_block_ids[2] is None
+    assert history.chunk_block_ids[3] is None
+
+    for chunk_idx in range(lengths.shape[0]):
+        actual = history.read(cache, chunk_idx, scale, dtype=torch.bfloat16)
+        ref_rows = _gather_static_fp8_rows(
+            cache, history.block_table, history.lengths[chunk_idx], history.starts[chunk_idx], history.totals[chunk_idx]
+        )
+        expected = _dequantize_static_fp8(ref_rows, scale, torch.bfloat16).unsqueeze(1)
+        assert torch.equal(actual, expected)

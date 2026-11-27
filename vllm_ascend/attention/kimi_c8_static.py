@@ -62,6 +62,52 @@ def write_static_fp8_cache(merged: torch.Tensor, cache: torch.Tensor, slots: tor
     pa_nz_storage_view(cache).view(-1, PA_NZ_TILE).index_copy_(0, indices, rows)
 
 
+@dataclass(frozen=True)
+class C8CacheWritePlan:
+    """One step's validated PA_NZ scatter indices shared across MLA layers."""
+
+    num_tokens: int
+    valid: torch.Tensor
+    indices: torch.Tensor
+    all_valid: bool
+
+    @classmethod
+    def prepare(cls, cache: torch.Tensor, slots: torch.Tensor) -> C8CacheWritePlan:
+        pa_nz_prolog_view(cache)
+        block_size = cache.shape[3]
+        if bool((slots >= cache.shape[0] * block_size).any()):
+            raise ValueError("C8 writer slot exceeds physical cache capacity")
+        valid, indices = pa_nz_indices(
+            slots,
+            block_size,
+            K3_MLA_CACHE_WIDTH,
+            page_stride_bytes=cache.stride(0),
+        )
+        return cls(
+            num_tokens=slots.numel(),
+            valid=valid,
+            indices=indices,
+            all_valid=bool(valid.all()),
+        )
+
+    def write(self, merged: torch.Tensor, cache: torch.Tensor, slots: torch.Tensor, validated_scale) -> None:
+        if merged.ndim != 2 or merged.shape[0] != self.num_tokens or merged.shape[1] != K3_MLA_CACHE_WIDTH:
+            raise ValueError("merged/cache layout is invalid")
+        if self.indices.numel() == 0:
+            return
+        src = merged if self.all_valid else merged[self.valid]
+        if (
+            isinstance(validated_scale, torch.Tensor)
+            and validated_scale.device == src.device
+            and validated_scale.dtype == torch.float32
+        ):
+            s = validated_scale
+        else:
+            s = torch.as_tensor(validated_scale, device=src.device, dtype=torch.float32)
+        rows = (src.float() / s).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn).view(torch.uint8)
+        pa_nz_storage_view(cache).view(-1, PA_NZ_TILE).index_copy_(0, self.indices, rows.reshape(-1, PA_NZ_TILE))
+
+
 def pa_nz_cache_view(
     raw: torch.Tensor,
     num_blocks: int,
@@ -194,6 +240,7 @@ class C8PrefillHistory:
     lengths: torch.Tensor
     starts: torch.Tensor
     totals: list[int]
+    chunk_block_ids: tuple[torch.Tensor | None, ...] = ()
 
     @classmethod
     def prepare(
@@ -210,6 +257,7 @@ class C8PrefillHistory:
             raise ValueError("C8 history lengths/starts must be non-negative")
         totals = lengths.sum(dim=1).tolist()
         block_table = block_table.to(cache.device)
+        chunk_block_ids: list[torch.Tensor | None] = [None] * len(totals)
         if any(totals):
             block_size, columns = cache.shape[3], block_table.shape[1]
             active = lengths > 0
@@ -228,7 +276,35 @@ class C8PrefillHistory:
             invalid = (block_table < 0) | (block_table >= cache.shape[0])
             if bool((used & invalid).any()):
                 raise ValueError("C8 history active block table entry is outside cache bounds")
-        return cls(block_table, lengths.to(cache.device), starts.to(cache.device), totals)
+
+            # Precompute block-level index_select lists for chunks whose active
+            # segments start on block boundaries (and only the last segment may
+            # end mid-block). Reusing these across all MLA layers avoids 5D
+            # per-token fancy indexing on every layer.
+            lengths_rows = lengths.tolist()
+            starts_rows = starts.tolist()
+            for chunk_idx, total in enumerate(totals):
+                if total == 0:
+                    continue
+                active_reqs = [req_idx for req_idx, length in enumerate(lengths_rows[chunk_idx]) if length > 0]
+                if not all(starts_rows[chunk_idx][req_idx] % block_size == 0 for req_idx in active_reqs):
+                    continue
+                if not all(lengths_rows[chunk_idx][req_idx] % block_size == 0 for req_idx in active_reqs[:-1]):
+                    continue
+                slices = [
+                    block_table[
+                        req_idx,
+                        starts_rows[chunk_idx][req_idx] // block_size : (
+                            starts_rows[chunk_idx][req_idx] + lengths_rows[chunk_idx][req_idx] + block_size - 1
+                        )
+                        // block_size,
+                    ]
+                    for req_idx in active_reqs
+                ]
+                chunk_block_ids[chunk_idx] = (
+                    slices[0].to(torch.int64) if len(slices) == 1 else torch.cat(slices, dim=0).to(torch.int64)
+                )
+        return cls(block_table, lengths.to(cache.device), starts.to(cache.device), totals, tuple(chunk_block_ids))
 
     def read(
         self, cache: torch.Tensor, chunk: int, validated_scale: torch.Tensor, *, dtype: torch.dtype
@@ -237,7 +313,14 @@ class C8PrefillHistory:
         total = self.totals[chunk]
         if total == 0:
             return torch.empty((0, 1, K3_MLA_CACHE_WIDTH), dtype=dtype, device=cache.device)
-        rows = _gather_static_fp8_rows(cache, self.block_table, self.lengths[chunk], self.starts[chunk], total)
+        blk_ids = self.chunk_block_ids[chunk] if chunk < len(self.chunk_block_ids) else None
+        if blk_ids is not None:
+            selected = cache.view(torch.uint8).index_select(0, blk_ids)
+            rows = selected.squeeze(1).permute(0, 2, 1, 3).reshape(-1, K3_MLA_CACHE_WIDTH)
+            if rows.shape[0] != total:
+                rows = rows[:total]
+        else:
+            rows = _gather_static_fp8_rows(cache, self.block_table, self.lengths[chunk], self.starts[chunk], total)
         return _dequantize_static_fp8(rows, validated_scale, dtype).unsqueeze(1)
 
 

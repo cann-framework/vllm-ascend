@@ -114,6 +114,12 @@ MLA_KERNEL_BLOCK_SIZE = 128
 
 # Exclusive batch * K limit of the fused op with perm_x1=(1, 0, 2).
 TRANSPOSE_BMM_MAX_SUPPORTED_DIM = 65536
+# Cap C8 history chunking at 384 MiB (e.g. 26,624 tokens for K3 TP8) so FIA stays
+# in its fast tiling regime while cutting peak activation memory by ~0.7 GiB.
+C8_HISTORY_WORKSPACE_BUDGET_BYTES = 384 * 1024 * 1024
+# Flush C8 FP32 attention-update buffers every 4 chunks instead of 16 to cut
+# peak prefill activation memory (~1.2 GiB saved at 16K batched tokens).
+C8_PREFILL_MERGE_FLUSH_INPUTS = 4
 
 PROLOG_V3_SUPPORTED_INPUT_SIZES = (1024, 2048, 3072, 4096, 5120, 6144, 7168, 7680, 8192)
 MLAPO_CACHE_BLOCK_ALIGNMENT = 16
@@ -415,7 +421,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
                     dense_width = projected_width + key_width + impl.v_head_dim
                     bytes_per_row = max(bytes_per_row, impl.num_heads * dense_width * get_dtype_size(torch.bfloat16))
             if bytes_per_row:
-                self._c8_history_token_budget = (1 << 30) // bytes_per_row
+                self._c8_history_token_budget = C8_HISTORY_WORKSPACE_BUDGET_BYTES // bytes_per_row
         # MLA layers are grouped by RoPE mode before metadata builders are created.
         self.use_mla_rope = static_forward_context[layer_names[0]].impl.use_mla_rope if layer_names else True
         self.cos_cache = None
@@ -1661,6 +1667,16 @@ class AscendMLAImpl(MLAAttentionImpl):
         if getattr(self, "kimi_c8_static_fp8", False):
             from vllm_ascend.attention.kimi_c8_graph import C8MetadataEvents
 
+            if getattr(self.kv_b_proj, "bias", None) is None:
+                # Materialize a contiguous (L, N*V) view alongside W_UK_T so C8
+                # chunked prefill produces contiguous k_nope/v directly without
+                # an interleaved kv_nope temporary or v.contiguous() copy.
+                replace_parameter(
+                    self,
+                    "_c8_w_uv_prefill",
+                    W_UV.reshape(self.kv_lora_rank, self.num_heads * self.v_head_dim).contiguous(),
+                    prefer_copy=True,
+                )
             self.mlapo_W_UK_T = self.W_UK_T
             self.enable_mlapo = False
             # Refresh native inputs; TP-local Prolog repacks into persistent
@@ -2169,6 +2185,27 @@ class AscendMLAImpl(MLAAttentionImpl):
                 from vllm_ascend.device.kimi_c8_cache_write import write_static_fp8_cache_graph
 
                 writer = write_static_fp8_cache_graph
+            else:
+                step_cache = getattr(attn_metadata, "c8_step_cache", None)
+                if isinstance(step_cache, dict):
+                    from vllm_ascend.attention.kimi_c8_static import C8CacheWritePlan
+
+                    write_key = (
+                        "c8_write_plan",
+                        attn_metadata.slot_mapping,
+                        actual,
+                        self.kimi_c8_manager_block_size,
+                        self.kimi_c8_page_stride_bytes,
+                        raw.shape[0],
+                        raw.shape[3],
+                        raw.stride(0),
+                        raw.device,
+                    )
+                    write_plan = step_cache.get(write_key)
+                    if write_plan is None:
+                        write_plan = C8CacheWritePlan.prepare(raw.view(torch.uint8), slots)
+                        step_cache[write_key] = write_plan
+                    writer = write_plan.write
             projection = project_and_write_kimi_c8(
                 self,
                 hidden_states[:actual],
@@ -2483,8 +2520,16 @@ class AscendMLAImpl(MLAAttentionImpl):
                 kv_c_normed = torch.mul(kv_c_normed.to(self.fak_descale_float.dtype), self.fak_descale_float).to(
                     torch.bfloat16
                 )
-            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            w_uv_prefill = getattr(self, "_c8_w_uv_prefill", None) if is_c8 else None
+            if w_uv_prefill is not None and getattr(self, "W_UK_T", None) is not None:
+                w_uk_2d = self.W_UK_T.reshape(self.num_heads * self.qk_nope_head_dim, self.kv_lora_rank)
+                k_nope = torch.matmul(kv_c_normed, w_uk_2d.t()).view(-1, self.num_heads, self.qk_nope_head_dim)
+                v = torch.matmul(kv_c_normed, w_uv_prefill).view(-1, self.num_heads, self.v_head_dim)
+            else:
+                kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+                    -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+                )
+                k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
 
             actual_seq_lengths_kv = prefill_metadata.chunked_context.chunk_actual_seq_lengths_kv_list[i]
@@ -2513,7 +2558,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             out_list.append(chunk_out.reshape(num_tokens * H, D))
             lse_list.append(chunk_lse.reshape(num_tokens * H))
             has_context = True
-            if len(out_list) == ATTENTION_UPDATE_MAX_INPUTS:
+            merge_flush_inputs = C8_PREFILL_MERGE_FLUSH_INPUTS if is_c8 else ATTENTION_UPDATE_MAX_INPUTS
+            if len(out_list) == merge_flush_inputs:
                 merged_out, merged_lse, lse_anchor = merge_prefill_chunks(
                     out_list, lse_list, lse_anchor, return_lse=True
                 )
