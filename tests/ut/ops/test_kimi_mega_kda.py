@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from torch import nn
+from torch.multiprocessing.reductions import StorageWeakRef
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -51,6 +52,7 @@ def runtime():
     ns = {
         "__name__": __name__,
         "torch": torch,
+        "StorageWeakRef": StorageWeakRef,
         "nn": nn,
         "Module": nn.Module,
         "dataclass": dataclass,
@@ -141,7 +143,11 @@ def runtime():
         "_prepare_mega_replayssm",
         "_allocate_mega_output",
     }
-    _definitions("vllm_ascend/ops/kimi_kda.py", {"_restore_token_rows", "_MegaKDAPlan", "_MegaKDAReplayPlan"}, ns)
+    _definitions(
+        "vllm_ascend/ops/kimi_kda.py",
+        {"_restore_token_rows", "_MegaKDAPlan", "_MegaKDAReplayPlan", "_mxfp8_qkv_storages"},
+        ns,
+    )
     _definitions("vllm_ascend/ops/kimi_kda.py", {"AscendKimiK3DeltaAttention"}, ns, methods=methods, bases="Module")
     return ns
 
@@ -714,12 +720,51 @@ def test_released_default_path_fails_loudly(runtime):
         forward_default(layer, hidden, torch.arange(8))
 
 
+@pytest.mark.parametrize("hidden_alias", [False, True])
+def test_mxfp8_qkv_offload_releases_storage_and_preserves_mega_operand(runtime, hidden_alias):
+    layer = _attention(runtime)
+    layer._mega_pd_decode_worker = True
+    proj = layer.in_proj_qkvgfab
+    proj.weight = nn.Parameter(torch.ones(32, 24, dtype=torch.float8_e4m3fn), requires_grad=False)
+    proj.weight_scale = nn.Parameter(torch.full((1, 24, 2), 127, dtype=torch.uint8), requires_grad=False)
+    proj._mxfp8_weight_buf = proj.weight.detach()
+    proj._mxfp8_scale_buf = proj.weight_scale.detach()
+    proj._mxfp8_transformed = True
+    refs = [StorageWeakRef(t.untyped_storage()) for t in (proj.weight, proj.weight_scale)]
+    expected = sum(t.untyped_storage().nbytes() for t in (proj.weight, proj.weight_scale))
+    alias = proj.weight.detach() if hidden_alias else None
+    x = torch.randn(2, 32, dtype=torch.bfloat16)
+    operand = layer._mega_weights.qkv
+    pointer = operand.data_ptr()
+    before = torch.nn.functional.linear(x, operand)
+    released = layer._release_default_kda_weights()
+    assert released == (48 if hidden_alias else expected)
+    assert layer._mega_nd_released
+    assert proj.weight.numel() == proj.weight_scale.numel() == 0
+    assert not hasattr(proj, "_mxfp8_weight_buf")
+    assert not hasattr(proj, "_mxfp8_scale_buf")
+    cpu_weight, cpu_scale = proj._mega_qkv_cpu_weights
+    assert cpu_weight.device.type == cpu_scale.device.type == "cpu"
+    assert cpu_weight.shape == (32, 24)
+    assert torch.equal(cpu_weight.float(), torch.ones(32, 24))
+    assert torch.equal(cpu_scale, torch.full((1, 24, 2), 127, dtype=torch.uint8))
+    assert sum(not ref.expired() for ref in refs) == int(hidden_alias)
+    del alias
+    assert all(ref.expired() for ref in refs)
+    assert layer._mega_weights.qkv.data_ptr() == pointer
+    torch.testing.assert_close(torch.nn.functional.linear(x, operand), before, rtol=0, atol=0)
+    assert layer.o_proj.weight.numel() > 0
+    assert layer._release_default_kda_weights() == 0
+
+
 def test_release_mega_kda_nd_weights_targets_pd_decode_layers_only(runtime):
     _definitions("vllm_ascend/ops/kimi_kda.py", {"release_mega_kda_nd_weights"}, runtime)
     eligible = _attention(runtime)
     eligible._mega_pd_decode_worker = True
     plain = _attention(runtime)
-    model = SimpleNamespace(modules=lambda: [eligible, plain])
+    both = _attention(runtime)
+    both._mega_pd_decode_worker = both._mega_pd_prefill_worker = True
+    model = SimpleNamespace(modules=lambda: [eligible, plain, both])
     nz_pointer = eligible._mega_weights.qkv.data_ptr()
 
     released = runtime["release_mega_kda_nd_weights"](model)
@@ -731,14 +776,42 @@ def test_release_mega_kda_nd_weights_targets_pd_decode_layers_only(runtime):
     # Non-PD-decode layers keep their ND weights and stay unreleased.
     assert not plain._mega_nd_released
     assert plain.in_proj_qkvgfab.weight.numel() > 0
+    assert not both._mega_nd_released
+    assert both.in_proj_qkvgfab.weight.numel() > 0
     # A second call is a no-op (idempotent across repeated profile runs).
     assert runtime["release_mega_kda_nd_weights"](model) == 0
+
+
+def test_mxfp8_offload_copy_failure_preserves_device_operands(runtime, monkeypatch):
+    layer = _attention(runtime)
+    layer._mega_pd_decode_worker = True
+    proj = layer.in_proj_qkvgfab
+    proj._mxfp8_transformed = True
+    proj.weight_scale = nn.Parameter(torch.ones(2, dtype=torch.uint8), requires_grad=False)
+    proj._mxfp8_weight_buf = proj.weight.detach()
+    proj._mxfp8_scale_buf = proj.weight_scale.detach()
+    pointer = proj.weight.data_ptr()
+    real_to = torch.Tensor.to
+
+    def fail_scale_copy(tensor, *args, **kwargs):
+        if tensor.dtype == torch.uint8:
+            raise RuntimeError("CPU copy failed")
+        return real_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", fail_scale_copy)
+    with pytest.raises(RuntimeError, match="CPU copy failed"):
+        layer._release_default_kda_weights()
+    assert not layer._mega_nd_released
+    assert not hasattr(proj, "_mega_qkv_cpu_weights")
+    assert proj.weight.data_ptr() == proj._mxfp8_weight_buf.data_ptr() == pointer
+    assert proj.weight_scale.data_ptr() == proj._mxfp8_scale_buf.data_ptr()
 
 
 @pytest.mark.parametrize(
     ("clear_params", "clear_buffers", "remaining"), [(False, False, 2), (True, False, 2), (True, True, 0)]
 )
-def test_mxfp8_release_reports_storage_aliases(clear_params, clear_buffers, remaining):
+@pytest.mark.parametrize("hidden_alias", [False, True])
+def test_mxfp8_release_reports_storage_aliases(clear_params, clear_buffers, remaining, hidden_alias):
     weight = torch.ones(8, dtype=torch.uint8)
     scale = torch.ones(2, dtype=torch.uint8)
     proj = SimpleNamespace(
@@ -749,6 +822,7 @@ def test_mxfp8_release_reports_storage_aliases(clear_params, clear_buffers, rema
         _mxfp8_transformed=True,
     )
     del weight, scale
+    alias = proj.weight.detach() if hidden_alias else None
 
     def release():
         if clear_params:
@@ -765,14 +839,22 @@ def test_mxfp8_release_reports_storage_aliases(clear_params, clear_buffers, rema
     npu.memory_allocated.side_effect = [100, 90 if clear_buffers else 100]
     npu.memory_reserved.return_value = 128
     log = MagicMock()
-    ns = {"AscendKimiK3DeltaAttention": SimpleNamespace, "torch": SimpleNamespace(npu=npu), "logger": log}
-    _definitions("vllm_ascend/ops/kimi_kda.py", {"release_mega_kda_nd_weights", "_mxfp8_qkv_storage_ptrs"}, ns)
+    ns = {
+        "AscendKimiK3DeltaAttention": SimpleNamespace,
+        "torch": SimpleNamespace(npu=npu),
+        "logger": log,
+        "StorageWeakRef": StorageWeakRef,
+    }
+    _definitions("vllm_ascend/ops/kimi_kda.py", {"release_mega_kda_nd_weights", "_mxfp8_qkv_storages"}, ns)
     assert ns["release_mega_kda_nd_weights"](SimpleNamespace(modules=lambda: [layer])) == (10 if clear_buffers else 0)
     assert npu.synchronize.call_count == 2
     before, after = [call.args[0] % call.args[1:] for call in log.info.call_args_list]
     assert "qkv_storages=2 " in before
     assert f"original_qkv_storages_still_referenced={remaining}/2 " in after
+    assert f"original_qkv_storages_alive={max(remaining, int(hidden_alias))}/2 " in after
     assert f"allocated_drop_bytes={10 if clear_buffers else 0} " in after
+    assert log.warning.called == bool(remaining or hidden_alias)
+    del alias
 
 
 def test_pd_prefill_worker_skips_mega_operand_build(runtime):

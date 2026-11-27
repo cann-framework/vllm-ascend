@@ -16,6 +16,7 @@ import torch_npu
 from einops import rearrange
 from fla_npu.ops.ascendc import causal_conv1d_fn, causal_conv1d_update
 from torch import nn
+from torch.multiprocessing.reductions import StorageWeakRef
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture, is_breakable_cudagraph_enabled
 from vllm.config import CUDAGraphMode
 from vllm.distributed import tensor_model_parallel_all_reduce
@@ -93,17 +94,18 @@ def _is_pd_prefill_worker(vllm_config) -> bool:
     return kv_transfer_config is not None and bool(getattr(kv_transfer_config, "is_kv_producer", False))
 
 
-def _mxfp8_qkv_storage_ptrs(projections) -> set[int]:
-    # Keep only addresses. Holding tensors or storages here would prevent release.
-    pointers = set()
+def _mxfp8_qkv_storages(projections) -> dict[int, tuple[StorageWeakRef, int]]:
+    # Weak storage handles also detect owners outside the projection attributes.
+    storages = {}
     for projection in projections:
         for name in ("weight", "weight_scale", "_mxfp8_weight_buf", "_mxfp8_scale_buf"):
             tensor = getattr(projection, name, None)
             if tensor is not None:
-                pointer = tensor.untyped_storage().data_ptr()
+                storage = tensor.untyped_storage()
+                pointer = storage.data_ptr()
                 if pointer:
-                    pointers.add(pointer)
-    return pointers
+                    storages[pointer] = (StorageWeakRef(storage), storage.nbytes())
+    return storages
 
 
 def release_mega_kda_nd_weights(model) -> int:
@@ -120,6 +122,7 @@ def release_mega_kda_nd_weights(model) -> int:
         if isinstance(module, AscendKimiK3DeltaAttention)
         and getattr(module, "_mega_weights", None) is not None
         and getattr(module, "_mega_pd_decode_worker", False)
+        and not getattr(module, "_mega_pd_prefill_worker", False)
         and not getattr(module, "_mega_nd_released", False)
     ]
     projections = [
@@ -128,7 +131,7 @@ def release_mega_kda_nd_weights(model) -> int:
     if projections:
         device = projections[0].weight.device
         torch.npu.synchronize(device)
-        before = _mxfp8_qkv_storage_ptrs(projections)
+        before = _mxfp8_qkv_storages(projections)
         allocated_before = torch.npu.memory_allocated(device)
         logger.info(
             "MegaKDA QKV release before: device=%s mxfp8_layers=%d qkv_storages=%d "
@@ -144,19 +147,25 @@ def release_mega_kda_nd_weights(model) -> int:
 
     if projections:
         torch.npu.synchronize(device)
-        remaining = before & _mxfp8_qkv_storage_ptrs(projections)
+        remaining = before.keys() & _mxfp8_qkv_storages(projections).keys()
+        alive = sum(not ref.expired() for ref, _ in before.values())
         allocated_after = torch.npu.memory_allocated(device)
         logger.info(
             "MegaKDA QKV release after: device=%s original_qkv_storages_still_referenced=%d/%d "
+            "original_qkv_storages_alive=%d/%d "
             "allocated_bytes=%d reserved_bytes=%d allocated_drop_bytes=%d all_kda_accounted_release_bytes=%d",
             device,
             len(remaining),
+            len(before),
+            alive,
             len(before),
             allocated_after,
             torch.npu.memory_reserved(device),
             allocated_before - allocated_after,
             released,
         )
+        if alive:
+            logger.warning("MegaKDA QKV release retained %d original storages through external references", alive)
     return released
 
 
@@ -1043,13 +1052,37 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         Only valid on a PD decode worker: every request arrives with its KV
         and KDA state already transferred, so decode and verify always run
         through the MegaKDA operator and the default (prefill/recompute) KDA
-        path is dead. Releasing the ND originals keeps the NZ operand set the
-        single resident copy, restoring the pre-MegaKDA weight footprint.
-        Returns the number of device bytes freed.
+        path is dead. BF16 projections are released; finalized MXFP8 QKV and
+        scales are backed up on CPU before dropping their device aliases.
+        Other projections are retained in the MXFP8 case. Returns the number
+        of device bytes freed, excluding MXFP8 storages with external owners.
         """
+        if getattr(self, "_mega_nd_released", False):
+            return 0
+        projection = self.in_proj_qkvgfab
+        if getattr(projection, "_mxfp8_transformed", False):
+            # Preserve the finalized quantized operands on CPU. Only QKV is
+            # offloaded here; other projections retain their current storage.
+            # Decode/Verify keep using the independent MegaKDA BF16/NZ operands.
+            storages = _mxfp8_qkv_storages([projection])
+            weight = projection.weight.detach()
+            if weight.device.type == "npu":
+                weight = torch_npu.npu_format_cast(weight, 2, customize_dtype=torch.float8_e4m3fn)
+            cpu_weight = weight.to(device="cpu", copy=True)
+            del weight
+            cpu_scale = projection.weight_scale.detach().to(device="cpu", copy=True)
+            projection._mega_qkv_cpu_weights = (cpu_weight, cpu_scale)
+            projection.weight.data = projection.weight.new_empty(0)
+            projection.weight_scale.data = projection.weight_scale.new_empty(0)
+            for name in ("_mxfp8_weight_buf", "_mxfp8_scale_buf"):
+                if hasattr(projection, name):
+                    delattr(projection, name)
+            self._mega_nd_released = True
+            logger.info_once("MegaKDA MXFP8 QKV operands offloaded to CPU on the PD decode worker for %s", self.prefix)
+            # Only credit storages that really died; external aliases must not
+            # inflate the KV cache budget. No device transfers occur in forward.
+            return sum(size for ref, size in storages.values() if ref.expired())
         released = 0
-        # MXFP8 Linear finalizers retain buffer aliases. Keep their quantized
-        # operands/scales intact for fallback and subsequent weight reloads.
         if any(param.dtype != torch.bfloat16 for param in self._released_mega_nd_params()):
             return released
         for param in self._released_mega_nd_params():
