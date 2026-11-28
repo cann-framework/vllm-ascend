@@ -29,6 +29,7 @@ from vllm_ascend.worker.v2.spec_decode.dspark.speculator import AscendDSparkSpec
 def make_speculator():
     spec = AscendDSparkSpeculator.__new__(AscendDSparkSpeculator)
     spec._draft_mla_uses_device_lengths = False
+    spec.dp_size = 1
     spec.replicated_pcp = False
     spec.enable_adaptive_verification = False
     spec.attn_architecture = "MLA"
@@ -312,7 +313,7 @@ def test_propose_uses_draft_decode_flags_for_dcp(monkeypatch, use_dcp):
     spec.use_dcp = use_dcp
     spec.max_num_reqs = 4
     spec.max_num_tokens = 20
-    input_batch = SimpleNamespace(num_reqs=1, is_prefilling_np=np.array([True, True, True, True]))
+    input_batch = SimpleNamespace(has_prefill=False, num_reqs=1, is_prefilling_np=np.array([True, True, True, True]))
     captured: dict[str, Any] = {}
     prepared_lengths = torch.tensor([12, 0, 0, 0], dtype=torch.int32)
     prepared_flags = torch.zeros(4, dtype=torch.bool)

@@ -409,7 +409,9 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         # and freed with the model instead of living for the whole process.
         self.nope_zero_rope_cache: dict[tuple, torch.Tensor] | None = {} if self.rope_dim == 0 else None
         static_forward_context = vllm_config.compilation_config.static_forward_context
+        self._c8_history_token_budget: int | None = None
         if self.kimi_c8_static_fp8:
+            dtype_size = get_dtype_size(vllm_config.model_config.dtype)
             bytes_per_row = 0
             for name in layer_names:
                 impl = static_forward_context[name].impl
@@ -419,7 +421,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
                     projected_width = impl.qk_nope_head_dim + impl.v_head_dim
                     key_width = impl.qk_nope_head_dim + impl.qk_rope_head_dim
                     dense_width = projected_width + key_width + impl.v_head_dim
-                    bytes_per_row = max(bytes_per_row, impl.num_heads * dense_width * get_dtype_size(torch.bfloat16))
+                    bytes_per_row = max(bytes_per_row, impl.num_heads * dense_width * dtype_size)
             if bytes_per_row:
                 self._c8_history_token_budget = C8_HISTORY_WORKSPACE_BUDGET_BYTES // bytes_per_row
         # MLA layers are grouped by RoPE mode before metadata builders are created.
@@ -2386,7 +2388,6 @@ class AscendMLAImpl(MLAAttentionImpl):
         chunk_idx: int,
         toks: int,
     ) -> torch.Tensor:
-        del chunked_context, chunk_idx, toks
         return packed_kv_c_k_pe
 
     def _reorg_kvcache(
@@ -2396,54 +2397,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         chunked_context: ChunkedContextMetadata,
         chunk_idx: int,
         toks: int,
-        packed_kv_c_k_pe: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        del chunked_context, chunk_idx, toks, packed_kv_c_k_pe
         return kv_c_normed, k_pe
-
-    def _use_c8_npu_anti_quant(self, device: torch.device, dtype: torch.dtype) -> bool:
-        cache = getattr(self, "_c8_npu_anti_quant_cache", None)
-        if cache is None:
-            cache = {}
-            self._c8_npu_anti_quant_cache = cache
-        key = (device.type, dtype)
-        supported = cache.get(key)
-        if supported is None:
-            from vllm_ascend.attention.kimi_c8_static import supports_npu_fp8_anti_quant
-
-            supported = supports_npu_fp8_anti_quant(device, dtype)
-            cache[key] = supported
-        return supported
-
-    def _dequantize_c8_history(
-        self,
-        raw_packed: torch.Tensor,
-        scale: torch.Tensor,
-        dtype: torch.dtype,
-        *,
-        use_npu_anti_quant: bool,
-    ) -> tuple[torch.Tensor, bool]:
-        from vllm_ascend.attention.kimi_c8_static import (
-            _dequantize_static_fp8,
-            is_unsupported_npu_anti_quant_error,
-        )
-
-        if use_npu_anti_quant:
-            try:
-                return (
-                    _dequantize_static_fp8(raw_packed, scale, dtype, use_npu_anti_quant=True),
-                    True,
-                )
-            except Exception as exc:
-                if not is_unsupported_npu_anti_quant_error(exc):
-                    raise
-                cache = getattr(self, "_c8_npu_anti_quant_cache", None)
-                if cache is None:
-                    cache = {}
-                    self._c8_npu_anti_quant_cache = cache
-                cache[(raw_packed.device.type, dtype)] = False
-                use_npu_anti_quant = False
-        return _dequantize_static_fp8(raw_packed, scale, dtype, use_npu_anti_quant=False), use_npu_anti_quant
 
     def _project_c8_prefill_kv(self, kv_c_normed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
         w_uv_prefill = getattr(self, "_c8_w_uv_prefill", None)
@@ -2486,11 +2441,17 @@ class AscendMLAImpl(MLAAttentionImpl):
             return prefix_output, prefix_lse
 
         history_plan = None
-        use_c8_anti_quant = False
+        c8_dequant_fn = None
+        c8_anti_quant = None
         if is_c8:
-            from vllm_ascend.attention.kimi_c8_static import C8PrefillHistory
+            from vllm_ascend.attention.kimi_c8_static import (
+                C8PrefillHistory,
+                _dequantize_static_fp8,
+                resolve_npu_fp8_anti_quant,
+            )
 
-            use_c8_anti_quant = self._use_c8_npu_anti_quant(cache_kv_c.device, q_nope.dtype)
+            c8_dequant_fn = _dequantize_static_fp8
+            c8_anti_quant = resolve_npu_fp8_anti_quant(cache_kv_c.device, q_nope.dtype)
 
             # The runner shares prefill metadata across layers in this attention group.
             key = (
@@ -2558,11 +2519,12 @@ class AscendMLAImpl(MLAAttentionImpl):
                 )
                 if raw_packed.numel() == 0:
                     continue
-                packed_kv, use_c8_anti_quant = self._dequantize_c8_history(
+                assert c8_dequant_fn is not None
+                packed_kv = c8_dequant_fn(
                     raw_packed,
                     self.fak_descale_float,
                     q_nope.dtype,
-                    use_npu_anti_quant=use_c8_anti_quant,
+                    anti_quant=c8_anti_quant,
                 )
                 kv_c_normed, k_pe = packed_kv.split([self.kv_lora_rank, rope_dim], dim=-1)
             else:

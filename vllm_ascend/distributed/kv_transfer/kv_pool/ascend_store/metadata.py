@@ -459,6 +459,11 @@ class ChunkedTokenDatabase:
             return None
         return self.cache_coordinator.store_mask(aligned_token_len, num_prompt_tokens)
 
+    def lookup_mask(self, aligned_token_len: int) -> tuple[list[bool] | None, ...] | None:
+        if self.cache_coordinator is None:
+            return None
+        return self.cache_coordinator.lookup_mask(aligned_token_len)
+
     def load_mask(
         self,
         block_hashes: list[BlockHash],

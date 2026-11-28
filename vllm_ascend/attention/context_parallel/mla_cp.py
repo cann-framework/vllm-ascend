@@ -1238,7 +1238,6 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
         chunked_context: ChunkedContextMetadata,
         chunk_idx: int,
         toks: int,
-        packed_kv_c_k_pe: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         reorg and unpad kvcache after cp local gather to tp layout for attn kernel.
@@ -1250,7 +1249,7 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
         -> reorganized_kv_c_normed = [T0_0, T0_1, T0_2, T0_3, T0_4, T0_5,
                                     T1_0, T1_1, T1_2, ...]
         """
-        packed = packed_kv_c_k_pe if packed_kv_c_k_pe is not None else torch.cat([kv_c_normed, k_pe], dim=-1)
+        packed = torch.cat([kv_c_normed, k_pe], dim=-1)
         reorganized_packed = self._reorg_packed_kvcache(
             packed,
             chunked_context=chunked_context,

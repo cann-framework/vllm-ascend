@@ -1650,7 +1650,9 @@ def test_layerwise_partial_tail_preserves_zero_external_load(pool_hit_tokens):
 
 
 def test_waiting_lookup_cache_deduplicates_and_invalidates(monkeypatch):
-    scheduler = KVPoolScheduler(make_config(block_size=16, extra_config={"load_async": True}), use_layerwise=False)
+    cfg = make_config(block_size=16, extra_config={"load_async": True})
+    cfg.additional_config = {"mla_cache_mode": "C8"}
+    scheduler = KVPoolScheduler(cfg, use_layerwise=False)
     scheduler.client = MagicMock()
     scheduler.client.lookup.return_value = 48
     req_hit = SimpleNamespace(
@@ -1712,3 +1714,29 @@ def test_waiting_lookup_cache_deduplicates_and_invalidates(monkeypatch):
     now[0] += 10.0
     assert scheduler.get_num_new_matched_tokens(req_miss, 0) == (32, True)
     assert scheduler.client.lookup.call_count == 5
+
+    # Completed Store PUT events immediately invalidate cached zero-hit entries.
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+        AscendStoreKVConnectorWorkerMetadata,
+    )
+
+    now[0] += 10.0
+    scheduler.client.lookup.return_value = 0
+    assert scheduler.get_num_new_matched_tokens(req_miss, 0) == (0, False)
+    assert req_miss.request_id in scheduler._waiting_lookup_cache
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            invalid_block_ids=set(),
+            finished_recving=None,
+            kv_connector_worker_meta=AscendStoreKVConnectorWorkerMetadata(completed_events={1: 1}),
+        )
+    )
+    assert req_miss.request_id not in scheduler._waiting_lookup_cache
+
+    # Non-C8 models do not use the waiting lookup cache.
+    non_c8 = KVPoolScheduler(make_config(block_size=16, extra_config={"load_async": True}), use_layerwise=False)
+    non_c8.client = MagicMock()
+    non_c8.client.lookup.return_value = 48
+    assert non_c8.get_num_new_matched_tokens(req_hit, 0) == (48, True)
+    assert non_c8.get_num_new_matched_tokens(req_hit, 0) == (48, True)
+    assert non_c8.client.lookup.call_count == 2

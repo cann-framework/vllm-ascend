@@ -31,6 +31,7 @@ from vllm_ascend.distributed.parallel_state import get_global_rank
 DEFAULT_GLOBAL_SEGMENT_SIZE = 1073741824  # 1.0 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
 DEFAULT_TENANT_ID = "default"
+# Mooncake Store ErrorCode::NO_AVAILABLE_MEMORY / insufficient capacity during eviction.
 _PUT_INSUFFICIENT_SPACE = -200
 MOONCAKE_LAYERWISE_CLIENT_METHODS = (
     "batch_put_session_start",
@@ -444,17 +445,21 @@ class MooncakeBackend(Backend):
             put = self.store.batch_put_from_multi_buffers
             res = require_aligned_batch_results("batch_put_from_multi_buffers", keys, put(keys, addrs, sizes, config))
             if self.config.enable_ssd_offload:
-                for index, code in enumerate(res):
-                    if code != _PUT_INSUFFICIENT_SPACE:
-                        continue
-                    # Smaller allocations can succeed while the master drains
-                    # eviction to SSD. Give each rejected key one attempt.
-                    retry_keys = keys[index : index + 1]
-                    (res[index],) = require_aligned_batch_results(
+                retry_indices = [i for i, code in enumerate(res) if code == _PUT_INSUFFICIENT_SPACE]
+                if retry_indices:
+                    retry_keys = [keys[i] for i in retry_indices]
+                    retry_res = require_aligned_batch_results(
                         "batch_put_from_multi_buffers",
                         retry_keys,
-                        put(retry_keys, addrs[index : index + 1], sizes[index : index + 1], config),
+                        put(
+                            retry_keys,
+                            [addrs[i] for i in retry_indices],
+                            [sizes[i] for i in retry_indices],
+                            config,
+                        ),
                     )
+                    for i, code in zip(retry_indices, retry_res, strict=True):
+                        res[i] = code
             failed_codes = [int(value) for value in res if value < 0]
             failed_count = len(failed_codes)
             if failed_count:

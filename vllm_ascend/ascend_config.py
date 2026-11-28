@@ -704,7 +704,9 @@ class AscendConfig:
             raise ValueError("mla_cache_mode=C8 currently requires prefill_context_parallel_size=1")
         dcp = getattr(parallel, "decode_context_parallel_size", 1)
         if dcp not in SUPPORTED_C8_DCP_SIZES:
-            raise ValueError("mla_cache_mode=C8 currently supports decode_context_parallel_size in (1, 2, 4, 8)")
+            raise ValueError(
+                f"mla_cache_mode=C8 currently supports decode_context_parallel_size in {SUPPORTED_C8_DCP_SIZES}"
+            )
         if dcp > 1 and getattr(parallel, "cp_kv_cache_interleave_size", None) != 1664:
             raise ValueError(f"mla_cache_mode=C8 with DCP{dcp} requires cp_kv_cache_interleave_size=1664")
         kv_transfer = getattr(vllm_config, "kv_transfer_config", None)
@@ -726,8 +728,6 @@ class AscendConfig:
                 if store_children:
                     if dcp > 1 and not vllm_config.cache_config.enable_prefix_caching:
                         raise ValueError(f"C8 DCP{dcp} Store requires enable_prefix_caching for KDA checkpoint hashes")
-                    if getattr(kv_transfer, "kv_load_failure_policy", "fail") not in ("fail", "recompute"):
-                        raise ValueError("C8 Store requires kv_load_failure_policy=fail or recompute")
                     for child in store_children:
                         store_config = child.get("kv_connector_extra_config") or {}
                         for option in ("load_async", "consumer_is_to_load"):

@@ -241,6 +241,11 @@ class KVPoolWorker:
         self.use_layerwise_transfer = self.use_layerwise and self.layerwise_data_plane == "gva"
         validate_layerwise_topology(self.layerwise_protocol, vllm_config.parallel_config, self.use_layerwise)
         kv_cache_groups = kv_cache_config.kv_cache_groups if kv_cache_config is not None else None
+        if is_kimi_c8_config(vllm_config) and self.dcp_size > 1:
+            assert self.dcp_rank == self.tp_rank % self.dcp_size, (
+                f"C8 DCP expects dcp_rank == tp_rank % dcp_size, got dcp_rank={self.dcp_rank}, "
+                f"tp_rank={self.tp_rank}, dcp_size={self.dcp_size}"
+            )
         self.cache_namespace = infer_cache_namespace(kv_cache_groups, extra_config, dcp_size=self.dcp_size)
         self.use_hybrid = uses_hybrid_kv_cache(vllm_config.scheduler_config, kv_cache_groups) or (
             self.use_block_key_layerwise and kv_cache_groups is not None and len(kv_cache_groups) > 1

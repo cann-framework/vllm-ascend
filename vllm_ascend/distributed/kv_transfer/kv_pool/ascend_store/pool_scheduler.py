@@ -68,7 +68,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
 
 # Deduplicate repeated Store lookups for waiting requests blocked at the head
 # of the scheduler queue across consecutive chunked-prefill steps.
-WAITING_LOOKUP_CACHE_TTL_SECONDS = 5.0
+WAITING_LOOKUP_CACHE_TTL_SECONDS = 2.0
 MAX_WAITING_LOOKUP_CACHE_SIZE = 256
 
 
@@ -669,16 +669,35 @@ class KVPoolScheduler:
                         token_len,
                     )
                     return 0, False
-                now = time.monotonic()
-                cached_lookup = self._waiting_lookup_cache.get(request.request_id)
-                if (
-                    cached_lookup is not None
-                    and cached_lookup[0] == token_len
-                    and cached_lookup[1] == num_computed_tokens
-                    and (now - cached_lookup[3]) < WAITING_LOOKUP_CACHE_TTL_SECONDS
-                ):
-                    num_external_hit_tokens = cached_lookup[2]
-                    reused_waiting_lookup = True
+                if is_kimi_c8_config(self.vllm_config):
+                    now = time.monotonic()
+                    cached_lookup = self._waiting_lookup_cache.get(request.request_id)
+                    if (
+                        cached_lookup is not None
+                        and cached_lookup[0] == token_len
+                        and cached_lookup[1] == num_computed_tokens
+                        and (now - cached_lookup[3]) < WAITING_LOOKUP_CACHE_TTL_SECONDS
+                    ):
+                        num_external_hit_tokens = cached_lookup[2]
+                        reused_waiting_lookup = True
+                    else:
+                        if self.client is None:
+                            self.client = LookupKeyClient(self.vllm_config)
+                        num_external_hit_tokens = self.client.lookup(
+                            token_len,
+                            request.block_hashes,
+                            self.kv_cache_group_ids,
+                            hbm_hit_tokens=num_computed_tokens,
+                        )
+                        self._waiting_lookup_cache.pop(request.request_id, None)
+                        if len(self._waiting_lookup_cache) >= MAX_WAITING_LOOKUP_CACHE_SIZE:
+                            self._waiting_lookup_cache.pop(next(iter(self._waiting_lookup_cache)))
+                        self._waiting_lookup_cache[request.request_id] = (
+                            token_len,
+                            num_computed_tokens,
+                            num_external_hit_tokens,
+                            now,
+                        )
                 else:
                     if self.client is None:
                         self.client = LookupKeyClient(self.vllm_config)
@@ -687,17 +706,6 @@ class KVPoolScheduler:
                         request.block_hashes,
                         self.kv_cache_group_ids,
                         hbm_hit_tokens=num_computed_tokens,
-                    )
-                    if (
-                        request.request_id not in self._waiting_lookup_cache
-                        and len(self._waiting_lookup_cache) >= MAX_WAITING_LOOKUP_CACHE_SIZE
-                    ):
-                        self._waiting_lookup_cache.pop(next(iter(self._waiting_lookup_cache)))
-                    self._waiting_lookup_cache[request.request_id] = (
-                        token_len,
-                        num_computed_tokens,
-                        num_external_hit_tokens,
-                        now,
                     )
 
         if num_external_hit_tokens == 0:
@@ -1055,12 +1063,8 @@ class KVPoolScheduler:
             self._failed_async_load_req_ids.discard(finished_req_id)
             self._waiting_lookup_cache.pop(finished_req_id, None)
 
-        if scheduler_output.finished_req_ids and self._waiting_lookup_cache:
-            # A finished request may have persisted new prefixes to Store; drop
-            # cached zero-hit entries so waiting requests re-probe immediately.
-            stale_zero_hits = [req_id for req_id, entry in self._waiting_lookup_cache.items() if entry[2] == 0]
-            for req_id in stale_zero_hits:
-                self._waiting_lookup_cache.pop(req_id, None)
+        if scheduler_output.finished_req_ids:
+            self._clear_waiting_zero_hits()
 
         for req_id in scheduler_output.preempted_req_ids:
             self._preempted_req_ids.update(scheduler_output.preempted_req_ids)
@@ -1170,13 +1174,18 @@ class KVPoolScheduler:
         self.sending_events[using_event_id] = 0
         self.sending_blocks[using_event_id] = current_step_sending
 
+    def _clear_waiting_zero_hits(self) -> None:
+        for req_id in [k for k, entry in self._waiting_lookup_cache.items() if entry[2] == 0]:
+            self._waiting_lookup_cache.pop(req_id, None)
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
         hand the connector_output, free non-null mamba blocks and so on.
         """
         invalid_blocks = connector_output.invalid_block_ids
         if invalid_blocks and is_kimi_c8_config(self.vllm_config):
-            invalid_blocks = invalid_blocks - {0}
+            null_block_id = self._block_pool.null_block.block_id if self._block_pool is not None else 0
+            invalid_blocks = invalid_blocks - {null_block_id}
             for req_id in self._loading_req_ids:
                 unfinished = self._unfinished_requests.get(req_id)
                 if unfinished is None:
@@ -1190,7 +1199,11 @@ class KVPoolScheduler:
         self.update_finished_recving(connector_output.finished_recving)
 
         meta = connector_output.kv_connector_worker_meta
-        if not isinstance(meta, AscendStoreKVConnectorWorkerMetadata) or self._block_pool is None:
+        if not isinstance(meta, AscendStoreKVConnectorWorkerMetadata):
+            return
+        if meta.completed_events:
+            self._clear_waiting_zero_hits()
+        if self._block_pool is None:
             return
 
         for event_id, count in meta.completed_events.items():

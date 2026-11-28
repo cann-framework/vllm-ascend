@@ -1141,9 +1141,16 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 and token_len == len(group_store_mask) * group_block_size
                 and not group_store_mask[-1]
             ):
-                # This chunk produced a checkpoint before the final prompt boundary.
-                # Keep its hash while the state slot is still live; null slots are skipped below.
-                group_store_mask = [*group_store_mask[:-1], True]
+                # Only persist an intermediate checkpoint if lookup_mask can probe it
+                # (respects sparse retention_interval boundaries).
+                lookup_masks = self.token_database.lookup_mask(token_len)
+                group_lookup_mask = (
+                    lookup_masks[group_id] if lookup_masks is not None and group_id < len(lookup_masks) else None
+                )
+                if group_lookup_mask is None or (
+                    len(group_lookup_mask) == len(group_store_mask) and group_lookup_mask[-1]
+                ):
+                    group_store_mask = [*group_store_mask[:-1], True]
             if group_store_mask is not None and not group_store_mask:
                 continue
 
@@ -1416,8 +1423,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             if ret is None or any(code != 0 for code in ret):
                 missing_block_ids = record_failed_blocks(block_id_list_c, ret)
                 if self.report_hybrid_load_errors or len(req_meta.block_ids_by_group) == 1:
-                    if self.report_hybrid_load_errors:
-                        req_meta.can_save = False
                     with self._invalid_block_ids_lock:
                         self._invalid_block_ids.update(missing_block_ids)
             logger.debug(

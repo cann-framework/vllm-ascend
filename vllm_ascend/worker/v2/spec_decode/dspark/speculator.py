@@ -425,24 +425,23 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
             dummy_run
             or is_profile
             or dp_sync is not None
-            or getattr(self, "dp_size", 1) > 1
-            or getattr(self, "replicated_pcp", False)
-            or getattr(self, "enable_adaptive_verification", False)
-            or getattr(self, "draft_tokens", None) is None
+            or self.dp_size > 1
+            or self.replicated_pcp
+            or self.enable_adaptive_verification
+            or not input_batch.has_prefill
+            or input_batch.num_reqs <= 0
+            or input_batch.num_draft_tokens != 0
         ):
             return False
-        if not getattr(input_batch, "has_prefill", False):
-            return False
-        num_reqs = getattr(input_batch, "num_reqs", 0)
-        if num_reqs <= 0 or getattr(input_batch, "num_draft_tokens", 0) != 0:
-            return False
-        num_computed_prefill = getattr(input_batch, "num_computed_prefill_tokens_np", None)
-        num_scheduled = getattr(input_batch, "num_scheduled_tokens", None)
-        prefill_len = getattr(input_batch, "prefill_len_np", None)
-        if num_computed_prefill is None or num_scheduled is None or prefill_len is None:
-            return False
-        return bool(np.all(num_computed_prefill[:num_reqs] + num_scheduled[:num_reqs] < prefill_len[:num_reqs]))
+        num_reqs = input_batch.num_reqs
+        return bool(
+            np.all(
+                input_batch.num_computed_prefill_tokens_np[:num_reqs] + input_batch.num_scheduled_tokens[:num_reqs]
+                < input_batch.prefill_len_np[:num_reqs]
+            )
+        )
 
+    # Mirrors upstream DFlashSpeculator.propose context-KV write only; remove once upstream adds a skip_draft hook.
     def _store_intermediate_prefill_context_kv(
         self,
         input_batch: InputBatch,

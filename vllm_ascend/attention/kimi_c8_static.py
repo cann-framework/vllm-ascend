@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import logging
 from dataclasses import dataclass
 
 import torch
@@ -10,13 +12,8 @@ PA_NZ_BLOCK_SIZE = 128  # Prolog/V2 table granularity; FA uses cache.shape[3].
 K3_MLA_CACHE_WIDTH = 576
 
 
-_UNSUPPORTED_ANTI_QUANT_MARKERS = (
-    "not implemented",
-    "not support",
-    "unsupported",
-    "ez1001",
-    "aclnn_parameter_error",
-)
+logger = logging.getLogger(__name__)
+
 _ANTI_QUANT_PROBE_CODES = (0x04, 0x38, 0x3C, 0x45, 0xB8, 0xC2)
 _ANTI_QUANT_PROBE_SCALE = 0.1372941
 _ANTI_QUANT_PROBE_ROWS = 2
@@ -36,16 +33,6 @@ def quantize_static_fp8(x: torch.Tensor, scale: torch.Tensor | float) -> torch.T
     return _quantize_static_fp8_validated(x, s)
 
 
-def is_unsupported_npu_anti_quant_error(exc: Exception) -> bool:
-    """Return True only when an exception indicates unsupported anti-quant op/dtype/shape."""
-    if isinstance(exc, (ImportError, NotImplementedError, TypeError, AttributeError)):
-        return True
-    if isinstance(exc, RuntimeError):
-        msg = str(exc).lower()
-        return any(marker in msg for marker in _UNSUPPORTED_ANTI_QUANT_MARKERS)
-    return False
-
-
 def _probe_npu_fp8_anti_quant(anti_quant, device: torch.device, dtype: torch.dtype) -> bool:
     sample = torch.tensor(_ANTI_QUANT_PROBE_CODES, dtype=torch.uint8, device=device)
     total_elems = _ANTI_QUANT_PROBE_ROWS * K3_MLA_CACHE_WIDTH
@@ -54,26 +41,33 @@ def _probe_npu_fp8_anti_quant(anti_quant, device: torch.device, dtype: torch.dty
     probe_s = torch.tensor([_ANTI_QUANT_PROBE_SCALE], dtype=torch.float32, device=device)
     try:
         actual = anti_quant(probe_u8.view(torch.float8_e4m3fn), probe_s, dst_dtype=dtype)
-    except Exception as exc:
-        if is_unsupported_npu_anti_quant_error(exc):
-            return False
-        raise
-    expected = probe_u8.view(torch.float8_e4m3fn).float().mul_(probe_s).to(dtype)
-    return actual.shape == expected.shape and actual.dtype == dtype and bool(torch.equal(actual, expected))
-
-
-def supports_npu_fp8_anti_quant(device: torch.device, dtype: torch.dtype) -> bool:
-    """Probe once with the real [T, 1, 576] layout and verify exact bit parity."""
-    if device.type != "npu" or dtype not in (torch.bfloat16, torch.float16):
+    except (NotImplementedError, RuntimeError) as exc:
+        logger.info("C8 npu_anti_quant probe failed for (%s, %s); using FP32 dequant fallback: %s", device, dtype, exc)
         return False
+    expected = probe_u8.view(torch.float8_e4m3fn).float().mul_(probe_s).to(dtype)
+    matched = actual.shape == expected.shape and actual.dtype == dtype and bool(torch.equal(actual, expected))
+    if not matched:
+        logger.info("C8 npu_anti_quant probe parity mismatch for (%s, %s); using FP32 dequant fallback.", device, dtype)
+    return matched
+
+
+@functools.lru_cache(maxsize=8)
+def resolve_npu_fp8_anti_quant(device: torch.device, dtype: torch.dtype):
+    """Probe once per (device, dtype) with the real [T, 1, 576] layout and return the op handle or None."""
+    if device.type != "npu" or dtype not in (torch.bfloat16, torch.float16):
+        return None
     try:
         import torch_npu  # noqa: PLC0415
     except ImportError:
-        return False
+        return None
     anti_quant = getattr(torch_npu, "npu_anti_quant", None)
-    if anti_quant is None:
-        return False
-    return _probe_npu_fp8_anti_quant(anti_quant, device, dtype)
+    if anti_quant is None or not _probe_npu_fp8_anti_quant(anti_quant, device, dtype):
+        return None
+    return anti_quant
+
+
+def supports_npu_fp8_anti_quant(device: torch.device, dtype: torch.dtype) -> bool:
+    return resolve_npu_fp8_anti_quant(device, dtype) is not None
 
 
 def dequantize_static_fp8(x: torch.Tensor, scale: torch.Tensor | float, dtype=torch.bfloat16) -> torch.Tensor:
@@ -88,16 +82,12 @@ def _dequantize_static_fp8(
     s: torch.Tensor,
     dtype: torch.dtype,
     *,
-    use_npu_anti_quant: bool = False,
+    anti_quant=None,
 ) -> torch.Tensor:
     if x.numel() == 0:
         return torch.empty(x.shape, dtype=dtype, device=x.device)
-    if use_npu_anti_quant and x.device.type == "npu" and dtype in (torch.bfloat16, torch.float16):
-        import torch_npu  # noqa: PLC0415
-
-        anti_quant = getattr(torch_npu, "npu_anti_quant", None)
-        if anti_quant is not None:
-            return anti_quant(x.view(torch.float8_e4m3fn), s, dst_dtype=dtype)
+    if anti_quant is not None:
+        return anti_quant(x.view(torch.float8_e4m3fn), s, dst_dtype=dtype)
     return x.view(torch.float8_e4m3fn).float().mul_(s).to(dtype)
 
 
@@ -401,11 +391,10 @@ class C8PrefillHistory:
         validated_scale: torch.Tensor,
         *,
         dtype: torch.dtype,
-        use_npu_anti_quant: bool = False,
     ) -> torch.Tensor:
         """Read from a cache with the geometry validated by prepare."""
         raw = self.read_raw(cache, chunk)
-        return _dequantize_static_fp8(raw, validated_scale, dtype, use_npu_anti_quant=use_npu_anti_quant)
+        return _dequantize_static_fp8(raw, validated_scale, dtype)
 
 
 def validate_pa_nz_page_stride(block_size: int, page_stride_bytes: int, width: int = K3_MLA_CACHE_WIDTH) -> None:

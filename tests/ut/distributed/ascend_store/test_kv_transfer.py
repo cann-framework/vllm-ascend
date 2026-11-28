@@ -85,6 +85,9 @@ class MaskedFakeTokenDatabase(FakeTokenDatabase):
     def store_mask(self, token_len, num_prompt_tokens=None):
         return self.masks
 
+    def lookup_mask(self, token_len):
+        return getattr(self, "lookup_masks", None)
+
     def load_mask(self, block_hashes, token_len):
         return self.masks
 

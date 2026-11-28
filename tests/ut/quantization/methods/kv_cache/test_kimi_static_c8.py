@@ -296,14 +296,15 @@ def test_c8_quantize_and_write_plan_preserve_caller_input(input_dtype, all_valid
     assert torch.equal(merged, merged_before)
 
 
-def test_c8_anti_quant_probe_checks_real_layout_parity_and_errors():
+def test_c8_anti_quant_probe_checks_real_layout_and_parity():
     from vllm_ascend.attention.kimi_c8_static import (
         K3_MLA_CACHE_WIDTH,
         _probe_npu_fp8_anti_quant,
+        resolve_npu_fp8_anti_quant,
         supports_npu_fp8_anti_quant,
     )
 
-    assert supports_npu_fp8_anti_quant(torch.device("cpu"), torch.bfloat16) is False
+    assert resolve_npu_fp8_anti_quant(torch.device("cpu"), torch.bfloat16) is None
     assert supports_npu_fp8_anti_quant(torch.device("npu"), torch.float32) is False
 
     seen: dict[str, object] = {}
@@ -329,48 +330,28 @@ def test_c8_anti_quant_probe_checks_real_layout_parity_and_errors():
 
     assert _probe_npu_fp8_anti_quant(unsupported_anti_quant, torch.device("cpu"), torch.bfloat16) is False
 
-    def oom_anti_quant(x, s, *, dst_dtype):
-        raise RuntimeError("NPU out of memory")
 
-    with pytest.raises(RuntimeError, match="out of memory"):
-        _probe_npu_fp8_anti_quant(oom_anti_quant, torch.device("cpu"), torch.bfloat16)
-
-
-def test_c8_dequant_disables_anti_quant_cache_after_unsupported_error(monkeypatch):
-    from vllm_ascend.attention import kimi_c8_static
+def test_c8_project_prefill_kv_matches_unquantized_kv_b_proj():
     from vllm_ascend.attention.mla_v1 import AscendMLAImpl
 
+    torch.manual_seed(7)
+    num_heads, kv_lora_rank, qk_nope_dim, v_dim = 4, 16, 12, 8
+    weight_out_in = torch.randn(num_heads * (qk_nope_dim + v_dim), kv_lora_rank, dtype=torch.float32)
+    kv_c_normed = torch.randn(5, kv_lora_rank, dtype=torch.float32)
+
+    kv_b_weight = weight_out_in.t().view(kv_lora_rank, num_heads, qk_nope_dim + v_dim)
+    w_uk, w_uv = kv_b_weight.split([qk_nope_dim, v_dim], dim=-1)
+
     impl = AscendMLAImpl.__new__(AscendMLAImpl)
-    impl._c8_npu_anti_quant_cache = {("cpu", torch.bfloat16): True}
-    raw = torch.tensor([[[0x38, 0x3C]]], dtype=torch.uint8)
-    scale = torch.tensor([0.1372941], dtype=torch.float32)
+    impl.num_heads = num_heads
+    impl.kv_lora_rank = kv_lora_rank
+    impl.qk_nope_head_dim = qk_nope_dim
+    impl.v_head_dim = v_dim
+    impl.W_UK_T = w_uk.permute(1, 2, 0).contiguous()
+    impl._c8_w_uv_prefill = w_uv.reshape(kv_lora_rank, num_heads * v_dim).contiguous()
 
-    calls = {"anti_quant": 0}
-    orig_dequant = kimi_c8_static._dequantize_static_fp8
-
-    def fake_dequant(x, s, dtype, *, use_npu_anti_quant=False):
-        if use_npu_anti_quant:
-            calls["anti_quant"] += 1
-            raise RuntimeError("AclNN_Parameter_Error(EZ1001): not implemented for shape")
-        return orig_dequant(x, s, dtype, use_npu_anti_quant=False)
-
-    monkeypatch.setattr(kimi_c8_static, "_dequantize_static_fp8", fake_dequant)
-
-    out1, flag1 = impl._dequantize_c8_history(raw, scale, torch.bfloat16, use_npu_anti_quant=True)
-    assert flag1 is False
-    assert impl._c8_npu_anti_quant_cache[("cpu", torch.bfloat16)] is False
-    assert calls["anti_quant"] == 1
-
-    # Subsequent chunk must skip the failing fast path completely.
-    out2, flag2 = impl._dequantize_c8_history(raw, scale, torch.bfloat16, use_npu_anti_quant=flag1)
-    assert flag2 is False
-    assert calls["anti_quant"] == 1
-    assert torch.equal(out1, out2)
-
-    # Non-unsupported RuntimeErrors (e.g. OOM) must not be swallowed.
-    def fake_oom(x, s, dtype, *, use_npu_anti_quant=False):
-        raise RuntimeError("NPU out of memory")
-
-    monkeypatch.setattr(kimi_c8_static, "_dequantize_static_fp8", fake_oom)
-    with pytest.raises(RuntimeError, match="out of memory"):
-        impl._dequantize_c8_history(raw, scale, torch.bfloat16, use_npu_anti_quant=True)
+    k_nope, v = impl._project_c8_prefill_kv(kv_c_normed)
+    ref = torch.nn.functional.linear(kv_c_normed, weight_out_in).view(-1, num_heads, qk_nope_dim + v_dim)
+    ref_k, ref_v = ref.split([qk_nope_dim, v_dim], dim=-1)
+    torch.testing.assert_close(k_nope, ref_k)
+    torch.testing.assert_close(v, ref_v)

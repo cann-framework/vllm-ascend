@@ -631,22 +631,18 @@ def test_reorg_kvcache_packed_single_span_zero_copy_and_multi_span_equivalence()
         chunk_size=6,
         kv_rank_offsets=[[0, 6]],
     )
-    kv_c_in, k_pe_in = packed_local.split([4, 2], dim=-1)
     with patch("vllm_ascend.attention.context_parallel.mla_cp.torch.cat", wraps=torch.cat) as cat_spy:
-        out_kv_c, out_k_pe = impl._reorg_kvcache(
-            kv_c_in,
-            k_pe_in,
+        out_packed = impl._reorg_packed_kvcache(
+            packed_local,
             chunked_context=meta_full,
             chunk_idx=0,
             toks=6,
-            packed_kv_c_k_pe=packed_local,
         )
     assert cat_spy.call_count == 0
     impl._dcp_all_gather.assert_called_once()
     assert impl._dcp_all_gather.call_args.args[0].data_ptr() == packed_local.data_ptr()
-    assert out_kv_c.data_ptr() == gathered.data_ptr()
-    torch.testing.assert_close(out_kv_c, gathered[:, :, :4])
-    torch.testing.assert_close(out_k_pe, gathered[:, :, 4:])
+    assert out_packed.data_ptr() == gathered.data_ptr()
+    torch.testing.assert_close(out_packed, gathered)
 
     # Case 2: Padded tail chunk (rank 0 has 6, rank 1 has 4 out of 6) -> 1 cat instead of 3, exact match!
     meta_tail = DCPChunkedContextMetadata(
@@ -666,18 +662,15 @@ def test_reorg_kvcache_packed_single_span_zero_copy_and_multi_span_equivalence()
     )
     impl._dcp_all_gather = Mock(return_value=gathered)
     with patch("vllm_ascend.attention.context_parallel.mla_cp.torch.cat", wraps=torch.cat) as cat_spy2:
-        tail_kv_c, tail_k_pe = impl._reorg_kvcache(
-            kv_c_in,
-            k_pe_in,
+        tail_packed = impl._reorg_packed_kvcache(
+            packed_local,
             chunked_context=meta_tail,
             chunk_idx=0,
             toks=6,
-            packed_kv_c_k_pe=packed_local,
         )
     assert cat_spy2.call_count == 1
     expected_rows = torch.cat([gathered[0:3], gathered[6:8], gathered[3:5], gathered[9:12]], dim=0)
-    torch.testing.assert_close(tail_kv_c, expected_rows[:, :, :4])
-    torch.testing.assert_close(tail_k_pe, expected_rows[:, :, 4:])
+    torch.testing.assert_close(tail_packed, expected_rows)
 
 
 def test_c8_compute_prefill_context_allgathers_uint8_before_dequant():

@@ -598,12 +598,11 @@ class TestMooncakeBackendMethods(unittest.TestCase):
         backend = self._make_backend()
         backend.config.enable_ssd_offload = True
         put = backend.store.batch_put_from_multi_buffers
-        put.side_effect = [[0, -200, -1, -200], [0], [-200]]
+        put.side_effect = [[0, -200, -1, -200], [0, -200]]
 
         assert backend.put(["a", "b", "c", "d"], [[1], [2], [3], [4]], [[8]] * 4) is False
         assert [invocation.args[:3] for invocation in put.call_args_list[1:]] == [
-            (["b"], [[2]], [[8]]),
-            (["d"], [[4]], [[8]]),
+            (["b", "d"], [[2], [4]], [[8], [8]]),
         ]
 
     def test_register_buffer(self):

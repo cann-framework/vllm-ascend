@@ -23,8 +23,6 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
-from vllm_ascend.ascend_config import is_kimi_c8_config
-
 
 def resolve_dcp_cache_block_sizes(
     group_block_sizes: Sequence[int], dcp_size: int, enable_prefix_caching: bool
@@ -179,6 +177,8 @@ def supports_component_major_mla_pd(vllm_config: VllmConfig) -> bool:
     # registry name, so conservatively fall back to the legacy layout.
     if getattr(kv_transfer_config, "kv_connector_module_path", None) is not None:
         return False
+
+    from vllm_ascend.ascend_config import is_kimi_c8_config
 
     if is_kimi_c8_config(vllm_config):
         return supports_c8_pd_connector(vllm_config)

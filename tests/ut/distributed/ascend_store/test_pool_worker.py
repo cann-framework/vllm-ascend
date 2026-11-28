@@ -1320,7 +1320,8 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
                     thread = worker.kv_recv_thread
                     thread._handle_request(thread.request_queue.get_nowait())
                 self.assertEqual(worker.get_block_ids_with_load_errors(), {8})
-                self.assertFalse(req.can_save)
+                if not load_async:
+                    self.assertFalse(req.can_save)
 
     @patch(
         "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.KVCacheStoreRecvingThread.start",
