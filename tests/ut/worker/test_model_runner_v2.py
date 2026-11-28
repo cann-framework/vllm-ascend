@@ -1874,6 +1874,39 @@ def test_spec_cpu_length_sync_bypass_requires_all_audited_conditions(architectur
         target_uses_flashmla.assert_not_called()
 
 
+@pytest.mark.parametrize("dcp_size", [1, 2, 8])
+def test_window_gqa_draft_keeps_spec_cpu_length_sync(dcp_size):
+    """Window-GQA drafts build their FIA host lists from the shared
+    num_computed mirror (seq_lens_cpu_upper_bound = mirror + scheduled),
+    so they must keep the staged D2H refresh even when the target is
+    all-FlashMLA; their length base stays exact like the MLA DCP draft's.
+    """
+    runner = _make_runner()
+    runner.model_config.architecture = "KimiK3ForCausalLM"
+    runner.model = torch.nn.Module()
+    runner.speculator = SimpleNamespace(
+        _draft_mla_uses_device_lengths=False,
+        _window_gqa_dcp_fallback=True,
+        attn_architecture="GQA",
+        use_dcp=False,
+    )
+    runner.vllm_config.parallel_config = SimpleNamespace(
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=dcp_size,
+    )
+    runner.adaptive_verification = None
+    runner.ascend_config.sparse_kv_offload_config.enabled = False
+    runner.ascend_config.kvpp_config = SimpleNamespace(size=1)
+
+    with patch(
+        "vllm_ascend.worker.v2.model_runner.all_mla_use_flashmla", return_value=True
+    ) as target_uses_flashmla:
+        assert runner._can_skip_spec_cpu_length_sync() is False
+
+    target_uses_flashmla.assert_not_called()
+
+
 def test_flashmla_cpu_length_sync_bypass_does_not_copy_or_record_event():
     runner = _make_runner()
     runner._skip_spec_cpu_length_sync = True

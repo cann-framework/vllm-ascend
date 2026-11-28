@@ -1280,7 +1280,13 @@ class NPUModelRunner(GPUModelRunner):
         return output
 
     def _can_skip_spec_cpu_length_sync(self) -> bool:
-        """Use device lengths for K3/DSpark FlashMLA, including DCP."""
+        """Skip the staged D2H only when every length reader is on-device.
+
+        Both DSpark draft families build host lengths from the shared
+        num_computed mirror (DCP MLA via input_buffers.seq_lens_cpu,
+        Window-GQA via seq_lens_cpu_upper_bound); only an all-FlashMLA
+        run may skip the refresh.
+        """
         parallel = self.vllm_config.parallel_config
         if (
             self.model_config.architecture
@@ -1295,8 +1301,7 @@ class NPUModelRunner(GPUModelRunner):
         ):
             return False
 
-        # FlashMLA derives DCP-local lengths from rejection-corrected device
-        # counters. K3's non-MLA attention uses the KDA device-length path.
+        # FlashMLA (target and draft) derives every length from device state.
         return all_mla_use_flashmla(self.model)
 
     def postprocess_sampled(

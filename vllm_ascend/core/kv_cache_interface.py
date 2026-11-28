@@ -52,6 +52,41 @@ def is_circular_kv_cache_spec(kv_cache_spec: KVCacheSpec) -> bool:
     return isinstance(kv_cache_spec, CircularBufferSpec) or getattr(kv_cache_spec, "is_circular", False)
 
 
+def is_sliding_window_gqa_spec(kv_cache_spec: KVCacheSpec) -> bool:
+    """Return whether a spec is an ordinary sliding-window GQA cache.
+
+    Sliding-window MLA and circular indexer-tail specs share the
+    ``SlidingWindowSpec`` base class but follow different DCP rules; only
+    ordinary GQA draft pages are replicated under worker-wide DCP.
+    """
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        specs = tuple(kv_cache_spec.kv_cache_specs.values())
+        return bool(specs) and all(is_sliding_window_gqa_spec(spec) for spec in specs)
+    if isinstance(kv_cache_spec, SlidingWindowMLASpec):
+        return False
+    if is_circular_kv_cache_spec(kv_cache_spec):
+        return False
+
+    # With the hybrid manager disabled, vLLM promotes an ordinary
+    # SlidingWindowSpec to FullAttentionSpec(sliding_window=...); keep both
+    # representations under the same predicate.
+    if isinstance(kv_cache_spec, SlidingWindowSpec):
+        return True
+    return (
+        isinstance(kv_cache_spec, FullAttentionSpec)
+        and kv_cache_spec.sliding_window is not None
+        # R-SWA carries a window field but different prefix/gap semantics.
+        and not hasattr(kv_cache_spec, "rswa_window")
+    )
+
+
+def is_sliding_window_gqa_draft_group(kv_cache_group) -> bool:
+    """Return whether a cache group is a replicated Window-GQA draft group."""
+    return bool(getattr(kv_cache_group, "is_eagle_group", False)) and is_sliding_window_gqa_spec(
+        kv_cache_group.kv_cache_spec
+    )
+
+
 def is_prefix_cacheable(kv_cache_spec: KVCacheSpec) -> bool:
     """Resolve cacheability through uniform wrappers.
 

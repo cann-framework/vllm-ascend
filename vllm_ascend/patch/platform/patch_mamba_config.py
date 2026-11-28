@@ -173,13 +173,13 @@ def verify_and_update_config(cls, vllm_config) -> None:
             )
     if _using_kimi_c8(vllm_config, model_config):
         # Kimi C8 stores one 576-byte E4M3 latent per token (512 nope + 64
-        # rope); the static per-layer scale is outside the page.  Keep the
-        # scheduler block at 1664 (C8+DCP8 contract) and shrink the shared
-        # mamba page to the C8 payload instead of the bf16 geometry.  Draft
-        # stays bf16 at 1,916,928 and is handled as its own per-layer page by
-        # the mixed-page worker grouping.
-        if cache_config.block_size != 1664:
-            raise ValueError(f"Kimi C8 packed page requires block_size=1664, got {cache_config.block_size}")
+        # rope); the static per-layer scale is outside the page.  The manager
+        # page width is the caller's configured block_size; Window-GQA later
+        # uses the same width while its backend may split it into kernel
+        # blocks (normally 128 tokens).
+        manager_block_size = cache_config.block_size
+        if not isinstance(manager_block_size, int) or manager_block_size <= 0:
+            raise ValueError(f"Kimi C8 packed page requires a positive block_size, got {manager_block_size}")
         kernel_block_size = 128
         model_cls, _ = ModelRegistry.resolve_model_cls(
             model_config.architecture,
@@ -193,7 +193,7 @@ def verify_and_update_config(cls, vllm_config) -> None:
         kv_lora_rank = int(model_config.hf_text_config.kv_lora_rank)
         qk_rope_head_dim = int(model_config.hf_text_config.qk_rope_head_dim)
         packed_token_page = kv_lora_rank + qk_rope_head_dim
-        attn_page_size = cache_config.block_size * packed_token_page
+        attn_page_size = manager_block_size * packed_token_page
         align_bytes = kernel_block_size * packed_token_page
         if attn_page_size % align_bytes:
             raise ValueError(

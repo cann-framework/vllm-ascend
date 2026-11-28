@@ -15,6 +15,19 @@ from vllm_ascend.utils import is_deepseek_v41, is_gqa_pcp_dcp_config
 _orig_post_init = SpeculativeConfig.__post_init__
 _orig_hf_config_override = SpeculativeConfig.hf_config_override
 
+
+def _is_redhat_window_gqa(hf_config: PretrainedConfig) -> bool:
+    """Identify the native eight-row RedHat Window-GQA DSpark checkpoint."""
+    architectures = getattr(hf_config, "architectures", ()) or ()
+    return (
+        getattr(hf_config, "model_type", None) in ("qwen3", "speculators")
+        and any(arch in ("Qwen3DSparkModel", "DSparkDraftModel") for arch in architectures)
+        and bool(getattr(hf_config, "use_sliding_window", False))
+        and bool(getattr(hf_config, "sample_from_anchor", False))
+        and getattr(hf_config, "block_size", None) == 8
+        and getattr(hf_config, "sliding_window", None) is not None
+    )
+
 # Transformers 5.14 inherited a hidden_size % num_heads check from Llama in
 # DeepseekV2Config. K3 MLA has independent projection/head dimensions (e.g.
 # hidden_size=7168, num_heads=96), so that MHA constraint does not apply.
@@ -86,16 +99,111 @@ def _normalize_kimi_dflash_rope(hf_config: PretrainedConfig) -> None:
 def _normalize_legacy_qwen3_dspark_config(hf_config: PretrainedConfig) -> PretrainedConfig:
     hf_config = _orig_hf_config_override(hf_config)
     _normalize_kimi_dflash_rope(hf_config)
-    architectures = hf_config.architectures or ()
-    if hf_config.model_type == "qwen3" and "DSparkDraftModel" in architectures:
-        dflash_config = hf_config.dflash_config
-        hf_config.update(
-            {
-                "architectures": ["Qwen3DSparkModel"],
-                "mask_token_id": dflash_config["mask_token_id"],
-                "target_layer_ids": dflash_config["target_layer_ids"],
+    architectures = getattr(hf_config, "architectures", ()) or ()
+    is_qwen3_dspark = (
+        getattr(hf_config, "model_type", None) in ("qwen3", "speculators")
+        and any(arch in ("Qwen3DSparkModel", "DSparkDraftModel") for arch in architectures)
+    )
+    if is_qwen3_dspark:
+        # RedHat's config stores the decoder fields under
+        # transformer_layer_config. Promote them before model inspection so
+        # the draft is built as ordinary Qwen3 Window-GQA.
+        outer_non_causal = getattr(hf_config, "sliding_window_non_causal", None)
+        transformer_config = getattr(hf_config, "transformer_layer_config", None)
+        if transformer_config is not None:
+            if isinstance(transformer_config, dict):
+                transformer_updates = transformer_config
+            elif hasattr(transformer_config, "to_dict"):
+                # Newer transformers materializes nested configs as a
+                # PretrainedConfig object rather than a plain mapping.  The
+                # Qwen3 model constructor still reads these decoder fields
+                # from the top-level draft config, so promote either form.
+                transformer_updates = transformer_config.to_dict()
+            else:
+                transformer_updates = {
+                    name: value
+                    for name in dir(transformer_config)
+                    if not name.startswith("_")
+                    and (value := getattr(transformer_config, name, None)) is not None
+                    and isinstance(value, (bool, int, float, str, list, tuple, dict))
+                }
+            if transformer_updates:
+                hf_config.update(transformer_updates)
+        if getattr(hf_config, "model_type", None) == "speculators":
+            hf_config.model_type = "qwen3"
+
+        raw_dflash_config = getattr(hf_config, "dflash_config", None)
+        if isinstance(raw_dflash_config, dict):
+            dflash_config = dict(raw_dflash_config)
+        elif hasattr(raw_dflash_config, "to_dict"):
+            dflash_config = raw_dflash_config.to_dict()
+        elif raw_dflash_config is None:
+            dflash_config = {}
+        else:
+            dflash_config = {
+                name: value
+                for name in dir(raw_dflash_config)
+                if not name.startswith("_")
+                and (value := getattr(raw_dflash_config, name, None)) is not None
+                and isinstance(value, (bool, int, float, str, list, tuple, dict))
             }
-        )
+        aux_layer_ids = getattr(hf_config, "aux_hidden_state_layer_ids", None)
+        if aux_layer_ids is None:
+            aux_layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+        target_layer_ids = dflash_config.get("target_layer_ids")
+        if target_layer_ids is None:
+            target_layer_ids = getattr(hf_config, "target_layer_ids", None)
+        if target_layer_ids is None and aux_layer_ids:
+            # Published auxiliary IDs are one-based; vLLM target IDs are zero-based.
+            target_layer_ids = [int(layer_id) - 1 for layer_id in aux_layer_ids]
+
+        normalized = {
+            "architectures": ["Qwen3DSparkModel"],
+            "mask_token_id": dflash_config.get(
+                "mask_token_id", getattr(hf_config, "mask_token_id", None)
+            ),
+        }
+        if target_layer_ids is not None:
+            normalized["target_layer_ids"] = list(target_layer_ids)
+            normalized["dspark_target_layer_ids"] = list(target_layer_ids)
+        if aux_layer_ids:
+            normalized["eagle_aux_hidden_state_layer_ids"] = [int(i) for i in aux_layer_ids]
+
+        non_causal = outer_non_causal
+        if non_causal is None:
+            non_causal = transformer_updates.get("sliding_window_non_causal") if transformer_config is not None else None
+        if non_causal is not None:
+            causal = not bool(non_causal)
+            normalized["is_causal"] = causal
+            dflash_config["causal"] = causal
+        elif (
+            bool(getattr(hf_config, "use_sliding_window", False))
+            and getattr(hf_config, "layer_types", None)
+            and all(layer_type == "sliding_attention" for layer_type in hf_config.layer_types)
+        ):
+            dflash_config.setdefault("causal", True)
+
+        # The trained anchor block has eight rows while vLLM verifies seven
+        # draft tokens. The proposer executes the native width and crops its
+        # final row; keep the same SWA metadata convention in the config.
+        sliding_window = getattr(hf_config, "sliding_window", None)
+        native_width = getattr(hf_config, "block_size", None)
+        if (
+            sliding_window is not None
+            and bool(getattr(hf_config, "use_sliding_window", False))
+            and bool(getattr(hf_config, "sample_from_anchor", False))
+            and aux_layer_ids is not None
+            and native_width == 8
+        ):
+            dflash_config["use_swa"] = True
+            dflash_config["swa_window_size"] = int(sliding_window) + native_width - 1
+        if target_layer_ids is not None:
+            dflash_config["target_layer_ids"] = list(target_layer_ids)
+        if normalized["mask_token_id"] is not None:
+            dflash_config.setdefault("mask_token_id", normalized["mask_token_id"])
+        if dflash_config:
+            normalized["dflash_config"] = dflash_config
+        hf_config.update(normalized)
     if hf_config.model_type in ("glm5_next", "glm5_next_text"):
         n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
         hf_config.model_type = "glm5_next_mtp"
@@ -199,6 +307,13 @@ def _dspark_post_init(self):
     if self.use_dspark():
         draft_model_config = getattr(self, "draft_model_config", None)
         draft_hf_config = getattr(draft_model_config, "hf_config", None)
+        if draft_hf_config is not None and _is_redhat_window_gqa(draft_hf_config):
+            # The checkpoint advertises its native eight-row anchor block;
+            # the verifier/proposer contract remains seven speculative tokens.
+            if self.num_speculative_tokens == 8:
+                self.num_speculative_tokens = 7
+                if hasattr(draft_hf_config, "num_lookahead_tokens"):
+                    draft_hf_config.num_lookahead_tokens = 7
         _normalize_deepseek_dspark_draft(draft_model_config)
         # deepseek v4 dspark
         if getattr(draft_hf_config, "ptd_token_id", None) is None:  # type: ignore

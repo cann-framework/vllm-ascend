@@ -6,7 +6,7 @@ import pytest
 import torch
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy, get_kv_cache_groups
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor, MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor, MambaSpec, SlidingWindowSpec
 from vllm.v1.worker.gpu.attn_utils import prepare_kernel_block_sizes
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -243,3 +243,34 @@ def test_mixed_pages_are_opt_in_for_c8(c8):
         }
     )
     assert (groups is not None) == c8
+
+
+@pytest.mark.parametrize("manager_block_size", [640, 1664])
+def test_window_gqa_uses_configured_manager_block_size(manager_block_size):
+    from vllm_ascend.patch.platform.patch_kv_cache_utils import _get_kimi_k3_dspark_mixed_kv_cache_groups
+
+    target = spec(block_size=manager_block_size)
+    draft = SlidingWindowSpec(
+        block_size=128,
+        num_kv_heads=8,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=4096,
+    )
+    state = MambaSpec(
+        block_size=manager_block_size,
+        shapes=((16,),),
+        dtypes=(torch.float32,),
+        page_size_padded=73728,
+    )
+    groups = _get_kimi_k3_dspark_mixed_kv_cache_groups(
+        {
+            "language_model.model.layers.0.self_attn.attn": target,
+            "model.layers.0.self_attn.attn": draft,
+            "language_model.model.layers.1.self_attn.attn": state,
+        }
+    )
+    assert groups is not None
+    window_group = next(group for group in groups if "model.layers.0.self_attn.attn" in group.layer_names)
+    window_spec = window_group.kv_cache_spec.kv_cache_specs["model.layers.0.self_attn.attn"]
+    assert window_spec.block_size == manager_block_size

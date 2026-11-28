@@ -84,6 +84,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSlidingWindowMLASpec,
     get_kv_cache_compression_ratio,
     get_storage_block_size,
+    is_sliding_window_gqa_spec,
     supports_component_major_mla_pd,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
@@ -198,6 +199,16 @@ def _align_hybrid_attention_page_sizes(kv_cache_specs: dict[str, KVCacheSpec]) -
             )
 
 
+def _dspark_draft_active(vllm_config: VllmConfig) -> bool:
+    """Whether a DSpark draft model is loaded alongside the target model."""
+    spec_config = vllm_config.speculative_config
+    return (
+        spec_config is not None
+        and spec_config.method == "dspark"
+        and getattr(spec_config, "draft_model_config", None) is not None
+    )
+
+
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     """Build Ascend-specific KV cache specs for v2 worker patching."""
     from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
@@ -225,6 +236,14 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
 
     c8_cache_dtype = kv_cache_dtype_str_to_dtype(vllm_config.cache_config.cache_dtype, vllm_config.model_config)
 
+    # Non-C8 DSpark: double the manager block for Window-GQA draft layers
+    # only; layer_is_draft keeps target-side sliding-window layers untouched.
+    window_gqa_double_block = (
+        not is_kimi_c8_config(vllm_config)
+        and getattr(vllm_config.model_config, "use_mla", False)
+        and _dspark_draft_active(vllm_config)
+    )
+
     for layer_name, attn_module in attn_layers.items():
         if getattr(attn_module, "kv_sharing_target_layer_name", None):
             continue
@@ -240,6 +259,33 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             or getattr(impl, "is_draft_cache", False) is True
             or getattr(impl, "is_draft_model", False) is True
         )
+
+        # Window-GQA uses the C8 manager page; the backend still picks its
+        # native kernel block below.
+        manager_block_size = getattr(vllm_config.cache_config, "block_size", None)
+        if (
+            is_kimi_c8_config(vllm_config)
+            and layer_is_draft
+            and is_sliding_window_gqa_spec(spec)
+            and isinstance(manager_block_size, int)
+            and manager_block_size > 0
+            and spec.block_size != manager_block_size
+        ):
+            spec = replace(spec, block_size=manager_block_size, page_size_padded=None)
+        elif (
+            window_gqa_double_block
+            and layer_is_draft
+            and is_sliding_window_gqa_spec(spec)
+            and isinstance(manager_block_size, int)
+            and manager_block_size > 0
+            and spec.block_size != 2 * manager_block_size
+            and spec.block_size > 0
+            and (2 * manager_block_size) % spec.block_size == 0
+        ):
+            # Doubling the manager block halves the scheduler blocks a window
+            # spans; the draft page stays below the MLA page, and the backend
+            # still splits it into native kernel blocks.
+            spec = replace(spec, block_size=2 * manager_block_size, page_size_padded=None)
 
         if isinstance(spec, MambaSpec):
             # Keep Mamba groups after attention groups. Ascend graph parameter
@@ -380,13 +426,25 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             for name, spec in list(mamba_specs.items()):
                 if spec.real_page_size_bytes <= c8_page and spec.page_size_bytes > c8_page:
                     mamba_specs[name] = replace(spec, page_size_padded=c8_page)
-        # Kimi C8: derive target/Mamba pages from their payloads. Draft keeps
-        # its own BF16 page within the per-layer mixed-page group.
-        page_pool = (
-            [*c8_attention_specs, *mamba_specs.values()]
-            if c8_attention_specs
-            else [*kv_cache_spec.values(), *mamba_specs.values()]
-        )
+        # Kimi C8: one physical page stride for target, Window-GQA draft, and
+        # Mamba; indexer/SFA auxiliary caches keep their own pools.
+        if c8_attention_specs:
+            page_pool = [
+                *c8_attention_specs,
+                *[spec for spec in kv_cache_spec.values() if is_sliding_window_gqa_spec(spec)],
+                *mamba_specs.values(),
+            ]
+        else:
+            # C8 declared but no layer produced a C8 page; keep the baseline
+            # shared-page fallback.
+            logger.warning(
+                "mla_cache_mode=C8 was declared but no target attention layer produced "
+                "a C8 static-FP8 page; using the shared non-C8 page layout."
+            )
+            page_pool = [
+                *kv_cache_spec.values(),
+                *mamba_specs.values(),
+            ]
         common_page_size = max(spec.page_size_bytes for spec in page_pool)
         c8_page_alignments = [spec.static_fp8_kernel_block_size * spec.static_fp8_width for spec in c8_attention_specs]
         if c8_page_alignments:
@@ -394,7 +452,13 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             common_page_size = _align_up(common_page_size, alignment)
         for layer_name in attention_layer_names:
             spec = kv_cache_spec[layer_name]
-            if c8_attention_specs and getattr(attn_layers[layer_name].impl, "is_draft_cache", False):
+            # Draft MLA keeps its own page; only Window-GQA shares the C8
+            # page stride.
+            if (
+                c8_attention_specs
+                and getattr(attn_layers[layer_name].impl, "is_draft_cache", False)
+                and not is_sliding_window_gqa_spec(spec)
+            ):
                 continue
             page_size_padded = common_page_size if spec.page_size_bytes < common_page_size else spec.page_size_padded
             kv_cache_spec[layer_name] = replace(spec, page_size_padded=page_size_padded)
