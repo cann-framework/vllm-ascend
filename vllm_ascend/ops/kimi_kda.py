@@ -4,7 +4,7 @@
 
 The projections, weight loading, and cache specification stay owned by
 upstream vLLM.  Only the CUDA-specific convolution and KDA execution is
-replaced here with the Ascend metadata builder and AscendC operators.
+replaced here with the Ascend metadata builder and CANNBot operators.
 """
 
 from dataclasses import dataclass, replace
@@ -72,6 +72,14 @@ from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import (
 from vllm_ascend.utils import npu_stream_switch
 
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
+_KDA_PROLOG_WEIGHT_NAMES = (
+    "_kda_prolog_qkv_weight",
+    "_kda_prolog_f_a_weight",
+    "_kda_prolog_f_b_weight",
+    "_kda_prolog_b_weight",
+    "_kda_prolog_conv_weight",
+    "_kda_prolog_output_gate_weight",
+)
 _F_PROJ_SHARD_ID = 1
 _MEGA_KDA_MAX_BATCH_MULTIPLIER = 32
 _MEGA_KDA_CACHE_ALIGNMENT_BYTES = 16
@@ -108,6 +116,19 @@ def release_mega_kda_nd_weights(model) -> int:
             and not getattr(module, "_mega_nd_released", False)
         ):
             released += module._release_default_kda_weights()
+    return released
+
+
+def release_kda_prolog_nd_weights(model) -> int:
+    """Release replaced input projections after profiling on pure PD prefill workers."""
+    released = 0
+    for module in model.modules():
+        if (
+            isinstance(module, AscendKimiK3DeltaAttention)
+            and getattr(module, "_mega_pd_prefill_worker", False)
+            and not getattr(module, "_mega_pd_decode_worker", False)
+        ):
+            released += module._release_kda_prolog_nd_weights()
     return released
 
 
@@ -474,6 +495,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         self._mega_pd_decode_worker = _is_pd_decode_worker(vllm_config)
         self._mega_pd_prefill_worker = _is_pd_prefill_worker(vllm_config)
         self._mega_nd_released = False
+        self._kda_prolog_nd_released = False
         quant_config = getattr(vllm_config, "quant_config", None)
         uses_mixed_projection = bool(
             quant_config is not None
@@ -547,6 +569,8 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 requires_grad=False,
             ),
         )
+        for name in _KDA_PROLOG_WEIGHT_NAMES:
+            self.register_buffer(name, None, persistent=False)
         original_process_weights = self.conv1d.quant_method.process_weights_after_loading
 
         @wraps(original_process_weights)
@@ -558,6 +582,124 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             return result
 
         self.conv1d.quant_method.process_weights_after_loading = process_weights_and_pack
+
+    @staticmethod
+    def _prepare_prolog_weight(weight: torch.Tensor, input_size: int, output_size: int) -> torch.Tensor:
+        if tuple(weight.shape) == (output_size, input_size):
+            weight = weight.transpose(0, 1).contiguous()
+        elif tuple(weight.shape) != (input_size, output_size):
+            raise RuntimeError(
+                f"KDA Prolog weight shape {tuple(weight.shape)} does not match [{input_size}, {output_size}]"
+            )
+        if weight.dtype != torch.bfloat16:
+            raise RuntimeError(f"KDA Prolog requires BF16 weights, got {weight.dtype}")
+        if int(torch_npu.get_npu_format(weight)) != 29:
+            weight = torch_npu.npu_format_cast(weight, 29)
+        return weight
+
+    @torch.no_grad()
+    def _prepare_kda_prolog_weights(self) -> bool:
+        """Materialize Prolog's four complete NZ projection allocations.
+
+        The original projections remain resident through profiling. Pure PD
+        prefill workers then release their replaced input projections. With
+        H=7168, 96 heads and D=128, the extra BF16 payload per layer/rank is
+        65.29 MiB at TP8 or 33.52 MiB at TP16, before NZ padding/workspaces.
+        These allocations are prepared before memory profiling so they reduce
+        the available KV-cache budget until the post-profile ND release.
+        """
+        self._kda_prolog_nd_released = False
+        for name in _KDA_PROLOG_WEIGHT_NAMES:
+            setattr(self, name, None)
+        if self._prefill_fused_kda_operator is None:
+            return False
+        if self.model_config.dtype != torch.bfloat16 or self._mega_pd_decode_worker:
+            return False
+        projections = (
+            (self.in_proj_qkvgfab, self.fused_bfg_proj)
+            if self.uses_mixed_projection
+            else (self.in_proj_qkvgfab, self.f_b_proj)
+        )
+        if any(
+            not isinstance(layer.quant_method, UnquantizedLinearMethod) or layer.weight.dtype != torch.bfloat16
+            for layer in projections
+        ):
+            return False
+        hidden = self.hidden_size
+        projection = self.local_projection_size
+        if self.uses_mixed_projection:
+            bfg = self.fused_bfg_proj
+            qkv_weight = ensure_mega_kda_nd(self.in_proj_qkvgfab.weight.detach())
+            f_a_weight = bfg.f_a_weight.detach()
+            f_b_weight = bfg.f_b_weight.detach()
+            bfg_weight = ensure_mega_kda_nd(bfg.weight.detach())
+            output_dim = getattr(bfg.weight, "output_dim", 0)
+            b_weight = bfg_weight.narrow(output_dim, 0, self.local_num_heads)
+            output_gate_weight = bfg_weight.narrow(output_dim, self.local_num_heads + projection, projection)
+        else:
+            weight = ensure_mega_kda_nd(self.in_proj_qkvgfab.weight.detach())
+            qkv_end = 3 * projection
+            gate_end = qkv_end + projection
+            f_a_end = gate_end + self.head_dim
+            output_dim = getattr(weight, "output_dim", 0)
+            qkv_weight = weight.narrow(output_dim, 0, qkv_end)
+            output_gate_weight = weight.narrow(output_dim, qkv_end, projection)
+            f_a_weight = weight.narrow(output_dim, gate_end, self.head_dim)
+            b_weight = weight.narrow(output_dim, f_a_end, self.local_num_heads)
+            f_b_weight = self.f_b_proj.weight.detach()
+        if any(
+            source.dtype != torch.bfloat16
+            for source in (qkv_weight, f_a_weight, f_b_weight, b_weight, output_gate_weight)
+        ):
+            return False
+        if tuple(output_gate_weight.shape) != (projection, hidden):
+            raise RuntimeError("KDA Prolog output gate weight has an unexpected shape")
+        self._kda_prolog_qkv_weight = self._prepare_prolog_weight(qkv_weight, hidden, 3 * projection)
+        self._kda_prolog_f_a_weight = self._prepare_prolog_weight(f_a_weight, hidden, self.head_dim)
+        self._kda_prolog_f_b_weight = self._prepare_prolog_weight(f_b_weight, self.head_dim, projection)
+        self._kda_prolog_b_weight = self._prepare_prolog_weight(b_weight, hidden, self.local_num_heads)
+        self._kda_prolog_conv_weight = self.get_parameter(_PACKED_CONV_WEIGHT_NAME).detach()
+        self._kda_prolog_output_gate_weight = output_gate_weight.contiguous()
+        if self._kda_prolog_conv_weight.dtype != torch.bfloat16:
+            raise RuntimeError("KDA Prolog requires a BF16 packed Conv weight")
+        return True
+
+    @torch.no_grad()
+    def _release_kda_prolog_nd_weights(self) -> int:
+        """Keep Prolog operands and release their ND sources after memory profiling."""
+        if (
+            getattr(self, "_kda_prolog_nd_released", False)
+            or getattr(self, "_prefill_fused_kda_operator", None) is None
+            or any(getattr(self, name, None) is None for name in _KDA_PROLOG_WEIGHT_NAMES)
+        ):
+            return 0
+        params = [self.in_proj_qkvgfab.weight]
+        if self.uses_mixed_projection:
+            # Recurrent groups use the composed F projection in the fused BFG
+            # weight. Its output-gate view also shares that retained storage.
+            params.extend((self.fused_bfg_proj.f_a_weight, self.fused_bfg_proj.f_b_weight))
+        else:
+            params.append(self.f_b_proj.weight)
+        source_storages = {param.untyped_storage().data_ptr(): param.untyped_storage().nbytes() for param in params}
+        gate_bytes = 0
+        if not self.uses_mixed_projection:
+            # A contiguous row slice still owns the entire packed ND storage.
+            # Give the output gate its own allocation before dropping that owner.
+            gate_storage = self._kda_prolog_output_gate_weight.untyped_storage()
+            source_storages[gate_storage.data_ptr()] = gate_storage.nbytes()
+            del gate_storage
+            self._kda_prolog_output_gate_weight = self._kda_prolog_output_gate_weight.clone()
+            gate_bytes = (
+                self._kda_prolog_output_gate_weight.numel() * self._kda_prolog_output_gate_weight.element_size()
+            )
+        released = sum(source_storages.values()) - gate_bytes
+        for param in params:
+            param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+        self._kda_prolog_nd_released = True
+        logger.info_once(
+            "KDA Prolog released replaced ND input projections on the PD prefill worker for %s", self.prefix
+        )
+        return released
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         if self.use_mega_kda_replayssm:
@@ -592,6 +734,15 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 output = self._allocate_mega_output(hidden_states)
                 self._forward_mega_kda(hidden_states, positions, plan, output, replay_plan)
                 return output
+        if torch.compiler.is_compiling() and self._kda_prolog_qkv_weight is not None:
+            if not is_breakable_cudagraph_enabled():
+                rows = hidden_states.shape[0]
+                if type(getattr(self.o_proj, "custom_op", None)) is KimiOProjMMReduceScatterOp:
+                    rows = (rows + self.tp_size - 1) // self.tp_size
+                return torch.ops.vllm.ascend_kimi_kda(hidden_states, positions, self.prefix, rows)
+            output = self._allocate_mega_output(hidden_states)
+            torch.ops.vllm.ascend_kimi_kda_with_output(hidden_states, positions, output, self.prefix)
+            return output
         return self._forward_default(hidden_states, positions)
 
     def forward_with_all_gather(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -716,9 +867,17 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 "prefill batches require the ND weights, which only remain on "
                 "non-PD-decode workers."
             )
-        if self.uses_mixed_projection:
+        if self._can_use_kda_prolog_prefill():
+            return self._forward_kda_prolog_prefill(hidden_states)
+        prolog_nd_released = getattr(self, "_kda_prolog_nd_released", False)
+        if self.uses_mixed_projection or prolog_nd_released:
             num_tokens = hidden_states.size(0)
-            mixed_qkv, beta, g1, g2 = self._run_overlapped_qkv_bfg(hidden_states)
+            if prolog_nd_released:
+                mixed_qkv, g1, beta, g2 = self._project_recurrent_inputs(hidden_states)
+                beta_is_preprocessed = True
+            else:
+                mixed_qkv, beta, g1, g2 = self._run_overlapped_qkv_bfg(hidden_states)
+                beta_is_preprocessed = getattr(self, "_prefill_fused_kda_operator", None) is None
             core_attn_out = torch.empty(
                 (1, num_tokens, self.local_num_heads, self.head_dim),
                 dtype=hidden_states.dtype,
@@ -730,11 +889,199 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 g2=g2,
                 beta=beta,
                 core_attn_out=core_attn_out,
-                beta_is_preprocessed=getattr(self, "_prefill_fused_kda_operator", None) is None,
+                beta_is_preprocessed=beta_is_preprocessed,
             )
             core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
             return self.o_proj(core_attn_out)[0]
         return super().forward(hidden_states, positions)
+
+    def _can_use_kda_prolog_prefill(self) -> bool:
+        # Quantized projections keep the original path. Do not inspect request
+        # metadata here: this check also runs while Dynamo traces projections.
+        if (
+            getattr(self, "_prefill_fused_kda_operator", None) is None
+            or getattr(self, "_kda_prolog_qkv_weight", None) is None
+            or self.gate_lower_bound is None
+        ):
+            return False
+        raw = self._get_kda_forward_metadata()
+        if not isinstance(raw, dict) or self.prefix not in raw:
+            return False
+        metadata = raw[self.prefix]
+        return isinstance(metadata, GDNAttentionMetadata) and metadata.num_prefills > 0
+
+    def _project_recurrent_inputs(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        prolog_nd_released = getattr(self, "_kda_prolog_nd_released", False)
+        if self.uses_mixed_projection:
+            if prolog_nd_released:
+                qkv = torch.matmul(hidden_states, self._kda_prolog_qkv_weight)
+                beta_logits, raw_gate, output_gate = self._postprocess_bfg(self._project_bfg(hidden_states))
+            else:
+                qkv, beta_logits, raw_gate, output_gate = self._run_overlapped_qkv_bfg(hidden_states)
+            return qkv, raw_gate, beta_logits.float().sigmoid(), output_gate
+        if prolog_nd_released:
+            qkv = torch.matmul(hidden_states, self._kda_prolog_qkv_weight)
+            output_gate = torch.nn.functional.linear(hidden_states, self._kda_prolog_output_gate_weight)
+            f_a = torch.matmul(hidden_states, self._kda_prolog_f_a_weight)
+            raw_gate = torch.matmul(f_a, self._kda_prolog_f_b_weight)
+            beta_logits = torch.matmul(hidden_states, self._kda_prolog_b_weight)
+        else:
+            projected = self.in_proj_qkvgfab(hidden_states)[0]
+            split_sizes = [
+                3 * self.local_projection_size,
+                self.local_projection_size,
+                self.head_dim,
+                self.local_num_heads,
+            ]
+            padding = getattr(self, "in_proj_padding", 0)
+            if padding:
+                split_sizes.append(padding)
+            qkv, output_gate, f_a, beta_logits = projected.split(split_sizes, dim=-1)[:4]
+            raw_gate = self.f_b_proj(f_a)[0]
+        return (
+            qkv,
+            rearrange(raw_gate, "n (h d) -> 1 n h d", d=self.head_dim),
+            beta_logits.unsqueeze(0).float().sigmoid(),
+            rearrange(output_gate, "n (h d) -> n h d", d=self.head_dim),
+        )
+
+    def _run_recurrent_group(
+        self, hidden_states: torch.Tensor, metadata: GDNAttentionMetadata, *, speculative: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        qkv, raw_gate, beta, output_gate = self._project_recurrent_inputs(hidden_states)
+        conv_state, recurrent_state = self.kv_cache[:2]
+        if speculative:
+            assert metadata.spec_decode_metadata is not None
+            assert metadata.spec_query_start_loc is not None
+            assert metadata.spec_state_indices_tensor is not None
+            conv = metadata.spec_decode_metadata.spec_causal_conv1d
+            query_start_loc = metadata.spec_query_start_loc
+            state_indices = metadata.spec_state_indices_tensor
+            accepted = conv.num_accepted_tokens
+            max_query_len = self.num_spec + 1
+            conv_indices = conv.cache_indices
+        else:
+            assert metadata.non_spec_query_start_loc is not None
+            assert metadata.non_spec_state_indices_tensor is not None
+            query_start_loc = metadata.non_spec_query_start_loc[: metadata.num_decodes + 1]
+            state_indices = metadata.non_spec_state_indices_tensor[: metadata.num_decodes]
+            accepted = None
+            max_query_len = 1
+            conv_indices = state_indices
+        qkv = self._run_causal_conv1d(
+            qkv,
+            self.get_parameter(_PACKED_CONV_WEIGHT_NAME),
+            conv_state,
+            query_start_loc,
+            conv_indices,
+            None,
+            run_mode=1,
+            max_query_len=max_query_len,
+            num_accepted_tokens=accepted,
+        )
+        q, k, v = (rearrange(part, "n (h d) -> 1 n h d", d=self.head_dim) for part in qkv.chunk(3, dim=-1))
+        output = self._run_recurrent(
+            q,
+            k,
+            v,
+            raw_gate,
+            beta,
+            recurrent_state,
+            query_start_loc,
+            state_indices,
+            num_accepted_tokens=accepted,
+        )
+        return output, output_gate
+
+    @eager_break_during_capture
+    def _forward_kda_prolog_prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        raw = self._get_kda_forward_metadata()
+        metadata = raw[self.prefix]
+        prefill_meta = metadata.non_spec_prefill_metadata
+        state_indices = metadata.prefill_state_indices
+        has_initial_state = metadata.prefill_has_initial_state
+        query_start_loc = metadata.prefill_query_start_loc
+        if prefill_meta is None or state_indices is None or has_initial_state is None or query_start_loc is None:
+            raise RuntimeError("KDA Prolog prefill metadata is incomplete")
+        state_copy = getattr(self, "_ascend_kda_state_copy", None)
+        if state_copy is None or not getattr(self, "_kda_state_copy_ready", False):
+            raise RuntimeError("KDA state copy requires worker cache initialization before prefill")
+        wait_for_kv_layer_from_connector(self.prefix)
+        record_attention_compute_start()
+        num_tokens = hidden_states.shape[0]
+        hidden_states = hidden_states[: metadata.num_actual_tokens].contiguous()
+        conv_state, recurrent_state = self.kv_cache[:2]
+        spec_masks = metadata.spec_sequence_masks
+        num_decode_tokens = 0 if spec_masks is not None else metadata.num_decode_tokens
+        initial_mode = prefill_meta.causal_conv1d.initial_state_mode
+        if initial_mode is not None and num_decode_tokens:
+            initial_mode = initial_mode[num_decode_tokens:]
+        keep = prefill_meta.chunk.keep_meta
+        if keep is not None:
+            keep_indices = prefill_meta.chunk.keep_indices
+            state_indices = state_indices.index_select(0, keep_indices)
+            has_initial_state = has_initial_state.index_select(0, keep_indices)
+            if initial_mode is not None:
+                initial_mode = initial_mode.index_select(0, keep_indices)
+            query_start_loc = torch.cat((query_start_loc[:1], query_start_loc[1:].index_select(0, keep_indices)))
+        if spec_masks is not None:
+            assert metadata.spec_token_indx is not None
+            assert metadata.non_spec_token_indx is not None
+            spec_indices = metadata.spec_token_indx
+            prefill_indices = metadata.non_spec_token_indx
+            recurrent_output, recurrent_gate = self._run_recurrent_group(
+                hidden_states.index_select(0, spec_indices), metadata, speculative=True
+            )
+            prefill_hidden = hidden_states.index_select(0, prefill_indices)
+        else:
+            if num_decode_tokens:
+                recurrent_output, recurrent_gate = self._run_recurrent_group(
+                    hidden_states[:num_decode_tokens], metadata, speculative=False
+                )
+            prefill_hidden = hidden_states[num_decode_tokens:]
+        initial_state = state_copy.gather(recurrent_state, state_indices, has_initial_state).float()
+        prefill_output, final_state = run_prefill_fused_kda(
+            self._prefill_fused_kda_operator,
+            prefill_hidden,
+            self._kda_prolog_qkv_weight,
+            self._kda_prolog_conv_weight,
+            self._kda_prolog_f_a_weight,
+            self._kda_prolog_f_b_weight,
+            self._kda_prolog_b_weight,
+            conv_state,
+            state_indices,
+            initial_mode,
+            initial_state,
+            query_start_loc,
+            self.A_log.detach().reshape(-1).contiguous(),
+            self.dt_bias.view(self.local_num_heads, self.head_dim),
+            scale=self.head_dim**-0.5,
+            lower_bound=float(self.gate_lower_bound),
+            metadata_context=getattr(prefill_meta.chunk, "flash_kda_metadata", None),
+        )
+        state_copy.scatter(recurrent_state, final_state, state_indices)
+        prefill_gate = torch.nn.functional.linear(prefill_hidden, self._kda_prolog_output_gate_weight)
+        prefill_gate = prefill_gate.view(-1, self.local_num_heads, self.head_dim)
+        if spec_masks is not None:
+            output = hidden_states.new_zeros((1, hidden_states.shape[0], self.local_num_heads, self.head_dim))
+            output_gate = hidden_states.new_zeros((hidden_states.shape[0], self.local_num_heads, self.head_dim))
+            output.index_copy_(1, spec_indices, recurrent_output)
+            output.index_copy_(1, prefill_indices, prefill_output)
+            output_gate.index_copy_(0, spec_indices, recurrent_gate)
+            output_gate.index_copy_(0, prefill_indices, prefill_gate)
+        elif num_decode_tokens:
+            output = torch.cat((recurrent_output, prefill_output), dim=1)
+            output_gate = torch.cat((recurrent_gate, prefill_gate), dim=0)
+        else:
+            output = prefill_output
+            output_gate = prefill_gate
+        self.o_norm.forward_oot(output, output_gate, out=output)
+        output = rearrange(output, "1 n h d -> n (h d)")
+        maybe_save_kv_layer_to_connector("", [])
+        output = _restore_token_rows(output, num_tokens)
+        return self.o_proj(output)[0]
 
     def _get_kda_forward_metadata(self):
         # Both callers execute inside the runtime/custom-op boundary, never tracing.
@@ -1332,8 +1679,8 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             raise ValueError("KDA prefill requires has_initial_state metadata")
         keep = prebuilt_metadata.keep_meta
         if keep is not None:
-            state_indices = state_indices[keep]
-            has_initial_state = has_initial_state[keep]
+            state_indices = state_indices.index_select(0, prebuilt_metadata.keep_indices)
+            has_initial_state = has_initial_state.index_select(0, prebuilt_metadata.keep_indices)
 
         # The recurrent cache uses [H,V,K]. The fused prefill operator accepts
         # that state layout directly through state_v_first.
@@ -1357,72 +1704,6 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         )
         state_copy.scatter(recurrent_state, final_state, state_indices)
         return output
-
-    def _run_prefill_fused_kda(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        raw_gate: torch.Tensor,
-        raw_beta: torch.Tensor,
-        recurrent_state: torch.Tensor,
-        state_indices: torch.Tensor,
-        has_initial_state: torch.Tensor,
-        prebuilt_metadata,
-        *,
-        query_start_loc: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run CANNBot's TND prefill kernel around the V2 state-copy plan."""
-        operator = self._prefill_fused_kda_operator
-        if operator is None:
-            raise RuntimeError("prefill fused KDA operator is not loaded")
-        if has_initial_state is None:
-            raise ValueError("KDA prefill requires has_initial_state metadata")
-        if query_start_loc is None or query_start_loc.ndim != 1 or query_start_loc.numel() != state_indices.numel() + 1:
-            raise ValueError("Kimi KDA prefill query boundaries must match the state indices")
-        if has_initial_state.numel() != state_indices.numel():
-            raise ValueError("Kimi KDA prefill flags must match the state indices")
-        keep = prebuilt_metadata.keep_meta
-        metadata_context = getattr(prebuilt_metadata, "flash_kda_metadata", None)
-        if keep is not None:
-            state_indices = state_indices[keep]
-            has_initial_state = has_initial_state[keep]
-            if metadata_context is None:
-                query_start_loc = torch.cat((query_start_loc[:1], query_start_loc[1:][keep]))
-        if state_indices.numel() == 0:
-            return torch.empty_like(v)
-        # Reuse V2's device offsets; do not upload host lengths in every layer.
-        query_start_loc = (
-            metadata_context.query_start_loc
-            if metadata_context is not None
-            else query_start_loc.to(dtype=torch.int32).contiguous()
-        )
-
-        state_copy = getattr(self, "_ascend_kda_state_copy", None)
-        if state_copy is None or not getattr(self, "_kda_state_copy_ready", False):
-            raise RuntimeError("KDA state copy requires worker cache initialization before prefill")
-        # Gather clears rows for requests without a reusable initial state and
-        # keeps all page/stride handling inside the worker-owned plan.
-        initial_state = state_copy.gather(recurrent_state, state_indices, has_initial_state).float()
-        output, final_state = run_prefill_fused_kda(
-            operator,
-            q.squeeze(0),
-            k.squeeze(0),
-            v.squeeze(0),
-            raw_gate.squeeze(0),
-            raw_beta.squeeze(0),
-            initial_state,
-            query_start_loc,
-            self.A_log,
-            self.dt_bias.reshape(self.local_num_heads, self.head_dim),
-            scale=self.head_dim**-0.5,
-            lower_bound=self.gate_lower_bound,
-            metadata_context=metadata_context,
-        )
-        # Publish only a successful result. Conv has already advanced; errors
-        # propagate without retrying the batch against partly updated caches.
-        state_copy.scatter(recurrent_state, final_state, state_indices)
-        return output.unsqueeze(0)
 
     @eager_break_during_capture
     def _forward(
@@ -1479,17 +1760,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         g1 = g1[:, :num_actual_tokens]
         g2 = g2[:num_actual_tokens]
         raw_beta = beta[:, :num_actual_tokens]
-        use_fused_prefill = (
-            getattr(self, "_prefill_fused_kda_operator", None) is not None
-            and attn_metadata.num_prefills > 0
-            and self.gate_lower_bound is not None
-            and mixed_qkv.dtype == torch.bfloat16
-            and not beta_is_preprocessed
-        )
-        if not (use_fused_prefill and attn_metadata.num_decodes == 0 and attn_metadata.num_spec_decodes == 0):
-            beta = _prepare_beta(raw_beta, num_actual_tokens, is_preprocessed=beta_is_preprocessed)
-        else:
-            beta = raw_beta  # Only FlashKDA consumes this batch; sigmoid is fused.
+        beta = _prepare_beta(raw_beta, num_actual_tokens, is_preprocessed=beta_is_preprocessed)
 
         # ReplaySSM stores three record states after conv/checkpoint.
         conv_state, recurrent_state = self.kv_cache[:2]
@@ -1504,7 +1775,6 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 raw_gate_spec = g1
                 beta_spec = beta
                 mixed_non_spec = raw_gate_non_spec = beta_non_spec = None
-                raw_beta_non_spec = None
             else:
                 assert spec_token_indices is not None
                 assert non_spec_token_indices is not None
@@ -1514,13 +1784,11 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 mixed_non_spec = mixed_qkv.index_select(0, non_spec_token_indices)
                 raw_gate_non_spec = g1.index_select(1, non_spec_token_indices)
                 beta_non_spec = beta.index_select(1, non_spec_token_indices)
-                raw_beta_non_spec = raw_beta.index_select(1, non_spec_token_indices) if use_fused_prefill else None
         else:
             mixed_spec = raw_gate_spec = beta_spec = None
             mixed_non_spec = mixed_qkv
             raw_gate_non_spec = g1
             beta_non_spec = beta
-            raw_beta_non_spec = raw_beta
 
         core_spec = None
         if mixed_spec is not None:
@@ -1614,39 +1882,22 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                     v_non_spec = v_non_spec[:, num_decode_tokens:]
                     raw_gate_non_spec = raw_gate_non_spec[:, num_decode_tokens:]
                     beta_non_spec = beta_non_spec[:, num_decode_tokens:]
-                    if raw_beta_non_spec is not None:
-                        raw_beta_non_spec = raw_beta_non_spec[:, num_decode_tokens:]
 
                 assert attn_metadata.prefill_state_indices is not None
                 assert attn_metadata.prefill_has_initial_state is not None
                 prefill_meta = attn_metadata.non_spec_prefill_metadata
                 assert prefill_meta is not None
-                if use_fused_prefill:
-                    assert raw_beta_non_spec is not None
-                    core_prefill = self._run_prefill_fused_kda(
-                        q_non_spec,
-                        k_non_spec,
-                        v_non_spec,
-                        raw_gate_non_spec,
-                        raw_beta_non_spec,
-                        recurrent_state,
-                        attn_metadata.prefill_state_indices,
-                        attn_metadata.prefill_has_initial_state,
-                        prefill_meta.chunk,
-                        query_start_loc=attn_metadata.prefill_query_start_loc,
-                    )
-                else:
-                    core_prefill = self._run_prefill(
-                        q_non_spec,
-                        k_non_spec,
-                        v_non_spec,
-                        raw_gate_non_spec,
-                        beta_non_spec,
-                        recurrent_state,
-                        attn_metadata.prefill_state_indices,
-                        attn_metadata.prefill_has_initial_state,
-                        prefill_meta.chunk,
-                    )
+                core_prefill = self._run_prefill(
+                    q_non_spec,
+                    k_non_spec,
+                    v_non_spec,
+                    raw_gate_non_spec,
+                    beta_non_spec,
+                    recurrent_state,
+                    attn_metadata.prefill_state_indices,
+                    attn_metadata.prefill_has_initial_state,
+                    prefill_meta.chunk,
+                )
                 core_non_spec = (
                     torch.cat((core_decode, core_prefill), dim=1) if core_decode is not None else core_prefill
                 )
